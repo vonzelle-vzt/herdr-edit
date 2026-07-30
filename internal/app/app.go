@@ -65,12 +65,12 @@ const (
 	// sidebarNeeds is the total width at which the file tree stops earning its 30 columns. Below
 	// it the tree auto-hides so the editor stays readable; the user preference is untouched, so
 	// widening the pane brings the tree straight back.
-	sidebarNeeds = 76
-	statusFlashFor      = 3 * time.Second
-	doubleClickMs       = 500 * time.Millisecond
-	doubleEscMs         = 500 * time.Millisecond
-	wheelLines          = 3
-	wheelCols           = 6 // horizontal step per WheelLeft/WheelRight event
+	sidebarNeeds   = 76
+	statusFlashFor = 3 * time.Second
+	doubleClickMs  = 500 * time.Millisecond
+	doubleEscMs    = 500 * time.Millisecond
+	wheelLines     = 3
+	wheelCols      = 6 // horizontal step per WheelLeft/WheelRight event
 
 	// modifierStickyWindow is how long a previously-seen Shift modifier
 	// state is allowed to persist forward onto the next wheel event.
@@ -535,9 +535,13 @@ func New(rootDir string) (*App, error) {
 	}
 
 	a := &App{
-		screen:         scr,
-		theme:          th,
-		rootDir:        rootDir,
+		screen: scr,
+		theme:  th,
+		// The TREE's resolved path, not the raw argument. herdr launches a plugin pane with --cwd
+		// and no argv, so rootDir arrives as "." — which showed up as a project named "." on the
+		// start page, and, worse, was published to active.json as root:"." where every companion
+		// panel would resolve it against ITS OWN working directory rather than the editor's.
+		rootDir:        tree.Root.Path,
 		active:         state.NewPublisher(),
 		tree:           tree,
 		hoveredMenuRow: -1,
@@ -595,9 +599,10 @@ func NewSingleFile(filePath string) (*App, error) {
 	}
 
 	a := &App{
-		screen:         scr,
-		theme:          th,
-		rootDir:        rootDir,
+		screen: scr,
+		theme:  th,
+		// Absolute for the same reason as above; single-file mode has no tree to borrow it from.
+		rootDir:        absOr(rootDir),
 		active:         state.NewPublisher(),
 		tree:           nil,
 		hoveredMenuRow: -1,
@@ -1721,6 +1726,15 @@ func (a *App) activeTabPtr() *editor.Tab {
 	return a.tabs[a.activeTab]
 }
 
+// absOr resolves a path to absolute, falling back to the input when that is impossible. Used so a
+// relative rootDir never reaches the start page or active.json.
+func absOr(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
 // flash sets a transient status message that displays for statusFlashFor
 // before the status bar reverts to the active file's info.
 func (a *App) flash(msg string) {
@@ -2565,7 +2579,6 @@ func (a *App) drawMenuButton() {
 	// Center the ≡ glyph in the button's mw cells.
 	a.screen.SetContent(mx+mw/2, my, '≡', nil, style)
 }
-
 
 // drawStatusBar paints the bottom status bar.
 func (a *App) drawStatusBar() {
