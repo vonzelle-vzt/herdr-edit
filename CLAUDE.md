@@ -1,19 +1,24 @@
 <!--
   File: CLAUDE.md
-  Author: Spicer Matthews <spicer@cloudmanic.com>
+  Author: Spicer Matthews <spicer@cloudmanic.com> (upstream)
   Created: 2026-04-29
-  Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+  Copyright: 2026 Cloudmanic, LLC. (upstream) / 2026 Vonzelle Brown (fork sections)
 -->
 
-# CLAUDE.md — SpiceEdit
+# CLAUDE.md — herdr-edit
 
 Project-specific guidance for Claude Code. Read this first; it captures
 conventions and design decisions that aren't obvious from the code alone.
 
 ## What this project is
 
-SpiceEdit is an opinionated, **mouse-first** terminal code editor aimed at
-SSH-into-tmux workflows. It looks and behaves like a tiny VS Code: file
+herdr-edit is a FORK of [cloudmanic/spice-edit](https://github.com/cloudmanic/spice-edit).
+Read FORK.md and README.md for what the fork adds and why. Everything below
+that is not marked as a fork change is upstream's design, and upstream's
+design decisions are to be preserved.
+
+It is an opinionated, **mouse-first** terminal code editor aimed at
+SSH-into-tmux workflows, and at living in a herdr pane beside an AI agent. It looks and behaves like a tiny VS Code: file
 tree on the left, tabs across the top, syntax-highlighted editor in the
 middle, status bar at the bottom. It ships as a single static Go binary
 with no CGO.
@@ -56,6 +61,15 @@ internal/spiceconfig/spiceconfig.go ~/.config/spiceedit/config.json loader (icon
 internal/icons/icons.go       Nerd Font detection + per-file glyph mapping
 internal/theme/theme.go       Tokyo Night palette + syntax color mapping
 internal/version/version.go   const Version = "x.y.z" — single line, CI bumps it
+
+FORK ADDITIONS
+internal/lsp/                 LSP client: protocol types, stdio transport, server registry
+internal/state/state.go       Publishes active.json so companion tools can follow the cursor
+internal/app/diagnostics.go   Diagnostics overlay, drawn AFTER Tab.Render, + status summary
+internal/app/startpage.go     The no-tabs-open view: project, branch, changed files
+internal/filetree/gitignore.go  git ls-files based filter for the tree
+internal/editor/geometry.go   Gutter width + buffer->screen mapping, for the overlay
+internal/editor/persist.go    Undo history that survives the process
 ```
 
 ## Conventions
@@ -153,11 +167,38 @@ A drag is detected when a press lands at exactly `x == splitterX()`.
 Min widths: `minSidebarWidth = 18`, `minEditorAfterDrag = 40`. Don't
 let the editor shrink below that.
 
+### Responsive layout (fork) — degrade, never refuse
+`minWidth`/`minHeight` are 24x8, not 50x24. Below `sidebarNeeds` (76) the
+tree auto-hides and the editor takes the full width, because the tree is a
+fixed 30 columns and a side panel was otherwise only usable in a narrow
+band — one column narrower and the whole editor was replaced by "Window too
+small". `sidebarVisible()` is preference AND room; the `sidebarShown`
+preference is never cleared by the auto-hide, so widening brings the tree
+straight back.
+
+### Polled call sites, not scattered hooks (fork)
+`publishActive()` and `maybeSyncLSP()` are each called from ONE place in
+the Run loop. The cursor moves and the buffer mutates from dozens of sites;
+a set of hand-placed hooks would miss some, and the symptom would be a
+stale panel or stale diagnostics rather than anything that looks like a
+bug. Both are cheap when nothing changed.
+
+### The diagnostics overlay draws on top (fork)
+`drawDiagnostics()` runs AFTER `tab.Render`, repainting existing runes with
+an underline so syntax colours survive. It is a separate pass because the
+render path is hot and diagnostics arrive on their own schedule — keeping
+them apart means a project with no language server pays nothing.
+
+🔴 LSP counts columns in **UTF-16 code units**; the buffer is **rune**
+indexed. Identical for ASCII, so a mistake here survives testing right up
+until a line contains an emoji or CJK text. Convert at the boundary
+(`lsp.UTF16ToRuneCol` / `lsp.RuneColToUTF16`), never in the middle.
+
 ## Build / run
 
 ```sh
 make run          # go run . in current dir
-make build        # build to ./bin/spiceedit
+make build        # build to ./bin/herdr-edit
 make build-linux  # cross-compile linux/amd64
 make install      # go install to $GOPATH/bin
 make tidy         # go mod tidy
@@ -189,8 +230,16 @@ loops forever.
 
 - `Ctrl+` editor shortcuts (they fight tmux/terminals — that's the
   whole reason the action menu exists).
-- A config file / dotfile / plugin system. SpiceEdit is opinionated.
+- **Third-party dependencies.** The dependency list is tcell, chroma and
+  go-gitignore, and that is the whole list. The LSP client is hand-rolled
+  against the stdlib specifically to keep it that way — do not swap it for
+  a protocol package.
 - CGO dependencies. The whole point is one static binary.
 - Tree-sitter. We use Chroma intentionally — pure Go, no setup.
 - A separate `homebrew-tap` repo. The formula lives here under
   `Formula/` and that's deliberate.
+- A plugin system. Upstream said "no config file / dotfile / plugin system"
+  and the *plugin* half still holds. The fork does read a small
+  `config.json` (icons, `tree.respectGitignore`), because a filter that
+  hides files must have an off switch — but that is a settings file, not an
+  extension point, and it should stay that small.
