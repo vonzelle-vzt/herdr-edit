@@ -13,15 +13,15 @@
 
 version: 2
 
-project_name: spiceedit
+project_name: spiceedit-vzt
 
 before:
   hooks:
     - go mod tidy
 
 builds:
-  - id: spiceedit
-    binary: spiceedit
+  - id: spiceedit-vzt
+    binary: spiceedit-vzt
     main: .
     env:
       - CGO_ENABLED=0
@@ -86,6 +86,6 @@ brews:
       name: github-actions[bot]
       email: 41898282+github-actions[bot]@users.noreply.github.com
     install: |
-      bin.install "spiceedit"
+      bin.install "spiceedit-vzt"
     test: |
-      assert_path_exists bin/"spiceedit"
+      assert_path_exists bin/"spiceedit-vzt"
