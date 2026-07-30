@@ -288,6 +288,15 @@ func (m *Manager) Definition(ctx context.Context, path string, pos Position) ([]
 
 // Stop shuts every server down. Called on quit; best-effort throughout, since
 // a wedged server must never keep the editor from exiting.
+// Completion asks the server owning path for completions at pos.
+func (m *Manager) Completion(ctx context.Context, path string, pos Position) ([]CompletionItem, error) {
+	c := m.existing(path)
+	if c == nil {
+		return nil, nil
+	}
+	return c.Completion(ctx, URI(path), pos)
+}
+
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	clients := make([]*Client, 0, len(m.clients))

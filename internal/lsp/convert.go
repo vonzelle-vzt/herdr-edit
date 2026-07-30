@@ -272,3 +272,113 @@ func Truncate(s string, n int) string {
 	}
 	return string(runes[:n-1]) + "…"
 }
+
+// CompletionItem is one suggestion. Only the fields this editor can actually
+// use are decoded: a label to show, the text to insert when it differs, a kind
+// for the little type hint, and detail for the right-hand column.
+type CompletionItem struct {
+	Label      string
+	InsertText string
+	Detail     string
+	Kind       int
+	SortText   string
+}
+
+// Text returns what should actually be typed into the buffer. Servers often
+// send a label decorated for display — "foo(…)" or "bar (deprecated)" — and a
+// clean insertText beside it; inserting the label in that case puts punctuation
+// into the user's code.
+func (c CompletionItem) Text() string {
+	if c.InsertText != "" {
+		return c.InsertText
+	}
+	return c.Label
+}
+
+// completionItems unwraps a textDocument/completion result. The spec allows
+// either a bare CompletionItem[] or a CompletionList{items:[...]}, and servers
+// genuinely differ — decoding only one shape silently yields zero completions
+// from half of them, which reads as "this language has no completion".
+func completionItems(raw json.RawMessage) []CompletionItem {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	type wireItem struct {
+		Label      string          `json:"label"`
+		InsertText string          `json:"insertText"`
+		Detail     string          `json:"detail"`
+		Kind       int             `json:"kind"`
+		SortText   string          `json:"sortText"`
+		TextEdit   json.RawMessage `json:"textEdit"`
+	}
+	var items []wireItem
+	if err := json.Unmarshal(raw, &items); err != nil {
+		var list struct {
+			Items []wireItem `json:"items"`
+		}
+		if err := json.Unmarshal(raw, &list); err != nil {
+			return nil
+		}
+		items = list.Items
+	}
+	out := make([]CompletionItem, 0, len(items))
+	for _, it := range items {
+		if it.Label == "" {
+			continue
+		}
+		out = append(out, CompletionItem{
+			Label:      it.Label,
+			InsertText: it.InsertText,
+			Detail:     it.Detail,
+			Kind:       it.Kind,
+			SortText:   it.SortText,
+		})
+	}
+	return out
+}
+
+// CompletionKindName maps the spec's numeric CompletionItemKind onto a short
+// label. Unknown kinds render blank rather than as a bare number, which would
+// mean nothing to a reader.
+func CompletionKindName(kind int) string {
+	switch kind {
+	case 1:
+		return "text"
+	case 2:
+		return "method"
+	case 3:
+		return "func"
+	case 4:
+		return "ctor"
+	case 5:
+		return "field"
+	case 6:
+		return "var"
+	case 7:
+		return "class"
+	case 8:
+		return "iface"
+	case 9:
+		return "module"
+	case 10:
+		return "prop"
+	case 12:
+		return "value"
+	case 13:
+		return "enum"
+	case 14:
+		return "keyword"
+	case 15:
+		return "snippet"
+	case 17:
+		return "file"
+	case 21:
+		return "const"
+	case 22:
+		return "struct"
+	case 25:
+		return "type"
+	default:
+		return ""
+	}
+}

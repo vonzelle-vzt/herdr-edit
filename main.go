@@ -13,11 +13,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/cloudmanic/spice-edit/internal/app"
+	"github.com/cloudmanic/spice-edit/internal/state"
 	"github.com/cloudmanic/spice-edit/internal/version"
 )
 
@@ -31,6 +35,7 @@ const (
 	actionEdit    cliAction = "edit"
 	actionVersion cliAction = "version"
 	actionHelp    cliAction = "help"
+	actionOpenAt  cliAction = "open-at"
 )
 
 // cliResult bundles everything resolveArgs hands back: which top-level
@@ -63,6 +68,16 @@ func resolveArgs(args []string) cliResult {
 		return cliResult{Action: actionVersion}
 	case "--help", "-h", "help":
 		return cliResult{Action: actionHelp}
+	case "--open-at":
+		// Ask an ALREADY-RUNNING editor to jump to a location, rather than
+		// starting a second one. This is the reverse of the active-file
+		// contract: panels read active.json to follow the cursor, and write an
+		// open-request to move it. It is what lets the Review panel hand a
+		// `path:line` from the agent diff straight into a real editor.
+		if len(args) < 2 {
+			return cliResult{Err: errors.New("--open-at needs a path, optionally as path:line:col")}
+		}
+		return cliResult{Action: actionOpenAt, OpenFile: args[1]}
 	}
 
 	target := args[0]
@@ -103,12 +118,40 @@ Usage:
   spiceedit                     Open the current directory.
   spiceedit <directory>         Open a project directory.
   spiceedit <file>              Open a file (its parent becomes the project root).
+  spiceedit --open-at F:L[:C]   Ask a RUNNING editor to jump to that location.
   spiceedit --version           Print the version and exit.
   spiceedit --help              Print this help and exit.
 
 Once running, click ≡ (top-left), right-click anywhere, or double-tap Esc
 for the action menu. See https://github.com/cloudmanic/spice-edit for
 hotkeys and the full feature list.`)
+}
+
+// splitLocation parses "path", "path:line" and "path:line:col" into their
+// parts, defaulting line and col to 1.
+//
+// Splitting from the RIGHT is what makes this correct on the paths that
+// actually occur: an absolute Windows-style path or any filename containing a
+// colon would be cut in the wrong place by a left-to-right scan, and the
+// trailing numeric fields are the only unambiguous part of the string.
+func splitLocation(s string) (path string, line, col int) {
+	line, col = 1, 1
+	parts := strings.Split(s, ":")
+	for len(parts) > 1 {
+		last := parts[len(parts)-1]
+		n, err := strconv.Atoi(last)
+		if err != nil || n < 1 {
+			break
+		}
+		if col == 1 && line == 1 {
+			line = n
+		} else {
+			col = line
+			line = n
+		}
+		parts = parts[:len(parts)-1]
+	}
+	return strings.Join(parts, ":"), line, col
 }
 
 // main routes to the action resolveArgs picked. Edit is by far the
@@ -128,6 +171,18 @@ func main() {
 		return
 	case actionHelp:
 		printHelp()
+		return
+	case actionOpenAt:
+		path, line, col := splitLocation(res.OpenFile)
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+			os.Exit(1)
+		}
+		if err := state.WriteOpenRequest(abs, line, col); err != nil {
+			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+			os.Exit(1)
+		}
 		return
 	}
 

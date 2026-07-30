@@ -238,6 +238,11 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Find in file", shortcut: "Esc f", action: (*App).menuFind, enabled: (*App).hasFindable},
 			{label: "Replace in file", action: (*App).menuReplace, enabled: (*App).hasFindable},
 			{label: "Find file in project", shortcut: "Esc p", action: (*App).menuFindFile, enabled: (*App).hasFinder},
+			{label: "Run a command", shortcut: "Esc k", action: (*App).menuCommandPalette, enabled: alwaysTrue},
+			{label: "Complete at cursor", shortcut: "Esc c", action: (*App).menuComplete, enabled: (*App).hasFindable},
+			{shortcut: "Esc b", action: (*App).menuToggleInlineBlame, enabled: alwaysTrue, labelFor: (*App).inlineBlameLabel},
+			{label: "Go to line", shortcut: "Esc g", action: (*App).menuGoToLine, enabled: (*App).hasFindable},
+			{label: "Select all", shortcut: "Esc a", action: (*App).menuSelectAll, enabled: (*App).hasFindable},
 		},
 		// File actions
 		{
@@ -532,7 +537,32 @@ type App struct {
 	// or ≡ → Find file). The Finder owns the cached index and a
 	// background-build goroutine; the rest of these fields are
 	// transient UI state for the modal itself.
-	finder         *finder.Finder
+	finder *finder.Finder
+	// Command palette — Esc k. Fuzzy search over every action in menuLayout(),
+	// scored with internal/finder so "fuzzy" means one thing in this editor.
+	paletteOpen     bool
+	paletteQuery    []rune
+	paletteCursor   int
+	paletteSelected int
+	paletteScroll   int
+	paletteResults  []paletteResult
+
+	// LSP completion popup — Esc c, explicitly invoked.
+	completionOpen     bool
+	completionItems    []lsp.CompletionItem
+	completionSelected int
+	completionScroll   int
+	completionPrefix   string
+
+	// Inline git blame — Esc b. Cursor line only, cached per (path, line),
+	// computed off the event loop and delivered as a posted event.
+	blameEnabled  bool
+	blameCache    map[blameKey]string
+	blameInflight map[blameKey]bool
+
+	// Highest open-request sequence already honoured. See consumeOpenRequest.
+	lastOpenSeq int64
+
 	finderOpen     bool
 	finderQuery    []rune
 	finderCursor   int
@@ -585,6 +615,7 @@ func New(rootDir string) (*App, error) {
 		tree:           tree,
 		hoveredMenuRow: -1,
 		sidebarShown:   true,
+		blameEnabled:   true,
 		sidebarWidth:   defaultSidebarWidth,
 	}
 	a.setActiveFolder(tree.Root.Path)
@@ -808,6 +839,7 @@ func (a *App) Run() error {
 		a.handleEvent(ev)
 		a.draw()
 		a.publishActive()
+		a.consumeOpenRequest()
 		a.maybeSyncLSP()
 		a.screen.Show()
 	}
@@ -827,6 +859,47 @@ func (a *App) publishActive() {
 		return
 	}
 	a.active.Set("", 0, 0, a.rootDir)
+}
+
+// consumeOpenRequest honours a pending "open this file at this line" request
+// from a panel. Polled from the SAME single call site as publishActive, and for
+// the same reason: one site cannot miss a case.
+//
+// This is the direction that turns reading into editing. active.json tells the
+// panels where the cursor is; this brings a location back the other way, so the
+// Review panel can hand you a `path:line` from the agent's diff and you land on
+// it in a real editor with a language server attached — rather than reading the
+// diff in one pane and hunting for the line in another.
+//
+// The sequence number is the whole guard. Without it the editor either reopens
+// the same file on every tick or ignores every request after the first; with it
+// a request is honoured exactly once, and a stale file left on disk from an
+// earlier session can never yank the user somewhere they did not ask to go.
+func (a *App) consumeOpenRequest() {
+	req, ok := state.ReadOpenRequest()
+	if !ok || req.Seq <= a.lastOpenSeq {
+		return
+	}
+	a.lastOpenSeq = req.Seq
+	if _, err := os.Stat(req.File); err != nil {
+		a.flash("Cannot open " + filepath.Base(req.File))
+		return
+	}
+	a.openFile(req.File)
+	tab := a.activeTabPtr()
+	if tab == nil {
+		return
+	}
+	// The wire is 1-based because that is how every tool prints a location and
+	// how a human reads one; the buffer is 0-based.
+	line, col := req.Line-1, req.Col-1
+	if line < 0 {
+		line = 0
+	}
+	if col < 0 {
+		col = 0
+	}
+	tab.MoveCursorTo(editor.Position{Line: line, Col: col}, false)
 }
 
 // handleEvent routes a tcell event to its specific handler.
@@ -849,6 +922,10 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleLSPJump(e)
 	case *diagnosticsEvent:
 		a.handleDiagnostics(e)
+	case *completionEvent:
+		a.handleCompletion(e)
+	case *blameEvent:
+		a.handleBlame(e)
 	case *lspLogEvent:
 		a.flash(e.msg)
 	case *customActionDoneEvent:
@@ -1203,6 +1280,15 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 		a.handleFindKey(ev)
 		return
 	}
+	if a.paletteOpen {
+		a.handlePaletteKey(ev)
+		return
+	}
+	// The completion popup consumes only the keys it owns; anything else
+	// dismisses it and falls through, so a keystroke is never swallowed.
+	if a.completionOpen && a.handleCompletionKey(ev) {
+		return
+	}
 	if a.finderOpen {
 		a.handleFinderKey(ev)
 		return
@@ -1353,6 +1439,10 @@ func (a *App) handleMouse(ev *tcell.EventMouse) {
 	}
 	if a.contextOpen {
 		a.handleContextMouse(x, y, btn)
+		return
+	}
+	if a.paletteOpen {
+		a.handlePaletteMouse(x, y, btn)
 		return
 	}
 	if a.finderOpen {
@@ -1948,6 +2038,9 @@ func (a *App) saveTabAt(idx int) bool {
 		return false
 	}
 	a.refreshGitStatus()
+	// The blame cache is keyed by line, and a save can move every line after an
+	// edit — a stale entry would attribute the cursor's line to the wrong commit.
+	a.invalidateBlame(tab.Path)
 	// Lint-style servers (eslint, and anything shelling out to a linter) only run a full analysis
 	// on save, so this is what makes their diagnostics appear at all.
 	a.lspDidSave(tab.Path, tab.Buffer.String())
@@ -2521,6 +2614,8 @@ func (a *App) draw() {
 		// After Render, so the underline sits on top of the syntax colours rather than being
 		// overwritten by them.
 		a.drawDiagnostics()
+		a.maybeRequestBlame()
+		a.drawInlineBlame(ex, ey, ew, eh)
 	} else {
 		a.drawStartPage()
 	}
@@ -2538,6 +2633,12 @@ func (a *App) draw() {
 	}
 	if a.contextOpen {
 		a.drawContext()
+	}
+	if a.paletteOpen {
+		a.drawPalette()
+	}
+	if a.completionOpen {
+		a.drawCompletion()
 	}
 	if a.promptOpen {
 		a.drawPrompt()

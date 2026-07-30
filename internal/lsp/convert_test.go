@@ -183,3 +183,40 @@ func TestSeverityString(t *testing.T) {
 		t.Errorf("got %q", SeverityWarning.String())
 	}
 }
+
+// TestCompletionItems_BothWireShapes pins the decode. The spec allows a bare
+// CompletionItem[] OR a CompletionList{items:[...]}, and servers genuinely
+// differ — handling only one silently yields zero completions from half of
+// them, which the user reads as "this language has no completion".
+func TestCompletionItems_BothWireShapes(t *testing.T) {
+	arr := []byte(`[{"label":"alpha","kind":3},{"label":"beta"}]`)
+	if got := completionItems(arr); len(got) != 2 || got[0].Label != "alpha" {
+		t.Fatalf("bare array decoded to %+v", got)
+	}
+	list := []byte(`{"isIncomplete":false,"items":[{"label":"gamma","insertText":"gamma()"}]}`)
+	got := completionItems(list)
+	if len(got) != 1 || got[0].Label != "gamma" || got[0].InsertText != "gamma()" {
+		t.Fatalf("CompletionList decoded to %+v", got)
+	}
+}
+
+// TestCompletionItems_Degrades pins that junk yields nothing rather than a
+// panic or a phantom entry.
+func TestCompletionItems_Degrades(t *testing.T) {
+	for _, in := range []string{"", "null", "{}", `{"items":null}`, `[{"label":""}]`, "not json"} {
+		if got := completionItems([]byte(in)); len(got) != 0 {
+			t.Errorf("completionItems(%q) = %+v, want empty", in, got)
+		}
+	}
+}
+
+// TestCompletionKindName covers the mapping and its unknown-kind fallback: a
+// bare number would mean nothing to a reader, so unknown renders blank.
+func TestCompletionKindName(t *testing.T) {
+	if CompletionKindName(3) != "func" {
+		t.Errorf("kind 3 = %q, want func", CompletionKindName(3))
+	}
+	if CompletionKindName(999) != "" {
+		t.Errorf("an unknown kind should render blank, got %q", CompletionKindName(999))
+	}
+}

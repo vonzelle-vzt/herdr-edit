@@ -133,3 +133,40 @@ func TestResolveArgs_HelpFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitLocation covers the three shapes a panel emits. Splitting from the
+// RIGHT is the whole point: a left-to-right scan cuts an absolute path
+// containing a colon in the wrong place, and the trailing numeric fields are
+// the only unambiguous part of the string.
+func TestSplitLocation(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantPath string
+		wantL    int
+		wantC    int
+	}{
+		{"src/app.go", "src/app.go", 1, 1},
+		{"src/app.go:42", "src/app.go", 42, 1},
+		{"src/app.go:42:7", "src/app.go", 42, 7},
+		{"/abs/path/to/file.ts:9", "/abs/path/to/file.ts", 9, 1},
+		{"weird:name.go", "weird:name.go", 1, 1},
+		{"file.go:0", "file.go:0", 1, 1},
+	}
+	for _, c := range cases {
+		p, l, col := splitLocation(c.in)
+		if p != c.wantPath || l != c.wantL || col != c.wantC {
+			t.Errorf("splitLocation(%q) = %q,%d,%d — want %q,%d,%d", c.in, p, l, col, c.wantPath, c.wantL, c.wantC)
+		}
+	}
+}
+
+// TestResolveArgs_OpenAt pins the flag and its error case.
+func TestResolveArgs_OpenAt(t *testing.T) {
+	res := resolveArgs([]string{"--open-at", "src/a.go:12"})
+	if res.Action != actionOpenAt || res.OpenFile != "src/a.go:12" {
+		t.Fatalf("got %+v", res)
+	}
+	if got := resolveArgs([]string{"--open-at"}); got.Err == nil {
+		t.Error("--open-at with no argument should be an error, not a silent no-op")
+	}
+}

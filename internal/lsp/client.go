@@ -148,6 +148,15 @@ func (c *Client) initialize(ctx context.Context, rootURI string) error {
 					"contentFormat": []string{"plaintext", "markdown"},
 				},
 				"definition": map[string]interface{}{},
+				"completion": map[string]interface{}{
+					"completionItem": map[string]interface{}{
+						// Plain text only: this editor has no snippet engine, and
+						// advertising snippetSupport makes servers return
+						// placeholder syntax like ${1:name} that we would then
+						// insert literally.
+						"snippetSupport": false,
+					},
+				},
 			},
 		},
 	}
@@ -273,6 +282,25 @@ func (c *Client) Definition(ctx context.Context, uri string, pos Position) ([]Lo
 		return nil, err
 	}
 	return locations(raw), nil
+}
+
+// Completion asks for completions at pos. Servers answer with either a bare
+// array of CompletionItem or a CompletionList wrapping one, and both shapes are
+// unwrapped in completionItems().
+//
+// 🔴 Implementing this request is the easy half. hover and definition sat here
+// complete, tested and advertised in initialize with no caller for months, and
+// find-and-replace repeated it. Before believing completion works, grep for a
+// non-test call site in internal/app.
+func (c *Client) Completion(ctx context.Context, uri string, pos Position) ([]CompletionItem, error) {
+	raw, err := c.call(ctx, "textDocument/completion", positionParams{
+		TextDocument: textDocumentIdentifier{URI: uri},
+		Position:     pos,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return completionItems(raw), nil
 }
 
 // call issues a request and waits for its response or the context deadline.

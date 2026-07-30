@@ -72,6 +72,11 @@ embeds standalone Monaco with no LSP at all.
 | **A start page** | With no tab open, the pane showed two lines of grey text. It now shows the project, branch, and changed files — each clickable. |
 | **Word wrap** | Upstream has none. `Esc z` reflows long lines to the pane width, breaking on word boundaries, and re-wraps whenever the pane resizes. Off by default, per tab, like VS Code. |
 | **A layout that degrades instead of refusing** | Below 50×24 upstream shows *"Window too small — please resize"*. Since the tree is a fixed 30 columns, a side panel was only usable in a narrow band. The tree now **auto-fits**: it grows to show full folder names and narrows toward 18 columns as the pane tightens, hiding only below 42 — a 60-column panel beside an agent still shows files. A splitter drag pins it. Floors drop to **24×8**. |
+| **LSP autocomplete** | `textDocument/completion` with a popup under the cursor. Explicitly invoked with `Esc c` rather than firing as you type: an as-you-type popup needs a debounce, a cancellation story and a dismissal rule, and every one of those failure modes shows up as the editor swallowing a keystroke. Only the four keys the popup owns are consumed; anything else dismisses it and is handled normally. |
+| **A command palette** | `Esc k`. Fuzzy search over every action, built from the action menu rather than from a list of its own — a second list is a second thing to forget to update. Scored with the same matcher as the file finder, because two notions of "fuzzy" in one program is a bug the user experiences as inconsistency. |
+| **Inline git blame** | `Esc b`. Author, coarse relative age and subject, dimmed at end-of-line. Only the cursor's line is blamed — `git blame` on a whole file is linear in history and would run on every scroll. Diagnostics win the end of the line when both want it. |
+| **Go to line, select all** | `Esc g`, `Esc a`. `SelectAll` had been complete and unit-tested in `internal/editor` with **zero** non-test callers; only the wiring was missing. |
+| **`--open-at`, the reverse contract** | `herdr-edit --open-at path:line[:col]` asks an **already-running** editor to jump there. `active.json` flows editor → panels; this flows panels → editor, which is what turns a read-only review into an edit: the Review panel hands you a line from the agent's diff and you land on it with a language server attached. |
 | **Persistent undo** | History used to die with the process. |
 | **Active-file publishing** | A debounced `{file,line,col,root}` snapshot other tools can read. |
 
@@ -107,6 +112,11 @@ primary surface, because macOS Terminal and tmux frequently swallow right-click.
 | `Esc` `h` | **Hover** — types and docs at the cursor | needs a language server |
 | `Esc` `d` | **Go to definition** | needs a language server |
 | `Esc` `z` | Toggle **word wrap** | per tab, off by default |
+| `Esc` `c` | **Complete at cursor** | LSP autocomplete; explicitly invoked, never as-you-type |
+| `Esc` `k` | **Command palette** | fuzzy search over every action |
+| `Esc` `g` | **Go to line** | accepts `N` or `N:C` |
+| `Esc` `a` | **Select all** | |
+| `Esc` `b` | Toggle **inline git blame** | author and commit on the cursor's line |
 
 Deliberately unbound: `c` / `x` / `v`, because the terminal's own copy and paste already own that
 path; and rename / delete / revert, which are destructive enough to want the menu's confirm dialog.

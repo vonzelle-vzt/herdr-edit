@@ -62,6 +62,8 @@ func (a *App) closeAllModals() {
 	a.formOpen = false
 	a.findOpen = false
 	a.finderOpen = false
+	a.paletteOpen = false
+	a.completionOpen = false
 	a.findValue = nil
 	a.findCursor = 0
 	a.findScroll = 0
