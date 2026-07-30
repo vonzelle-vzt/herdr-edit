@@ -357,6 +357,13 @@ If you're touching the workflow or `.goreleaser.yml`, make sure both
 auto-commits keep their `[skip ci]` markers — without them the workflow
 loops forever.
 
+🔴 **Never write that marker in a commit message you want CI to run on.** GitHub
+scans the **entire** message, body included — so explaining the marker in prose opts
+the commit out. Observed: a commit whose body described the changelog filter produced
+**no workflow runs at all**, neither Test nor Release, which reads like a broken
+trigger rather than a message that opted out. Describe it ("the CI-skip marker"),
+never spell it.
+
 🔴 **A source build goes stale silently, and merging is what makes it stale.** Every
 push to `main` auto-tags a release, so `go build -o ~/.local/bin/herdr-edit .` from
 last week is now behind — while still being first on `PATH` and reporting no
