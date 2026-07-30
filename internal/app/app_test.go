@@ -1426,6 +1426,70 @@ func TestHandleEvent_Resize(t *testing.T) {
 	}
 }
 
+// TestResizeRelayoutsEverything is the "fits the pane at any size" contract, and it exists because
+// TestHandleEvent_Resize above only checks that a.width/a.height were updated. Every rect is derived
+// from those, so a regression that left the sidebar, editor or tab bar on a stale width would pass
+// that test and show up only as a pane drawn past its own edge.
+//
+// Sweeps a resize event across every width from the too-narrow-for-a-tree case up to a roomy pane,
+// asserting at each step that the three regions exactly tile the pane, that nothing is drawn outside
+// it, and that the tree appears or stands down according to treeNeeds -- then confirms widening
+// restores the full tree, since the sidebarShown preference must survive an auto-hide.
+func TestResizeRelayoutsEverything(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	scr := a.screen.(tcell.SimulationScreen)
+
+	resizeTo := func(w, h int) {
+		scr.SetSize(w, h)
+		a.handleEvent(tcell.NewEventResize(w, h))
+	}
+
+	for w := treeNeeds - 4; w <= 140; w++ {
+		resizeTo(w, 30)
+
+		sw := a.sidebarW()
+		ex, _, ew, _ := a.editorRect()
+		tx, _, tw, _ := a.tabBarRect()
+
+		// The regions must tile the pane exactly: no overlap, no dead column, no overflow.
+		if ex != sw {
+			t.Fatalf("width %d: editor starts at %d but the sidebar is %d wide", w, ex, sw)
+		}
+		if sw+ew != w {
+			t.Fatalf("width %d: sidebar %d + editor %d = %d, not the pane width", w, sw, ew, sw+ew)
+		}
+		if tx+tw != w {
+			t.Fatalf("width %d: tab bar spans %d..%d, not the pane width", w, tx, tx+tw)
+		}
+		if ew <= 0 {
+			t.Fatalf("width %d: editor collapsed to %d columns", w, ew)
+		}
+
+		// And the tree follows the pane rather than a stale value.
+		if w >= treeNeeds && sw == 0 {
+			t.Fatalf("width %d: tree hidden at or above treeNeeds %d", w, treeNeeds)
+		}
+		if w < treeNeeds && sw != 0 {
+			t.Fatalf("width %d: tree %d wide below treeNeeds %d", w, sw, treeNeeds)
+		}
+	}
+
+	// Widening restores the full tree: the auto-hide never clears the preference.
+	resizeTo(140, 30)
+	if got := a.sidebarW(); got != defaultSidebarWidth {
+		t.Fatalf("after widening: tree %d, want its full %d", got, defaultSidebarWidth)
+	}
+	// Narrow past the floor and back, to prove the round trip.
+	resizeTo(treeNeeds-1, 30)
+	if got := a.sidebarW(); got != 0 {
+		t.Fatalf("below treeNeeds: tree %d, want hidden", got)
+	}
+	resizeTo(140, 30)
+	if got := a.sidebarW(); got != defaultSidebarWidth {
+		t.Fatalf("after the round trip: tree %d, want its full %d", got, defaultSidebarWidth)
+	}
+}
+
 // TestHandleMouse_Wheel routes scroll events to the panel under the cursor.
 func TestHandleMouse_Wheel(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
