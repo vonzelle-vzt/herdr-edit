@@ -5,21 +5,21 @@
 class HerdrEdit < Formula
   desc "herdr-edit — mouse-first terminal code editor with LSP diagnostics, for herdr."
   homepage "https://github.com/vonzelle-vzt/herdr-edit"
-  version "0.5.1"
+  version "0.5.2"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.1/herdr-edit_0.5.1_darwin_amd64.tar.gz"
-      sha256 "33d70a3a1f8714c1b3981bb3197ff68b14ed7d0b87956fed045bf9946dab1a03"
+      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.2/herdr-edit_0.5.2_darwin_amd64.tar.gz"
+      sha256 "4c94e44724f5fa1dfcb8b626ba2524c4f46d0339c0a705c67af6add9758ecc38"
 
       define_method(:install) do
         bin.install "herdr-edit"
       end
     end
     if Hardware::CPU.arm?
-      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.1/herdr-edit_0.5.1_darwin_arm64.tar.gz"
-      sha256 "8713fb6802348683bf92869e4a74a237fbae345d8428cf26a8b9649c0e50245a"
+      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.2/herdr-edit_0.5.2_darwin_arm64.tar.gz"
+      sha256 "8949667b0d02f33c78bece759641119f7861c3ea965dd239ca871719377837d2"
 
       define_method(:install) do
         bin.install "herdr-edit"
@@ -29,15 +29,15 @@ class HerdrEdit < Formula
 
   on_linux do
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.1/herdr-edit_0.5.1_linux_amd64.tar.gz"
-      sha256 "58478c0735c748d81ed4cefe5906f4ab1e4a067fcf0079e5b1d57cd821db6ed9"
+      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.2/herdr-edit_0.5.2_linux_amd64.tar.gz"
+      sha256 "3a9d9f86aabd90d9e8f717300629d6e87a69a9f382c9170c0fd8659a661df752"
       define_method(:install) do
         bin.install "herdr-edit"
       end
     end
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.1/herdr-edit_0.5.1_linux_arm64.tar.gz"
-      sha256 "af0370ce5ee6a1ff9a373b628b7008d38d694fc631b3624853227967eeb1b481"
+      url "https://github.com/vonzelle-vzt/herdr-edit/releases/download/v0.5.2/herdr-edit_0.5.2_linux_arm64.tar.gz"
+      sha256 "2618e7afdde03e73b1b4ddcf5ba2640f846efbcc80b271ed6bec855c28832b1e"
       define_method(:install) do
         bin.install "herdr-edit"
       end
