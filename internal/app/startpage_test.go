@@ -225,3 +225,42 @@ func TestSidebarToggleExplainsAutoHide(t *testing.T) {
 		t.Errorf("menu label should describe reality, got %q", got)
 	}
 }
+
+// TestRelativeToRoot_ResolvesSymlinks pins the bug a real render exposed. On
+// macOS /tmp IS /private/tmp, so a project opened by one name against a git
+// status reporting the other produced "../../../../private/tmp/..." — correct,
+// unreadable, and it pushes the filename off the end of the line.
+func TestRelativeToRoot_ResolvesSymlinks(t *testing.T) {
+	dir := t.TempDir() // under /var, itself a symlink to /private/var on macOS
+	sub := filepath.Join(dir, "src", "api")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(sub, "routes.go")
+	if err := os.WriteFile(file, []byte("package api\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := filepath.EvalSymlinks(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The root is the UNRESOLVED name, the file the RESOLVED one — exactly the
+	// mismatch git status produces.
+	got := relativeToRoot(dir, resolved)
+	if want := filepath.Join("src", "api", "routes.go"); got != want {
+		t.Fatalf("relativeToRoot = %q, want %q", got, want)
+	}
+	if strings.HasPrefix(got, "..") {
+		t.Fatal("the path escaped the root as a chain of dots")
+	}
+}
+
+// TestRelativeToRoot_OutsideRoot pins that a genuinely unrelated path shows as
+// absolute rather than as a ladder of dots.
+func TestRelativeToRoot_OutsideRoot(t *testing.T) {
+	got := relativeToRoot(t.TempDir(), "/etc/hosts")
+	if got != "/etc/hosts" {
+		t.Fatalf("relativeToRoot = %q, want the absolute path", got)
+	}
+}

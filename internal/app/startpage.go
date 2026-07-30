@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/gdamore/tcell/v2"
 
@@ -166,10 +167,7 @@ func (a *App) drawStartPage() {
 			if y >= ey+eh-3 {
 				break
 			}
-			rel, err := filepath.Rel(a.rootDir, abs)
-			if err != nil {
-				rel = abs
-			}
+			rel := relativeToRoot(a.rootDir, abs)
 			kind := a.tree.DirtyFiles[abs]
 			markStyle := tcell.StyleDefault.Background(bg).Foreground(a.gitMarkColor(kind))
 			put(left, y, string(gitMark(kind)), markStyle)
@@ -220,4 +218,30 @@ func (a *App) handleStartPageClick(x, y int) bool {
 		}
 	}
 	return false
+}
+
+// relativeToRoot renders a changed file's path the way a reader expects:
+// relative to the project, and never as a chain of "..".
+//
+// 🔴 filepath.Rel alone is not enough, because the two paths can describe the
+// same place through different symlinks. On macOS /tmp IS /private/tmp, so a
+// project opened as /tmp/demo against a git status reporting /private/tmp/demo
+// produced "../../../../private/tmp/demo/src/api/routes.go" — technically
+// correct, useless to read, and it silently pushes the actual filename off the
+// end of the line. Resolve both sides first, and if the answer still escapes
+// the root, show the absolute path rather than a ladder of dots.
+func relativeToRoot(root, abs string) string {
+	resolve := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return p
+	}
+	if rel, err := filepath.Rel(resolve(root), resolve(abs)); err == nil && !strings.HasPrefix(rel, "..") {
+		return rel
+	}
+	if rel, err := filepath.Rel(root, abs); err == nil && !strings.HasPrefix(rel, "..") {
+		return rel
+	}
+	return abs
 }

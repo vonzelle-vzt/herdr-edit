@@ -42,6 +42,15 @@ editor runs standalone on any terminal.
 
 ## What it looks like
 
+<p align="center">
+  <img src="docs/assets/demo.gif"
+       alt="herdr-edit: opening a Go project, walking the file tree, a live gopls diagnostic rendered inline at the end of the line, the command palette, the outline, and the diff view."
+       width="100%">
+</p>
+
+Recorded with [VHS](https://github.com/charmbracelet/vhs) against a real `gopls` — the diagnostic
+is genuine, not a mock. Below is the same editor dumped from its own renderer:
+
 Rendered by the editor itself, not drawn by hand — file tree, gutter, syntax, and an LSP
 diagnostic reported inline at the end of the offending line:
 
