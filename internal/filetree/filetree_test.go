@@ -1265,3 +1265,62 @@ func TestNaturalWidthEmptyAndNil(t *testing.T) {
 		t.Fatalf("empty project: got %d, want at least the header width", got)
 	}
 }
+
+// TestFitWidthIgnoresOutliers is the bug that shipped in the first auto-fit: sizing to the LONGEST
+// row let one deep filename inflate the whole sidebar. With scripts/ expanded,
+// "backfill-report-canonical-names.ts" wanted 43 columns and pinned the panel to 38% of the pane.
+func TestFitWidthIgnoresOutliers(t *testing.T) {
+	root := t.TempDir()
+	// Twenty short top-level folders, plus one expanded folder holding a very long filename.
+	for i := 0; i < 20; i++ {
+		if err := os.MkdirAll(filepath.Join(root, "d"+string(rune('a'+i))), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deep := filepath.Join(root, "scripts")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	long := "backfill-report-canonical-names-and-then-some.ts"
+	if err := os.WriteFile(filepath.Join(deep, long), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range tr.Root.Children {
+		if c.Name == "scripts" {
+			tr.Toggle(c)
+		}
+	}
+
+	max := tr.FitWidth(100)
+	typical := tr.FitWidth(85)
+	if max <= len([]rune(long)) {
+		t.Fatalf("fixture broken: the long name should dominate the max, max=%d", max)
+	}
+	if typical >= max {
+		t.Fatalf("the 85th percentile must clip the outlier: typical=%d max=%d", typical, max)
+	}
+
+	// NaturalWidth stays the maximum, so the two are not silently the same function.
+	if got := tr.NaturalWidth(); got != max {
+		t.Fatalf("NaturalWidth should equal FitWidth(100): %d vs %d", got, max)
+	}
+
+	// Percentiles are monotonic and bounded.
+	prev := 0
+	for _, pct := range []int{1, 25, 50, 85, 100} {
+		w := tr.FitWidth(pct)
+		if w < prev {
+			t.Fatalf("FitWidth(%d)=%d went backwards from %d", pct, w, prev)
+		}
+		prev = w
+	}
+	// Out-of-range percentiles clamp rather than panic on a bad index.
+	if tr.FitWidth(0) <= 0 || tr.FitWidth(1000) != max {
+		t.Fatalf("percentile clamping wrong: 0->%d 1000->%d max=%d",
+			tr.FitWidth(0), tr.FitWidth(1000), max)
+	}
+}

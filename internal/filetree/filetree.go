@@ -351,12 +351,25 @@ func rowParts(item flatNode) (prefix, suffix string) {
 // position, so scrolling never changes the width, and it only moves when you expand or collapse a
 // folder or the tree refreshes. Fitting the currently-scrolled-into-view rows instead would make
 // the sidebar twitch as you scrolled, which is far worse than a clipped name.
-func (t *Tree) NaturalWidth() int {
+func (t *Tree) NaturalWidth() int { return t.FitWidth(100) }
+
+// FitWidth reports the width that accommodates the given PERCENTILE of currently-expanded rows,
+// never dropping below what the two header rows need. FitWidth(100) is the widest row; NaturalWidth
+// is exactly that.
+//
+// A percentile rather than the maximum, because the maximum is the wrong number to size a sidebar
+// by. Sizing to it let ONE long name in an expanded folder inflate the whole panel: with scripts/
+// open, "backfill-report-canonical-names.ts" wanted 43 columns and pinned the sidebar to 38% of a
+// 114-column pane, which is worse than the fixed 30 it replaced and made resizing look inert
+// because the panel just sat against its own ceiling. Clipping a rare long filename is what VS Code
+// does anyway; clipping the folder names you navigate by is not.
+func (t *Tree) FitWidth(percentile int) int {
 	if t == nil || t.Root == nil {
 		return 0
 	}
 
-	// The two header rows: " EXPLORER" and the project name.
+	// The two header rows: " EXPLORER" and the project name. Always a floor -- a truncated project
+	// name in the header is disorienting in a way a truncated row is not.
 	need := len([]rune(" EXPLORER"))
 	if n := len([]rune(" " + t.Root.Name)); n > need {
 		need = n
@@ -366,6 +379,7 @@ func (t *Tree) NaturalWidth() int {
 	for _, c := range t.Root.Children {
 		flattenInto(c, 0, &flat)
 	}
+	widths := make([]int, 0, len(flat))
 	for _, item := range flat {
 		prefix, suffix := rowParts(item)
 		w := len([]rune(prefix)) + len([]rune(suffix))
@@ -374,9 +388,27 @@ func (t *Tree) NaturalWidth() int {
 			glyph := icons.For(item.Node.Name, item.Node.IsDir, item.Node.Expanded)
 			w += len([]rune(glyph)) + 2
 		}
-		if w > need {
-			need = w
-		}
+		widths = append(widths, w)
+	}
+	if len(widths) == 0 {
+		return need
+	}
+
+	if percentile < 1 {
+		percentile = 1
+	}
+	if percentile > 100 {
+		percentile = 100
+	}
+	sort.Ints(widths)
+	// Ceiling index so FitWidth(100) is the last element and every percentile covers at least one
+	// row. len=20, pct=85 -> idx 16, i.e. the 17th narrowest, clipping the three widest.
+	idx := (len(widths)*percentile + 99) / 100
+	if idx > len(widths) {
+		idx = len(widths)
+	}
+	if w := widths[idx-1]; w > need {
+		need = w
 	}
 	return need
 }

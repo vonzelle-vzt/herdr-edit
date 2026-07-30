@@ -73,13 +73,20 @@ const (
 	// minSidebarWidth before it gives up existing.
 	treeNeeds = minSidebarWidth + minWidth
 
-	// maxAutoSidebarNum/Den bound the AUTO-FIT width as a fraction of the pane (2/5). Auto-fit asks
-	// the tree how many columns its longest row needs, and on a deep tree with long names that
-	// answer can exceed the whole pane -- fitting it literally would leave no editor. A dragged
-	// width is not subject to this: it is an explicit choice, and maxSidebarWidth already stops it
-	// starving the editor.
-	maxAutoSidebarNum = 2
-	maxAutoSidebarDen = 5
+	// maxAutoSidebarNum/Den bound the AUTO-FIT width as a fraction of the pane (1/3, close to what
+	// VS Code gives its explorer by default). A dragged width is not subject to this: it is an
+	// explicit choice, and maxSidebarWidth already stops it starving the editor.
+	//
+	// This was 2/5, and combined with fitting the LONGEST row it produced the opposite of the goal:
+	// one 34-character filename in an expanded folder pushed the sidebar to 38% of the pane and held
+	// it against this ceiling, so resizing appeared to do nothing at all.
+	maxAutoSidebarNum = 1
+	maxAutoSidebarDen = 3
+
+	// autoSidebarPercentile is the share of expanded rows the auto-fit tries to show in full. Below
+	// 100 on purpose: a handful of very long deep filenames must not set the width for the folder
+	// names you actually navigate by.
+	autoSidebarPercentile = 85
 
 	statusFlashFor = 3 * time.Second
 	doubleClickMs  = 500 * time.Millisecond
@@ -988,9 +995,10 @@ func (a *App) sidebarW() int {
 	return w
 }
 
-// autoSidebarWidth is the width the file tree wants in order to show its names in full: the tree
-// reports what its longest expanded row needs, and we bound that by a fraction of the pane so a
-// deeply nested project cannot push the editor out.
+// autoSidebarWidth is the width the file tree wants in order to show its names: the tree reports
+// what most of its expanded rows need (autoSidebarPercentile, not the longest -- one deep filename
+// must not size the whole panel), bounded by a fraction of the pane so a nested project cannot push
+// the editor out.
 //
 // This is what makes the sidebar grow as well as shrink. It only ever narrowed before -- clamped
 // down from a fixed 30-column preference -- so a 145-column pane still clipped ".pending-shots/"
@@ -1002,7 +1010,7 @@ func (a *App) sidebarW() int {
 func (a *App) autoSidebarWidth() int {
 	want := defaultSidebarWidth
 	if a.tree != nil {
-		if n := a.tree.NaturalWidth() + 1; n > want {
+		if n := a.tree.FitWidth(autoSidebarPercentile) + 1; n > want {
 			want = n
 		}
 	}
