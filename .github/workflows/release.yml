@@ -131,14 +131,17 @@ jobs:
           # no separate tap repo or PAT needed.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Kick the Pages deploy explicitly. The version bump and brew
-      # formula commits both carry [skip ci] (otherwise this workflow
-      # would loop on its own pushes), and pages.yml is gated by file
-      # paths — so without this step the marketing site is stranded at
-      # whatever version it last deployed, one bump behind reality.
-      # Uses workflow_dispatch (declared in pages.yml) and runs after
-      # the version push so the deploy reads the just-bumped value.
-      - name: Trigger Pages redeploy
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run pages.yml --ref main
+      # NO Pages dispatch here. Upstream spice-edit deploys a marketing site from
+      # a pages.yml workflow and this step was inherited with the rest of the
+      # pipeline — but this fork has no pages.yml, so `gh workflow run pages.yml`
+      # died with "HTTP 422: Workflow does not have workflow_dispatch trigger" and
+      # took the whole job down with it. Every release from v0.1.2 to v0.1.6 is
+      # marked FAILED for that reason alone, while having already tagged, built
+      # all five platforms, published the GitHub Release and written the brew
+      # formula. Same shape as the brews.repository bug above: inherited upstream
+      # config pointing at infrastructure this fork does not have.
+      #
+      # A red release that actually shipped is worse than either outcome alone --
+      # it trains you to ignore the signal, so a genuine GoReleaser failure would
+      # have looked identical. Restore this only alongside a real pages.yml that
+      # declares workflow_dispatch.
