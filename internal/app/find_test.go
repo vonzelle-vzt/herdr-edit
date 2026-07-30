@@ -204,3 +204,338 @@ func TestCloseAllModals_ClosesFindBar(t *testing.T) {
 		t.Fatal("closeAllModals should close the find bar")
 	}
 }
+
+// TestHandleFindKey_TabOpensAndFocusesReplace pins the keyboard path into
+// the replace field. Tab from a find-only bar expands the replace row and
+// moves the caret there in one gesture, so the feature is reachable
+// without the mouse on terminals that swallow Alt.
+func TestHandleFindKey_TabOpensAndFocusesReplace(t *testing.T) {
+	a := seedFindApp(t, "foo bar foo")
+	a.openFind()
+	if a.findReplaceOpen {
+		t.Fatal("replace row should start collapsed")
+	}
+	a.handleFindKey(keyEv(tcell.KeyTab, 0))
+	if !a.findReplaceOpen {
+		t.Fatal("Tab should expand the replace row")
+	}
+	if a.findFocus != findFieldReplace {
+		t.Fatal("Tab should move the caret into the replace field")
+	}
+	// A second Tab swaps back to the query field rather than collapsing.
+	a.handleFindKey(keyEv(tcell.KeyTab, 0))
+	if a.findFocus != findFieldQuery {
+		t.Fatal("second Tab should return focus to the query field")
+	}
+	if !a.findReplaceOpen {
+		t.Fatal("second Tab must not collapse the row")
+	}
+}
+
+// TestHandleFindKey_ReplaceCurrentAdvances is the end-to-end oracle for the
+// replace feature: drive it entirely through the key handler (the way a
+// user does) and assert the buffer actually changed. The engine had a
+// complete, tested Replace with no UI caller at all; this test fails
+// against that state.
+func TestHandleFindKey_ReplaceCurrentAdvances(t *testing.T) {
+	a := seedFindApp(t, "foo bar foo")
+	a.openFind()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	a.handleFindKey(keyEv(tcell.KeyTab, 0))
+	for _, r := range "baz" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	a.handleFindKey(keyEv(tcell.KeyEnter, 0))
+
+	got := a.activeTabPtr().Buffer.Lines[0]
+	if got != "baz bar foo" {
+		t.Fatalf("after one replace, line = %q, want %q", got, "baz bar foo")
+	}
+	if !a.activeTabPtr().Dirty {
+		t.Error("replacing should mark the tab dirty")
+	}
+}
+
+// TestHandleFindKey_ReplaceAllOneUndo checks Shift+Enter in the replace
+// field rewrites every match, and that the whole pass is a single undo
+// step rather than one per replacement.
+func TestHandleFindKey_ReplaceAllOneUndo(t *testing.T) {
+	a := seedFindApp(t, "foo bar foo baz foo")
+	a.openFind()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	a.handleFindKey(keyEv(tcell.KeyTab, 0))
+	for _, r := range "qux" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	a.handleFindKey(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModShift))
+
+	if got := a.activeTabPtr().Buffer.Lines[0]; got != "qux bar qux baz qux" {
+		t.Fatalf("replace all produced %q", got)
+	}
+	a.activeTabPtr().Undo()
+	if got := a.activeTabPtr().Buffer.Lines[0]; got != "foo bar foo baz foo" {
+		t.Fatalf("one undo should restore the whole pass, got %q", got)
+	}
+}
+
+// TestHandleFindKey_ReplaceFieldDoesNotDisturbMatches pins that typing a
+// replacement never re-runs the search. Recomputing on every replace-field
+// keystroke would move the highlights out from under a user who is
+// mid-edit.
+func TestHandleFindKey_ReplaceFieldDoesNotDisturbMatches(t *testing.T) {
+	a := seedFindApp(t, "foo bar foo")
+	a.openFind()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	before := len(a.activeTabPtr().FindMatches)
+	a.handleFindKey(keyEv(tcell.KeyTab, 0))
+	for _, r := range "zzzz" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	if got := len(a.activeTabPtr().FindMatches); got != before {
+		t.Fatalf("match count changed while typing a replacement: %d -> %d", before, got)
+	}
+	if a.activeTabPtr().FindQuery != "foo" {
+		t.Fatalf("query changed to %q while typing a replacement", a.activeTabPtr().FindQuery)
+	}
+}
+
+// TestHandleFindKey_AltTogglesOptions covers the three search-option
+// toggles on their VS Code shortcuts, and that flipping one re-runs the
+// query immediately instead of waiting for the next keystroke.
+func TestHandleFindKey_AltTogglesOptions(t *testing.T) {
+	a := seedFindApp(t, "Foo foo FOO")
+	a.openFind()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	if got := len(a.activeTabPtr().FindMatches); got != 3 {
+		t.Fatalf("case-insensitive should match 3, got %d", got)
+	}
+	a.handleFindKey(tcell.NewEventKey(tcell.KeyRune, 'c', tcell.ModAlt))
+	if !a.activeTabPtr().FindCaseSensitive {
+		t.Fatal("Alt+c should enable case sensitivity")
+	}
+	if got := len(a.activeTabPtr().FindMatches); got != 1 {
+		t.Fatalf("case-sensitive should match 1, got %d", got)
+	}
+	a.handleFindKey(tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModAlt))
+	if !a.activeTabPtr().FindRegex {
+		t.Fatal("Alt+r should enable regex")
+	}
+	a.handleFindKey(tcell.NewEventKey(tcell.KeyRune, 'w', tcell.ModAlt))
+	if !a.activeTabPtr().FindWholeWord {
+		t.Fatal("Alt+w should enable whole-word")
+	}
+	// The Alt runes must never reach the input.
+	if string(a.findValue) != "foo" {
+		t.Fatalf("Alt-modified runes leaked into the query: %q", string(a.findValue))
+	}
+}
+
+// TestFindStatusText_SurfacesRegexError is the fix for a silent failure:
+// an unparseable pattern clears the match list, so without this the bar
+// reads "no results" — indistinguishable from a valid pattern that
+// genuinely matches nothing.
+func TestFindStatusText_SurfacesRegexError(t *testing.T) {
+	a := seedFindApp(t, "foo bar")
+	a.openFind()
+	a.handleFindKey(tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModAlt))
+	for _, r := range "foo(" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	if a.activeTabPtr().FindErr == nil {
+		t.Fatal("an unclosed group should set FindErr")
+	}
+	if got := a.findStatusText(); got != "bad pattern" {
+		t.Fatalf("status = %q, want %q", got, "bad pattern")
+	}
+}
+
+// TestFindBarH_GrowsWithReplaceRow pins the geometry contract: the bar is
+// two rows when replace is expanded, and the editor body gives up exactly
+// those rows. A mismatch here paints the bar over the last line of code.
+func TestFindBarH_GrowsWithReplaceRow(t *testing.T) {
+	a := seedFindApp(t, "foo")
+	_, _, _, closedH := a.editorRect()
+	a.openFind()
+	if a.findBarH() != 1 {
+		t.Fatalf("collapsed bar height = %d, want 1", a.findBarH())
+	}
+	_, _, _, findH := a.editorRect()
+	a.openReplace()
+	if a.findBarH() != 2 {
+		t.Fatalf("expanded bar height = %d, want 2", a.findBarH())
+	}
+	_, _, _, replaceH := a.editorRect()
+
+	if findH != closedH-1 {
+		t.Errorf("find bar should cost 1 row: %d -> %d", closedH, findH)
+	}
+	if replaceH != closedH-2 {
+		t.Errorf("replace row should cost a 2nd row: %d -> %d", closedH, replaceH)
+	}
+	// The bar rect must sit directly above the status bar and cover both rows.
+	_, by, _, bh := a.findBarRect()
+	if by+bh != a.height-1 {
+		t.Errorf("bar bottom = %d, want %d (status bar row)", by+bh, a.height-1)
+	}
+}
+
+// TestHandleFindMouse_ClicksHitTheirControls drives the bar through the
+// mouse path. The layout is computed once and shared by the renderer and
+// the hit-test, so this also pins that they agree: a click at a toggle's
+// drawn column must fire that toggle.
+func TestHandleFindMouse_ClicksHitTheirControls(t *testing.T) {
+	a := seedFindApp(t, "Foo foo")
+	a.openFind()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	bx, by, bw, _ := a.findBarRect()
+	l := a.findBarLayout(bx, bw)
+
+	if l.caseW == 0 {
+		t.Skip("test screen too narrow to lay out the toggles")
+	}
+	if !a.handleFindMouse(l.caseX, by, tcell.Button1) {
+		t.Fatal("a click on the bar should be consumed by it")
+	}
+	if !a.activeTabPtr().FindCaseSensitive {
+		t.Error("clicking Aa should enable case sensitivity")
+	}
+	a.handleFindMouse(l.regexX, by, tcell.Button1)
+	if !a.activeTabPtr().FindRegex {
+		t.Error("clicking .* should enable regex")
+	}
+	a.handleFindMouse(l.wordX, by, tcell.Button1)
+	if !a.activeTabPtr().FindWholeWord {
+		t.Error("clicking ab should enable whole-word")
+	}
+
+	// The chevron expands the replace row.
+	a.handleFindMouse(l.chevronX, by, tcell.Button1)
+	if !a.findReplaceOpen {
+		t.Error("clicking the chevron should expand the replace row")
+	}
+
+	// A click outside the bar is not ours.
+	if a.handleFindMouse(bx, by-3, tcell.Button1) {
+		t.Error("a click above the bar must fall through to the editor")
+	}
+}
+
+// TestHandleFindMouse_ReplaceButtons covers the two clickable actions on
+// the replace row — the mouse-first path that works on terminals which
+// never deliver Alt.
+func TestHandleFindMouse_ReplaceButtons(t *testing.T) {
+	a := seedFindApp(t, "foo bar foo")
+	a.openFind()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	a.openReplace()
+	for _, r := range "baz" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	bx, by, bw, _ := a.findBarRect()
+	l := a.findBarLayout(bx, bw)
+	if l.btnW == 0 {
+		t.Skip("test screen too narrow to lay out the replace buttons")
+	}
+	a.handleFindMouse(l.btnAllX, by+1, tcell.Button1)
+	if got := a.activeTabPtr().Buffer.Lines[0]; got != "baz bar baz" {
+		t.Fatalf("clicking [All] produced %q", got)
+	}
+}
+
+// TestMenuReplace_OpensExpandedBar checks the action menu reaches the
+// feature. The menu is the primary surface per the project's rule that
+// right-click can be swallowed by the host terminal.
+func TestMenuReplace_OpensExpandedBar(t *testing.T) {
+	a := seedFindApp(t, "foo")
+	a.menuReplace()
+	if !a.findOpen || !a.findReplaceOpen {
+		t.Fatal("menuReplace should open the bar with the replace row expanded")
+	}
+	if a.findFocus != findFieldReplace {
+		t.Fatal("menuReplace should focus the replace field")
+	}
+}
+
+// TestFindBarLayout_TogglesOutrankTheHint pins the drop order of the bar's
+// right-hand chrome. The toggles are admitted before the hint, and stay
+// put when focus moves between the two fields.
+//
+// Regression: chrome used to be admitted in visual (right-to-left) order,
+// so the longer query-field hint claimed the width first and the toggles
+// vanished at 120 columns — then reappeared on Tab, because the replace
+// field's hint is shorter. Search options that blink in and out as you
+// change fields read as a rendering fault.
+func TestFindBarLayout_TogglesOutrankTheHint(t *testing.T) {
+	a := seedFindApp(t, "foo bar foo")
+	a.openFind()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	bx, _, bw, _ := a.findBarRect()
+
+	query := a.findBarLayout(bx, bw)
+	if query.caseW == 0 {
+		t.Fatal("toggles must be laid out at full width with the query focused")
+	}
+
+	a.openReplace()
+	replace := a.findBarLayout(bx, bw)
+	if replace.caseW == 0 {
+		t.Fatal("toggles must survive moving focus to the replace field")
+	}
+
+	// Narrow the bar until the hint is dropped; the toggles must outlive it.
+	for w := bw; w > 20; w -= 2 {
+		l := a.findBarLayout(bx, w)
+		if l.hintW > 0 && l.caseW == 0 {
+			t.Fatalf("width %d kept the hint but dropped the toggles", w)
+		}
+	}
+}
+
+// TestFindBarLayout_NeverOverlaps walks the bar across every width it can
+// be drawn at and asserts the query input never runs into the chrome to
+// its right. An overlap here paints the user's query on top of the match
+// counter, which is the kind of fault that only shows up on someone else's
+// terminal size.
+func TestFindBarLayout_NeverOverlaps(t *testing.T) {
+	a := seedFindApp(t, "foo bar foo")
+	a.openReplace()
+	for _, r := range "foo" {
+		a.handleFindKey(keyEv(tcell.KeyRune, r))
+	}
+	bx, _, _, _ := a.findBarRect()
+
+	for w := 20; w <= 200; w++ {
+		l := a.findBarLayout(bx, w)
+		inputEnd := l.queryInX + l.queryInW
+		for _, el := range []struct {
+			name string
+			x, w int
+		}{
+			{"toggles", l.caseX, l.caseW},
+			{"status", l.statusX, l.statusW},
+			{"hint", l.hintX, l.hintW},
+		} {
+			if el.w > 0 && el.x < inputEnd {
+				t.Fatalf("width %d: query input ends at %d but %s starts at %d",
+					w, inputEnd, el.name, el.x)
+			}
+		}
+		if l.btnW > 0 && l.btnReplaceX < l.replaceInX+l.replaceInW {
+			t.Fatalf("width %d: replace input overlaps the [Replace] button", w)
+		}
+	}
+}

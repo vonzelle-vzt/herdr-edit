@@ -236,6 +236,7 @@ func builtinMenuGroups() [][]menuItemDef {
 		// Search
 		{
 			{label: "Find in file", shortcut: "Esc f", action: (*App).menuFind, enabled: (*App).hasFindable},
+			{label: "Replace in file", action: (*App).menuReplace, enabled: (*App).hasFindable},
 			{label: "Find file in project", shortcut: "Esc p", action: (*App).menuFindFile, enabled: (*App).hasFinder},
 		},
 		// File actions
@@ -485,14 +486,24 @@ type App struct {
 	contextHover int
 
 	// Find bar — opened with Esc-f or the "Find in file" menu entry. The
-	// bar is a 1-row strip pinned above the status bar; while it's open
-	// it owns the keyboard. The active tab carries the query and match
-	// list (see editor.Tab.SetFindQuery), so each tab remembers its own
-	// search across closes / reopens.
+	// bar is a strip pinned above the status bar; while it's open it owns
+	// the keyboard. The active tab carries the query and match list (see
+	// editor.Tab.SetFindQuery), so each tab remembers its own search
+	// across closes / reopens.
 	findOpen   bool
 	findValue  []rune
 	findCursor int
 	findScroll int
+
+	// Replace row. findReplaceOpen adds a second row to the bar and is
+	// sticky across closes, the way VS Code remembers the expanded state.
+	// findFocus decides which of the two inputs the editing keys and the
+	// caret belong to — see findFocusedField.
+	findReplaceOpen bool
+	findFocus       findField
+	replaceValue    []rune
+	replaceCursor   int
+	replaceScroll   int
 
 	// Auto-scroll while drag-selecting past the editor's top/bottom edge.
 	// lastDragX/Y is the most recent mouse position so the auto-scroll
@@ -1106,13 +1117,14 @@ func (a *App) tabBarRect() (x, y, w, h int) {
 
 // editorRect returns the editor body's screen rectangle (everything to the
 // right of the sidebar, between the tab bar and the status bar). When the
-// find bar is open, one row is taken out of the bottom — the bar is
-// pinned directly above the status bar.
+// find bar is open its rows are taken out of the bottom — the bar is
+// pinned directly above the status bar, and is one row taller when the
+// replace field is expanded.
 func (a *App) editorRect() (x, y, w, h int) {
 	sw := a.sidebarW()
 	h = a.height - 2
 	if a.findOpen {
-		h -= findBarHeight
+		h -= a.findBarH()
 	}
 	return sw, 1, a.width - sw, h
 }
@@ -1351,6 +1363,15 @@ func (a *App) handleMouse(ev *tcell.EventMouse) {
 	if a.menuOpen {
 		a.updateMenuHover(x, y)
 		a.handleMenuMouse(x, y, btn)
+		return
+	}
+
+	// The find bar is not a modal — the editor stays clickable while it's
+	// open — so it only claims a left-click that actually lands on it.
+	// Without this the toggles and the Replace buttons would be painted
+	// controls that move the text cursor behind them instead of firing.
+	// Right-click and wheel events fall through by design.
+	if a.handleFindMouse(x, y, btn) {
 		return
 	}
 
