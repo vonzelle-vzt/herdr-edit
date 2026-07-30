@@ -47,6 +47,19 @@ features, make sure they're reachable from the main menu first.
   release here tried to commit a formula into someone else's repository; only
   a GitHub 403 stopped it.
 
+### Never push to upstream
+`cloudmanic/spice-edit` is someone else's repo. Two guards, installed by
+`scripts/install-guards.sh` (re-run it after a fresh clone — hooks live in
+`.git/` and are not cloned):
+
+1. `remote.upstream.pushurl = DISABLED` — stops `git push upstream`.
+2. A `pre-push` hook refusing any URL containing `cloudmanic/spice-edit`,
+   in either https or ssh spelling.
+
+Note git runs `pre-push` only AFTER connecting, so today the 403 is what you
+actually see. The hook is what protects you the day that 403 stops happening —
+a permission check is not a design. Contribute upstream by pull request.
+
 ## Architecture map
 
 ```
