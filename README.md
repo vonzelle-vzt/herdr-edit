@@ -354,7 +354,14 @@ make test       # go test ./... with the race detector
 make coverage   # coverage.out + an HTML report
 ```
 
-The test suite covers 14 packages. Conventions (file headers, a `_test.go` beside every source file,
+The test suite covers 14 packages, and `internal/lsp/live_gopls_test.go` drives **every** LSP
+request against a **real** `gopls` — hover, definition, completion, references, rename,
+documentSymbol, signatureHelp and codeAction. That file exists because every other test here feeds
+hand-written JSON to a decoder, which proves the decoder handles the shape it was handed and
+nothing about whether a real server sends it. This fork shipped a "complete, tested" LSP feature
+nobody could reach three separate times; a green decoder test is exactly the evidence that allowed
+it. Install the server with `go install golang.org/x/tools/gopls@latest`; the file skips when it is
+absent, so a fresh clone stays green. Conventions (file headers, a `_test.go` beside every source file,
 `tcell.NewSimulationScreen` for drawing tests) are documented in [`CLAUDE.md`](CLAUDE.md) and
 inherited from upstream — please keep to them.
 
