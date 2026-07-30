@@ -64,7 +64,7 @@ embeds standalone Monaco with no LSP at all.
 
 | Feature | Why it is here |
 | --- | --- |
-| **LSP diagnostics** — inline underlines, severity colours, message + code in the status bar | The one thing a terminal editor genuinely cannot fake. |
+| **LSP diagnostics** — inline underlines, severity colours, message + code in the status bar, and the **message itself rendered dimmed at end-of-line** the way VS Code's Error Lens does | The one thing a terminal editor genuinely cannot fake. An underline tells you *where*; the inline message tells you *what*, without moving the cursor to read a status bar. Only the most severe diagnostic on a line draws, and it truncates rather than wrapping — a two-word fragment of an error is worse than no error. |
 | **Hover and go-to-definition** | The other two things you reach for constantly. |
 | **A file tree that respects `.gitignore`** | Upstream's *fuzzy finder* already honoured it; only the tree did not, so it listed `node_modules/`, `.next/`, `dist/`. On a real Next.js checkout that is **7 of 29** top-level entries. |
 | **Find and *replace*** | Upstream find is case-insensitive substring **jump only** — there was no replace at all. `Esc f` opens the bar; `Tab`, the `›` chevron, or the menu's *Replace in file* expands the replace row. `Alt+c` / `Alt+w` / `Alt+r` toggle case, whole-word and regex — or click `Aa` `ab` `.*`. Enter replaces and advances; Shift+Enter replaces every match **as one undo step**. A pattern that will not compile says so, instead of reporting "no results". |

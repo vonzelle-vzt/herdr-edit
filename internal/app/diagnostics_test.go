@@ -229,6 +229,163 @@ func TestOverlaySkipsScrolledOffLines(t *testing.T) {
 	}
 }
 
+// screenText reads the row at y from a simulation screen's contents as a
+// plain string, so overlay tests can assert on substrings instead of poking
+// individual cells.
+func screenText(cells []tcell.SimCell, w, y int) string {
+	var b strings.Builder
+	for x := 0; x < w; x++ {
+		b.WriteRune(cells[y*w+x].Runes[0])
+	}
+	return b.String()
+}
+
+// TestInlineMessageRendersAfterLine is the core Error Lens assertion: the
+// diagnostic's own message shows up dimmed past the end of the offending
+// line, in addition to the underline this pass already paints.
+func TestInlineMessageRendersAfterLine(t *testing.T) {
+	a, path := appWithFile(t, "package main\n\nfunc oops() {}\n")
+	a.handleDiagnostics(&diagnosticsEvent{when: time.Now(), uri: lsp.URI(path),
+		diags: []lsp.Diagnostic{diag(2, 5, 9, lsp.SeverityError, "undefined: oops")}})
+
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(120, 40)
+	a.width, a.height = 120, 40
+	a.draw()
+	scr.Show()
+
+	ex, ey, _, _ := a.editorRect()
+	cells, w, _ := scr.GetContents()
+	row := screenText(cells, w, ey+2)
+	if !strings.Contains(row, "undefined: oops") {
+		t.Fatalf("expected the inline message on the diagnostic's line, got %q", row)
+	}
+
+	// The message must start a couple of columns after the line's own text,
+	// not glued onto it.
+	tab := a.activeTabPtr()
+	gut := tab.GutterWidth()
+	lineEnd := ex + gut + tab.LineRuneLen(2)
+	msgStart := strings.Index(row, "undefined: oops")
+	if msgStart < lineEnd-ex+inlineMessageGap {
+		t.Fatalf("message started at col %d, wanted at least %d columns after line end (%d)", msgStart, inlineMessageGap, lineEnd-ex)
+	}
+
+	// The underline this pass already paints must still be there.
+	underlined := func(col int) bool {
+		x := ex + gut + col
+		y := ey + 2
+		_, _, attr := cells[y*w+x].Style.Decompose()
+		return attr&tcell.AttrUnderline != 0
+	}
+	for col := 5; col < 9; col++ {
+		if !underlined(col) {
+			t.Errorf("column %d should still be underlined", col)
+		}
+	}
+}
+
+// TestInlineMessageTruncatesRatherThanOverflows guards the narrow-pane case:
+// a long message must be cut with an ellipsis rather than running past the
+// editor rectangle or wrapping onto another row.
+func TestInlineMessageTruncatesRatherThanOverflows(t *testing.T) {
+	a, path := appWithFile(t, "x\n")
+	long := "this is a very long diagnostic message that will never fit in a narrow pane at all"
+	a.handleDiagnostics(&diagnosticsEvent{when: time.Now(), uri: lsp.URI(path),
+		diags: []lsp.Diagnostic{diag(0, 0, 1, lsp.SeverityError, long)}})
+
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(40, 20)
+	a.width, a.height = 40, 20
+	a.draw()
+	scr.Show()
+
+	ex, ey, ew, _ := a.editorRect()
+	cells, w, _ := scr.GetContents()
+	row := screenText(cells, w, ey)
+
+	if strings.Contains(row, long) {
+		t.Fatalf("the full message must not fit verbatim in a narrow pane, got %q", row)
+	}
+	// Nothing of ours may render past the editor rectangle's right edge.
+	for x := ex + ew; x < w; x++ {
+		if _, _, attr := cells[ey*w+x].Style.Decompose(); attr&tcell.AttrDim != 0 {
+			t.Fatalf("inline message overflowed the editor rect at x=%d", x)
+		}
+	}
+}
+
+// TestInlineMessageSkipsWhenTooNarrow pins the "never a two-word fragment"
+// rule: with fewer than inlineMessageMinWidth columns free after the line,
+// nothing should be drawn at all.
+func TestInlineMessageSkipsWhenTooNarrow(t *testing.T) {
+	a, path := appWithFile(t, "a line that almost fills a very narrow pane\n")
+	a.handleDiagnostics(&diagnosticsEvent{when: time.Now(), uri: lsp.URI(path),
+		diags: []lsp.Diagnostic{diag(0, 0, 1, lsp.SeverityError, "should not appear")}})
+
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(50, 20)
+	a.width, a.height = 50, 20
+	a.draw()
+	scr.Show()
+
+	_, ey, _, _ := a.editorRect()
+	cells, w, _ := scr.GetContents()
+	row := screenText(cells, w, ey)
+	if strings.Contains(row, "should not appear") {
+		t.Fatalf("message should have been skipped for lack of room, got %q", row)
+	}
+}
+
+// TestInlineMessageOnlyMostSevere covers the reduction step: with a hint and
+// an error on the same line, only the error's message may be drawn.
+func TestInlineMessageOnlyMostSevere(t *testing.T) {
+	a, path := appWithFile(t, "package main\n\nfunc oops() {}\n")
+	a.handleDiagnostics(&diagnosticsEvent{when: time.Now(), uri: lsp.URI(path), diags: []lsp.Diagnostic{
+		diag(2, 0, 4, lsp.SeverityHint, "minor hint message"),
+		diag(2, 5, 9, lsp.SeverityError, "undefined: oops"),
+	}})
+
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(120, 40)
+	a.width, a.height = 120, 40
+	a.draw()
+	scr.Show()
+
+	_, ey, _, _ := a.editorRect()
+	cells, w, _ := scr.GetContents()
+	row := screenText(cells, w, ey+2)
+	if !strings.Contains(row, "undefined: oops") {
+		t.Fatalf("expected the error's message, got %q", row)
+	}
+	if strings.Contains(row, "minor hint message") {
+		t.Fatalf("the hint's message must not draw alongside the error's, got %q", row)
+	}
+}
+
+// TestInlineMessageSkipsWrappedTabs pins the wrap-mode rule: with Tab.Wrap on,
+// ScreenPos no longer maps one buffer line to one screen row, so the inline
+// pass must skip rather than guess at a row.
+func TestInlineMessageSkipsWrappedTabs(t *testing.T) {
+	a, path := appWithFile(t, "package main\n\nfunc oops() {}\n")
+	a.handleDiagnostics(&diagnosticsEvent{when: time.Now(), uri: lsp.URI(path),
+		diags: []lsp.Diagnostic{diag(2, 5, 9, lsp.SeverityError, "undefined: oops")}})
+	a.activeTabPtr().Wrap = true
+
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(120, 40)
+	a.width, a.height = 120, 40
+	a.draw() // must not panic even though the wrapped renderer changed row layout
+	scr.Show()
+
+	cells, w, h := scr.GetContents()
+	for y := 0; y < h; y++ {
+		if strings.Contains(screenText(cells, w, y), "undefined: oops") {
+			t.Fatalf("inline message must not draw for a wrapped tab, found it on row %d", y)
+		}
+	}
+}
+
 // TestLSPCallsAreNilSafe keeps the whole feature optional: with no server
 // available every hook must be a no-op rather than a crash.
 func TestLSPCallsAreNilSafe(t *testing.T) {

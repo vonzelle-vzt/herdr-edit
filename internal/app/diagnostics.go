@@ -14,6 +14,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
+	"github.com/cloudmanic/spice-edit/internal/editor"
 	"github.com/cloudmanic/spice-edit/internal/lsp"
 )
 
@@ -300,6 +301,90 @@ func (a *App) drawDiagnostics() {
 			}
 		}
 	}
+
+	a.drawDiagnosticsInline(tab, diags, ex, ey, ew, eh)
+}
+
+// inlineMessageGap is the blank space kept between the last rune on a line
+// and where its Error Lens style message begins, so the message never reads
+// as glued onto the code.
+const inlineMessageGap = 2
+
+// inlineMessageMinWidth is the least horizontal room worth spending on an
+// inline message. A two-word fragment of an error is worse than no message
+// at all, so anything narrower than this is skipped rather than truncated
+// down to nothing useful.
+const inlineMessageMinWidth = 20
+
+// drawDiagnosticsInline renders the most severe diagnostic on each affected
+// line as dimmed text past the end of that line — VS Code's Error Lens.
+//
+// It is called at the end of drawDiagnostics rather than folded into its
+// loop: the underline pass walks every diagnostic's full range one column at
+// a time, while this pass only ever needs one line's worth of text, and
+// keeping the two loops separate is what makes "only the most severe
+// diagnostic draws" a single, easy-to-read reduction step instead of state
+// threaded through the underline arithmetic.
+//
+// Wrapped tabs are skipped outright rather than mapped: Tab.ScreenPos (like
+// the rest of the unwrapped geometry) assumes one buffer line is one screen
+// row, which word wrap breaks, and a message placed on the wrong row is
+// worse than no message at all.
+func (a *App) drawDiagnosticsInline(tab *editor.Tab, diags []lsp.Diagnostic, ex, ey, ew, eh int) {
+	if tab.Wrap {
+		return
+	}
+
+	// Reduce to the single most severe diagnostic per line, keyed on where it
+	// starts — the same position the underline and the gutter already agree
+	// to call "that diagnostic's line".
+	best := make(map[int]lsp.Diagnostic)
+	for _, d := range diags {
+		line := d.Range.Start.Line
+		if cur, ok := best[line]; !ok || severityRank(d.Severity) < severityRank(cur.Severity) {
+			best[line] = d
+		}
+	}
+
+	for line, d := range best {
+		msg := lsp.FirstLine(d.Message)
+		if msg == "" {
+			continue
+		}
+		endCol := tab.LineRuneLen(line)
+		// The gutter-to-screen mapping is shared with the underline pass on
+		// purpose: a second copy of this arithmetic is exactly how a squiggle
+		// and its message would eventually disagree about where a line ends.
+		dx, dy, ok := tab.ScreenPos(line, endCol, ew, eh)
+		if !ok {
+			continue
+		}
+		startX := dx + inlineMessageGap
+		avail := ew - startX
+		if avail < inlineMessageMinWidth {
+			continue
+		}
+		text := truncateEllipsis(msg, avail)
+		style := tcell.StyleDefault.Foreground(a.diagnosticColor(d.Severity)).Dim(true)
+		sx, sy := ex+startX, ey+dy
+		for i, r := range []rune(text) {
+			a.screen.SetContent(sx+i, sy, r, nil, style)
+		}
+	}
+}
+
+// truncateEllipsis shortens s to at most maxCols runes, replacing the tail
+// with a single ellipsis so a long message can never overrun its budget or
+// wrap onto a second row.
+func truncateEllipsis(s string, maxCols int) string {
+	runes := []rune(s)
+	if len(runes) <= maxCols {
+		return s
+	}
+	if maxCols <= 1 {
+		return "…"
+	}
+	return string(runes[:maxCols-1]) + "…"
 }
 
 // diagnosticStatus is the one-line summary for the status bar: what is wrong
