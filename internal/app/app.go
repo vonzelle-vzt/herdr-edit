@@ -34,6 +34,7 @@ import (
 	"github.com/cloudmanic/spice-edit/internal/finder"
 	"github.com/cloudmanic/spice-edit/internal/icons"
 	"github.com/cloudmanic/spice-edit/internal/spiceconfig"
+	"github.com/cloudmanic/spice-edit/internal/state"
 	"github.com/cloudmanic/spice-edit/internal/theme"
 	"github.com/cloudmanic/spice-edit/internal/version"
 )
@@ -44,8 +45,26 @@ const (
 	defaultSidebarWidth = 30
 	minSidebarWidth     = 18
 	minEditorAfterDrag  = 40
-	minWidth            = 50
-	minHeight           = 24
+
+	// minWidth / minHeight are the point below which the editor genuinely cannot render anything
+	// useful and shows the "too small" notice instead.
+	//
+	// These used to be 50x24, which made a side panel painful: the file tree alone is a fixed 30
+	// columns, so a 50-column panel left 20 for code, and dragging one column narrower replaced
+	// the whole editor with "Window too small - please resize". A panel was only usable inside a
+	// narrow band and gave no hint which way to go.
+	//
+	// The fix is to degrade instead of refusing. Below sidebarNeeds the file tree hides itself and
+	// the editor takes the full width, which is what VS Code does when you shrink a window, so
+	// these floors only have to cover a bare editor: enough columns for line numbers plus some
+	// code, and enough rows for the tab bar, one line, and the status bar.
+	minWidth  = 24
+	minHeight = 8
+
+	// sidebarNeeds is the total width at which the file tree stops earning its 30 columns. Below
+	// it the tree auto-hides so the editor stays readable; the user preference is untouched, so
+	// widening the pane brings the tree straight back.
+	sidebarNeeds = 76
 	statusFlashFor      = 3 * time.Second
 	doubleClickMs       = 500 * time.Millisecond
 	doubleEscMs         = 500 * time.Millisecond
@@ -320,6 +339,13 @@ type App struct {
 	tabs      []*editor.Tab
 	activeTab int
 
+	// startRows maps start-page rows back to files so a click can open them. Rebuilt each draw.
+	startRows []startRow
+
+	// active publishes {file,line,col,root} to a well-known path so companion tools can follow
+	// along. Nil-safe, debounced, and every failure is swallowed — see internal/state.
+	active *state.Publisher
+
 	// activeFolder is the directory the editor is currently "working
 	// in" — the default target for New File from the main menu. It
 	// updates whenever the user clicks a folder in the tree, opens a
@@ -504,6 +530,7 @@ func New(rootDir string) (*App, error) {
 		screen:         scr,
 		theme:          th,
 		rootDir:        rootDir,
+		active:         state.NewPublisher(),
 		tree:           tree,
 		hoveredMenuRow: -1,
 		sidebarShown:   true,
@@ -563,6 +590,7 @@ func NewSingleFile(filePath string) (*App, error) {
 		screen:         scr,
 		theme:          th,
 		rootDir:        rootDir,
+		active:         state.NewPublisher(),
 		tree:           nil,
 		hoveredMenuRow: -1,
 		sidebarShown:   false,
@@ -717,9 +745,22 @@ func (a *App) Run() error {
 		}
 		a.handleEvent(ev)
 		a.draw()
+		a.publishActive()
 		a.screen.Show()
 	}
+	a.active.Flush() // do not lose the final position inside the debounce window
 	return nil
+}
+
+// publishActive tells internal/state where the cursor is. Called once per event from Run rather
+// than from each of the ~40 places that move the cursor or switch tabs: a single call site cannot
+// miss a case, and Publisher.Set is a couple of comparisons when nothing changed.
+func (a *App) publishActive() {
+	if tab := a.activeTabPtr(); tab != nil {
+		a.active.Set(tab.Path, tab.Cursor.Line, tab.Cursor.Col, a.rootDir)
+		return
+	}
+	a.active.Set("", 0, 0, a.rootDir)
 }
 
 // handleEvent routes a tcell event to its specific handler.
@@ -879,10 +920,18 @@ func (a *App) reconcileOpenTabsWithDisk() {
 // helper and click router goes through this so toggling/resizing the
 // panel reshapes the entire UI in one place.
 func (a *App) sidebarW() int {
-	if !a.sidebarShown {
+	if !a.sidebarVisible() {
 		return 0
 	}
 	return a.sidebarWidth
+}
+
+// sidebarVisible reports whether the file tree is actually on screen: the user has to want it AND
+// the window has to be wide enough to afford it. Keeping the auto-hide separate from the
+// sidebarShown preference means a narrow pane borrows the tree's columns without forgetting that
+// the user asked for a tree — widen the pane and it reappears with no keypress.
+func (a *App) sidebarVisible() bool {
+	return a.sidebarShown && a.tree != nil && a.width >= sidebarNeeds
 }
 
 // sidebarRect returns the file tree's render rectangle (one column
@@ -899,7 +948,7 @@ func (a *App) sidebarRect() (x, y, w, h int) {
 // splitterX returns the x coordinate of the resize splitter column, or -1
 // when the sidebar is hidden (no splitter to draw or click).
 func (a *App) splitterX() int {
-	if !a.sidebarShown {
+	if !a.sidebarVisible() {
 		return -1
 	}
 	return a.sidebarWidth - 1
@@ -1258,6 +1307,11 @@ func (a *App) handleMouse(ev *tcell.EventMouse) {
 		case y == 0:
 			a.tabBarClick(x, y)
 		case y > 0 && y < a.height-1:
+			// With no tab open the editor region is the start page, whose rows are clickable.
+			// Only fall through to editorPress when the click missed every row.
+			if a.handleStartPageClick(x, y) {
+				return
+			}
 			a.editorPress(x, y)
 			a.dragMode = "editor"
 		}
@@ -2199,12 +2253,24 @@ func (a *App) menuToggleSidebar() {
 		a.flash("No file explorer in single-file mode")
 		return
 	}
+	// When the pane is too narrow the tree is already auto-hidden, so flipping the preference
+	// looks like the toggle did nothing. Say why instead of silently no-op-ing.
+	if a.sidebarShown && a.width < sidebarNeeds {
+		a.flash(fmt.Sprintf("File explorer is hidden automatically below %d columns (pane is %d)",
+			sidebarNeeds, a.width))
+		return
+	}
 	a.sidebarShown = !a.sidebarShown
 }
 
 // sidebarToggleLabel returns the label the toggle row should display given
 // the current sidebar state. Drawn dynamically by drawMenu.
 func (a *App) sidebarToggleLabel() string {
+	// Reflect what is on screen, not just the preference: with the tree auto-hidden by a narrow
+	// pane, offering "Hide file explorer" would be describing something the user cannot see.
+	if a.sidebarShown && !a.sidebarVisible() {
+		return "File explorer (hidden - pane too narrow)"
+	}
 	if a.sidebarShown {
 		return "Hide file explorer"
 	}
@@ -2266,7 +2332,7 @@ func (a *App) draw() {
 		return
 	}
 
-	if a.sidebarShown {
+	if a.sidebarVisible() {
 		sx, sy, sw, sh := a.sidebarRect()
 		a.tree.Render(a.screen, a.theme, sx, sy, sw, sh)
 		a.drawSplitter()
@@ -2278,7 +2344,7 @@ func (a *App) draw() {
 		ex, ey, ew, eh := a.editorRect()
 		tab.Render(a.screen, a.theme, ex, ey, ew, eh)
 	} else {
-		a.drawEmptyEditor()
+		a.drawStartPage()
 	}
 
 	if a.findOpen {
@@ -2464,30 +2530,6 @@ func (a *App) drawMenuButton() {
 	a.screen.SetContent(mx+mw/2, my, '≡', nil, style)
 }
 
-// drawEmptyEditor paints the placeholder shown when no tabs are open.
-func (a *App) drawEmptyEditor() {
-	ex, ey, ew, eh := a.editorRect()
-	bg := a.theme.BG
-	muted := tcell.StyleDefault.Background(bg).Foreground(a.theme.Muted)
-	bold := tcell.StyleDefault.Background(bg).Foreground(a.theme.Text).Bold(true)
-	for cy := ey; cy < ey+eh; cy++ {
-		for cx := ex; cx < ex+ew; cx++ {
-			a.screen.SetContent(cx, cy, ' ', nil, muted)
-		}
-	}
-	cy := ey + eh/2
-	msg1 := "No file open"
-	msg2 := "Click a file in the tree, or  ≡  for the menu"
-	cx1 := ex + (ew-len([]rune(msg1)))/2
-	for i, r := range msg1 {
-		a.screen.SetContent(cx1+i, cy-1, r, nil, bold)
-	}
-	cx2 := ex + (ew-len([]rune(msg2)))/2
-	for i, r := range msg2 {
-		a.screen.SetContent(cx2+i, cy+1, r, nil, muted)
-	}
-	a.screen.HideCursor()
-}
 
 // drawStatusBar paints the bottom status bar.
 func (a *App) drawStatusBar() {
