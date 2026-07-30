@@ -5,7 +5,7 @@
 # Copyright: 2026 Cloudmanic, LLC. All rights reserved.
 # =============================================================================
 
-BINARY := spiceedit-vzt
+BINARY := herdr-edit
 SITE_DIR := website
 
 .PHONY: run build install build-linux test test-short coverage tidy clean help \

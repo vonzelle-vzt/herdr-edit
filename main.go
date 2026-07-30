@@ -124,7 +124,7 @@ func main() {
 
 	switch res.Action {
 	case actionVersion:
-		fmt.Println("spiceedit-vzt", version.Version, "(fork of cloudmanic/spice-edit)")
+		fmt.Println("herdr-edit", version.Version, "(fork of cloudmanic/spice-edit)")
 		return
 	case actionHelp:
 		printHelp()

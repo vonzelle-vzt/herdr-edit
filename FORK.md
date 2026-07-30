@@ -1,4 +1,4 @@
-# spiceedit-vzt — a fork of [cloudmanic/spice-edit](https://github.com/cloudmanic/spice-edit)
+# herdr-edit — a fork of [cloudmanic/spice-edit](https://github.com/cloudmanic/spice-edit)
 
 SpiceEdit is an excellent mouse-first terminal editor by
 [Spicer Matthews](https://github.com/cloudmanic). All the credit for what this is belongs there;
@@ -43,9 +43,9 @@ opinionated, and stay here.
 ## Building
 
 ```sh
-make build      # -> bin/spiceedit-vzt
+make build      # -> bin/herdr-edit
 make test       # go test ./... with the race detector
 ```
 
-The binary is deliberately named `spiceedit-vzt`, not `spiceedit`, so it can sit alongside an
+The binary is deliberately named `herdr-edit`, not `spiceedit`, so it can sit alongside an
 upstream install without either shadowing the other.
