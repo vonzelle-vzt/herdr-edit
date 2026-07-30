@@ -32,7 +32,9 @@ type leaderBinding struct {
 //
 // Intentionally not bound:
 //   - c / x / v (clipboard) — the host terminal's Cmd+C/V already covers
-//     that path; adding a third channel just adds confusion.
+//     that path; adding a third channel just adds confusion. Completion was
+//     briefly bound to c in violation of this and has moved to SPACE, which is
+//     both free and the muscle memory from VS Code's Ctrl+Space.
 //   - rename / delete / revert — destructive enough that we want the
 //     menu's confirm dialog to gate the action as a deliberate gesture.
 func leaderBindings() []leaderBinding {
@@ -51,7 +53,8 @@ func leaderBindings() []leaderBinding {
 		{'a', (*App).menuSelectAll},
 		{'k', (*App).openCommandPalette},
 		{'b', (*App).menuToggleInlineBlame},
-		{'c', (*App).menuComplete},
+		{' ', (*App).menuComplete},
+		{'o', (*App).menuOpenChanges},
 		// LSP. Both requests were implemented, tested and advertised in initialize with no caller;
 		// these two keys are the entire wiring.
 		{'h', (*App).menuHover},

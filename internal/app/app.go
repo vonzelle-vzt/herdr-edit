@@ -239,7 +239,8 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Replace in file", action: (*App).menuReplace, enabled: (*App).hasFindable},
 			{label: "Find file in project", shortcut: "Esc p", action: (*App).menuFindFile, enabled: (*App).hasFinder},
 			{label: "Run a command", shortcut: "Esc k", action: (*App).menuCommandPalette, enabled: alwaysTrue},
-			{label: "Complete at cursor", shortcut: "Esc c", action: (*App).menuComplete, enabled: (*App).hasFindable},
+			{label: "Complete at cursor", shortcut: "Esc space", action: (*App).menuComplete, enabled: (*App).hasFindable},
+			{label: "Open changes (diff)", shortcut: "Esc o", action: (*App).menuOpenChanges, enabled: (*App).hasFileTab},
 			{shortcut: "Esc b", action: (*App).menuToggleInlineBlame, enabled: alwaysTrue, labelFor: (*App).inlineBlameLabel},
 			{label: "Go to line", shortcut: "Esc g", action: (*App).menuGoToLine, enabled: (*App).hasFindable},
 			{label: "Select all", shortcut: "Esc a", action: (*App).menuSelectAll, enabled: (*App).hasFindable},
@@ -562,6 +563,11 @@ type App struct {
 
 	// Highest open-request sequence already honoured. See consumeOpenRequest.
 	lastOpenSeq int64
+
+	// Diff view — Esc o. diffSource is the real file the open synthetic tab is
+	// showing, so a second Esc o can flip the baseline instead of stacking tabs.
+	diffSource   string
+	diffBaseline diffBaseline
 
 	finderOpen     bool
 	finderQuery    []rune

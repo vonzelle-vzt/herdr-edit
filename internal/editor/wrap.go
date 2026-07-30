@@ -323,7 +323,7 @@ func (t *Tab) renderWrapped(scr tcell.Screen, th theme.Theme, x, y, w, h int) {
 	// line, so it is unaffected by wrapping; only the number of lines to cover changes, and a
 	// viewport of h rows can never span more than h buffer lines.
 	if t.StyleStale || t.ScrollY != t.lastHighlightScrollY || h != t.lastHighlightHeight {
-		t.Styles = HighlightVisible(t.Path, t.Buffer.Lines, t.ScrollY, h, th)
+		t.Styles = HighlightVisible(t.HighlightKey(), t.Buffer.Lines, t.ScrollY, h, th)
 		t.StyleStale = false
 		t.lastHighlightScrollY = t.ScrollY
 		t.lastHighlightHeight = h

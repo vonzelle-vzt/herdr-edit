@@ -1815,13 +1815,13 @@ func TestMenuLayout_NoCustomActions(t *testing.T) {
 	a.customActions = nil
 	items, dividers, h := a.menuLayout()
 
-	if h != 37 {
-		t.Errorf("modalHeight = %d, want 37", h)
+	if h != 38 {
+		t.Errorf("modalHeight = %d, want 38", h)
 	}
-	if got := len(items); got != 27 {
-		t.Errorf("item count = %d, want 27 built-ins", got)
+	if got := len(items); got != 28 {
+		t.Errorf("item count = %d, want 28 built-ins", got)
 	}
-	wantDiv := []int{2, 6, 10, 19, 27, 32, 34}
+	wantDiv := []int{2, 6, 10, 20, 28, 33, 35}
 	if len(dividers) != len(wantDiv) {
 		t.Fatalf("dividers = %v, want %v", dividers, wantDiv)
 	}
@@ -1982,8 +1982,8 @@ func TestMenuLayout_WithCustomActions(t *testing.T) {
 	}
 	items, _, h := a.menuLayout()
 
-	if h != 40 { // 37 + 2 items + 1 divider
-		t.Errorf("modalHeight = %d, want 40", h)
+	if h != 41 { // 38 + 2 items + 1 divider
+		t.Errorf("modalHeight = %d, want 41", h)
 	}
 	// Custom actions should be the second-to-last and third-to-last
 	// rows, with Quit as the final row.

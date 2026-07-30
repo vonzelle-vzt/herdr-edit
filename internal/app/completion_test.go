@@ -148,8 +148,14 @@ func TestHandleCompletion_IgnoresStaleAnswers(t *testing.T) {
 // TestCompletion_Reachable guards the failure this fork has now hit three
 // times: a complete, tested request with no caller.
 func TestCompletion_Reachable(t *testing.T) {
-	if leaderActionFor('c') == nil {
-		t.Fatal("Esc c is not bound — completion is unreachable")
+	// c stays UNBOUND: CLAUDE.md reserves c/x/v so the host terminal's own
+	// clipboard is the only clipboard channel. Completion lives on SPACE, which
+	// is also the muscle memory from VS Code's Ctrl+Space.
+	if leaderActionFor(' ') == nil {
+		t.Fatal("Esc space is not bound — completion is unreachable")
+	}
+	if leaderActionFor('c') != nil {
+		t.Fatal("c must stay unbound — it is reserved for the terminal's clipboard")
 	}
 	a := newTestApp(t, t.TempDir())
 	items, _, _ := a.menuLayout()

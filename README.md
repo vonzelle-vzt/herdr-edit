@@ -77,6 +77,7 @@ embeds standalone Monaco with no LSP at all.
 | **Inline git blame** | `Esc b`. Author, coarse relative age and subject, dimmed at end-of-line. Only the cursor's line is blamed — `git blame` on a whole file is linear in history and would run on every scroll. Diagnostics win the end of the line when both want it. |
 | **Go to line, select all** | `Esc g`, `Esc a`. `SelectAll` had been complete and unit-tested in `internal/editor` with **zero** non-test callers; only the wiring was missing. |
 | **`--open-at`, the reverse contract** | `herdr-edit --open-at path:line[:col]` asks an **already-running** editor to jump there. `active.json` flows editor → panels; this flows panels → editor, which is what turns a read-only review into an edit: the Review panel hands you a line from the agent's diff and you land on it with a language server attached. |
+| **A diff view** | `Esc o` opens the active file's diff as a real tab, and pressing it again flips the baseline between your branch's **merge-base** and **HEAD** — "what does this branch change" versus "what have I not committed", which are different questions and the first is the one you ask of an agent's work. Built as a *synthetic tab* rather than a new render mode: word wrap already taught this codebase what a second geometry path costs, so a tab whose buffer happens to hold diff text inherits scrolling, search, selection and mouse hit-testing for free, and refuses to save. |
 | **Persistent undo** | History used to die with the process. |
 | **Active-file publishing** | A debounced `{file,line,col,root}` snapshot other tools can read. |
 
@@ -112,11 +113,12 @@ primary surface, because macOS Terminal and tmux frequently swallow right-click.
 | `Esc` `h` | **Hover** — types and docs at the cursor | needs a language server |
 | `Esc` `d` | **Go to definition** | needs a language server |
 | `Esc` `z` | Toggle **word wrap** | per tab, off by default |
-| `Esc` `c` | **Complete at cursor** | LSP autocomplete; explicitly invoked, never as-you-type |
+| `Esc` `space` | **Complete at cursor** | LSP autocomplete; explicitly invoked, never as-you-type. `space` mirrors VS Code's Ctrl+Space, and keeps `c` free for the terminal's own clipboard |
 | `Esc` `k` | **Command palette** | fuzzy search over every action |
 | `Esc` `g` | **Go to line** | accepts `N` or `N:C` |
 | `Esc` `a` | **Select all** | |
 | `Esc` `b` | Toggle **inline git blame** | author and commit on the cursor's line |
+| `Esc` `o` | **Open changes** — the file's diff as a tab | press again to flip merge-base ⟷ HEAD |
 
 Deliberately unbound: `c` / `x` / `v`, because the terminal's own copy and paste already own that
 path; and rename / delete / revert, which are destructive enough to want the menu's confirm dialog.

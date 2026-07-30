@@ -90,12 +90,12 @@ const (
 // the per-tab view state (scroll position, cursor, selection anchor), the
 // cached syntax-highlight styles, and a dirty flag.
 type Tab struct {
-	Path       string // Empty for an unsaved/scratch tab.
-	Buffer     *Buffer
-	Cursor     Position // Where new typed text appears.
-	Anchor     Position // Selection anchor; equals Cursor when nothing is selected.
-	ScrollY    int      // Index of the first visible line.
-	ScrollX    int      // Index of the first visible column (rune-indexed). Always 0 when Wrap.
+	Path    string // Empty for an unsaved/scratch tab.
+	Buffer  *Buffer
+	Cursor  Position // Where new typed text appears.
+	Anchor  Position // Selection anchor; equals Cursor when nothing is selected.
+	ScrollY int      // Index of the first visible line.
+	ScrollX int      // Index of the first visible column (rune-indexed). Always 0 when Wrap.
 
 	// Wrap reflows long lines onto extra screen rows instead of letting them run off to the right.
 	// Off by default, matching VS Code, and it gates an entirely separate geometry path (wrap.go) --
@@ -105,7 +105,7 @@ type Tab struct {
 	// ScrollSub is how many of ScrollY's wrapped rows are scrolled off the top. Only meaningful when
 	// Wrap is set. Without it a single line longer than the viewport could not be scrolled through:
 	// you would see its first screenful and have no way to reach the rest.
-	ScrollSub int
+	ScrollSub  int
 	Dirty      bool
 	Styles     [][]tcell.Style
 	StyleStale bool
@@ -177,6 +177,12 @@ type Tab struct {
 	FindWholeWord     bool
 	FindRegex         bool
 	FindErr           error
+
+	// Synthetic marks a tab whose content was GENERATED (the diff view) rather
+	// than read from a file. Such a tab has no Path, must never be saved, and
+	// highlights by Label instead. See synthetic.go.
+	Synthetic bool
+	Label     string
 
 	// IndentUnit is the string the editor inserts when the user presses
 	// Tab. Detected on file open (DetectIndent) so the editor matches
@@ -264,6 +270,9 @@ func (t *Tab) IsImage() bool {
 
 // DisplayName returns the basename of Path, or "untitled" for unsaved tabs.
 func (t *Tab) DisplayName() string {
+	if t.Synthetic {
+		return t.Label
+	}
 	if t.Path == "" {
 		return "untitled"
 	}
@@ -278,6 +287,9 @@ func (t *Tab) DisplayName() string {
 func (t *Tab) Save() error {
 	if t.IsImage() {
 		return fmt.Errorf("image tabs are read-only")
+	}
+	if t.Synthetic {
+		return fmt.Errorf("%s is a generated view and cannot be saved", t.Label)
 	}
 	if t.Path == "" {
 		return fmt.Errorf("no path set for tab")
@@ -787,7 +799,7 @@ func (t *Tab) Render(scr tcell.Screen, th theme.Theme, x, y, w, h int) {
 	// indexed by absolute line number and only carries the visible rows, so
 	// a scroll change means different rows must be filled.
 	if t.StyleStale || t.ScrollY != t.lastHighlightScrollY || h != t.lastHighlightHeight {
-		t.Styles = HighlightVisible(t.Path, t.Buffer.Lines, t.ScrollY, h, th)
+		t.Styles = HighlightVisible(t.HighlightKey(), t.Buffer.Lines, t.ScrollY, h, th)
 		t.StyleStale = false
 		t.lastHighlightScrollY = t.ScrollY
 		t.lastHighlightHeight = h
