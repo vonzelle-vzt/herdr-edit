@@ -357,6 +357,14 @@ If you're touching the workflow or `.goreleaser.yml`, make sure both
 auto-commits keep their `[skip ci]` markers — without them the workflow
 loops forever.
 
+🔴 **A source build goes stale silently, and merging is what makes it stale.** Every
+push to `main` auto-tags a release, so `go build -o ~/.local/bin/herdr-edit .` from
+last week is now behind — while still being first on `PATH` and reporting no
+problem at all. Observed for real: a locally built 0.5.0 running against a tap at
+0.5.4, which means a bug you already fixed keeps reproducing.
+**Rebuild after every pull.** `herdr-extensions doctor` now compares the binary on
+`PATH` against the version in the tapped formula and warns when it is behind.
+
 🔴 **The git identity must stay in its own ungated step.** It used to live inside
 `Commit version bump`, which is gated on the auto-bump path (step 2 above), and
 `Tag release` borrowed it as a side effect. So hand-editing `version.go` — the

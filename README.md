@@ -151,6 +151,11 @@ make test           # go test -race ./...   (14 packages)
 make install        # -> $GOPATH/bin
 ```
 
+⚠️ **Rebuild after every pull.** A source build never updates itself, and every push to
+`main` here auto-tags a release — so a binary built last week is behind while still being
+first on your `PATH` and reporting nothing wrong. `herdr-extensions doctor` compares the
+binary on `PATH` against the tap and warns when it has fallen behind.
+
 The binary is deliberately named `herdr-edit`, **not** `spiceedit`, so it can sit alongside an
 upstream install without either shadowing the other. If you build from source *and* install via brew,
 note that whichever of `~/.local/bin` or `/opt/homebrew/bin` comes first on your `PATH` wins — and
