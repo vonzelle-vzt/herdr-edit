@@ -60,6 +60,20 @@ Note git runs `pre-push` only AFTER connecting, so today the 403 is what you
 actually see. The hook is what protects you the day that 403 stops happening —
 a permission check is not a design. Contribute upstream by pull request.
 
+🔴 **Both guards cover `git push`. Neither covers `gh pr create`.** In a repo
+GitHub knows is a fork, bare `gh pr create` defaults the **base to the parent**,
+so it opens the PR against `cloudmanic/spice-edit` — pushing our branch into
+someone else's review queue. Observed: it fails with *"No commits between
+cloudmanic:main and vonzelle-vzt:…"*, which reads like a branch problem and is
+actually the wrong repository. Always be explicit:
+
+```sh
+gh pr create --repo vonzelle-vzt/herdr-edit --base main --head <branch>
+```
+
+The `--repo` flag is the guard here; there is no hook that can catch this one,
+because no `git` operation takes place.
+
 ## Architecture map
 
 ```
