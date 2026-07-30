@@ -67,7 +67,7 @@ embeds standalone Monaco with no LSP at all.
 | **LSP diagnostics** — inline underlines, severity colours, message + code in the status bar | The one thing a terminal editor genuinely cannot fake. |
 | **Hover and go-to-definition** | The other two things you reach for constantly. |
 | **A file tree that respects `.gitignore`** | Upstream's *fuzzy finder* already honoured it; only the tree did not, so it listed `node_modules/`, `.next/`, `dist/`. On a real Next.js checkout that is **7 of 29** top-level entries. |
-| **Find and *replace*** | Upstream find is case-insensitive substring **jump only** — there was no replace at all. Adds regex, whole-word, case-sensitive, replace, and replace-all **as one undo step**. |
+| **Find and *replace*** | Upstream find is case-insensitive substring **jump only** — there was no replace at all. `Esc f` opens the bar; `Tab`, the `›` chevron, or the menu's *Replace in file* expands the replace row. `Alt+c` / `Alt+w` / `Alt+r` toggle case, whole-word and regex — or click `Aa` `ab` `.*`. Enter replaces and advances; Shift+Enter replaces every match **as one undo step**. A pattern that will not compile says so, instead of reporting "no results". |
 | **Auto-closing brackets and quotes** | Pairs close, closers step over, backspace removes both, and a selection gets *surrounded*. Quotes are suppressed after a word character so `don't` never becomes `don''t`. |
 | **A start page** | With no tab open, the pane showed two lines of grey text. It now shows the project, branch, and changed files — each clickable. |
 | **Word wrap** | Upstream has none. `Esc z` reflows long lines to the pane width, breaking on word boundaries, and re-wraps whenever the pane resizes. Off by default, per tab, like VS Code. |
@@ -84,6 +84,58 @@ The decisions that make SpiceEdit what it is are untouched, on purpose:
 - **No CGO, one static binary.**
 - **Chroma, not tree-sitter.** Pure Go, no setup step.
 - **No new third-party dependencies.** The LSP client is stdlib-only for exactly this reason.
+
+---
+
+## Keys
+
+`Esc` is the leader. Press it, then a letter, within about half a second. Pressing `Esc` **twice**
+opens the `≡` action menu, which lists every action here plus the file operations — the menu is the
+primary surface, because macOS Terminal and tmux frequently swallow right-click.
+
+| Key | Action | |
+| --- | --- | --- |
+| `Esc` `Esc` | Action menu | also: click `≡`, or right-click |
+| `Esc` `s` | Save | |
+| `Esc` `u` / `r` | Undo / redo | history survives closing the editor |
+| `Esc` `n` | New file | relative to the active folder; creates intermediate dirs |
+| `Esc` `w` / `q` | Close tab / quit | |
+| `Esc` `t` | Show/hide the file tree | |
+| `Esc` `/` | Toggle line comment | marker chosen by file type |
+| `Esc` `f` | **Find** in file | |
+| `Esc` `p` | **Find file** in project | fuzzy, background-indexed |
+| `Esc` `h` | **Hover** — types and docs at the cursor | needs a language server |
+| `Esc` `d` | **Go to definition** | needs a language server |
+| `Esc` `z` | Toggle **word wrap** | per tab, off by default |
+
+Deliberately unbound: `c` / `x` / `v`, because the terminal's own copy and paste already own that
+path; and rename / delete / revert, which are destructive enough to want the menu's confirm dialog.
+
+### Inside the find bar
+
+The bar is one row, or two when the replace field is expanded. Expand it with `Tab`, by clicking the
+`›` chevron on the left, or from the menu's *Replace in file*.
+
+| Key | In the find field | In the replace field |
+| --- | --- | --- |
+| `Enter` | next match | **replace** and advance |
+| `Shift`+`Enter` | previous match | **replace all**, as one undo step |
+| `Tab` | expand / focus replace | back to the find field |
+| `Alt`+`c` / `w` / `r` | case-sensitive · whole-word · regex | same |
+| `Esc` | close the bar and clear highlights | same |
+
+Every toggle is also a **click target** — `Aa`, `ab`, `.*` in the bar, and `[Replace]` / `[All]` on
+the replace row — so terminals that never deliver `Alt` lose nothing. Regex is Go's RE2: it cannot
+backtrack, so a hostile pattern cannot hang the editor. A pattern that will not compile says
+`bad pattern` rather than reporting "no results", which would be indistinguishable from a valid
+pattern that genuinely matches nothing.
+
+### Mouse
+
+The editor is mouse-first and expects it to work over SSH. Click to place the cursor, drag to select
+(it auto-scrolls past the edge), wheel to scroll, `Shift`+wheel to scroll horizontally. Click a file
+in the tree to open it, double-click a folder to fold it, and drag the splitter to size the tree —
+a drag pins your width, and double-clicking the splitter hands it back to auto-fit.
 
 ---
 
@@ -254,6 +306,20 @@ forever.
 **Icons need a Nerd Font *and a terminal configured to use it*.** The editor detects fonts on disk;
 it cannot know what font your terminal renders with. A tree full of question marks is almost always
 this. `herdr-extensions doctor` diagnoses it by name.
+
+**A tested engine is not a shipped feature — and this fork has been caught by it twice.** `hover`
+and `definition` were complete, unit-tested and advertised in the LSP `initialize` handshake with
+zero call sites for months. Find-and-*replace* then repeated it exactly: `Tab.Replace`,
+`ReplaceAll` and `SetFindOptions` were fully tested and named as a headline feature in this README
+*and* in FORK.md, while every caller was a `_test.go` file. The bar drew a single row with no
+replace field, so `findOptions()` always returned the zero value and the editor silently behaved
+just like upstream. Before believing a feature here works:
+
+```sh
+grep -rn "\.YourMethod(" --include="*.go" . | grep -v _test.go
+```
+
+A green suite proves the engine is correct, not that a user can reach it.
 
 ---
 

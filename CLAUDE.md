@@ -315,6 +315,26 @@ complete and unreachable. If you add another (`references`, `rename`,
 `documentSymbol`), remember that implementing the request is the easy half;
 grep for a call site before believing it works.
 
+🔴 **This is not an LSP problem — it is a fork-wide pattern, and it has now
+happened twice.** `Tab.Replace`, `Tab.ReplaceAll` and `Tab.SetFindOptions` were
+complete, unit-tested, and advertised in BOTH README.md and FORK.md as a shipped
+headline feature — with **every caller a `_test.go` file**. The find bar drew one
+row, had no replace field and no option toggles, so `findOptions()` always
+returned the zero value: case-insensitive plain substring, i.e. exactly
+upstream's behaviour. A user following the README found nothing there. `FindErr`
+was likewise set by the engine and read by nobody, so an uncompilable regex
+reported "no results" — indistinguishable from a valid pattern matching nothing.
+
+A green test suite proves the engine works, not that anyone can reach it. Before
+believing any feature here is shipped:
+
+```sh
+grep -rn "\.YourMethod(" --include="*.go" . | grep -v _test.go   # needs a real call site
+```
+
+A row in a feature table is a claim about the UI, and only a non-test caller
+substantiates it.
+
 Both run on a goroutine and deliver a **posted event**, like diagnostics. Calling
 inline would block `Run`'s `PollEvent` loop on a language server — gopls answers
 in milliseconds, but an indexing or wedged server would freeze the editor for the
