@@ -1,8 +1,8 @@
 // =============================================================================
 // File: internal/editor/wrap.go
-// Author: Spicer Matthews <spicer@cloudmanic.com>
+// Author: Vonzelle Brown
 // Created: 2026-07-30
-// Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+// Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
 // wrap.go is the visual-line layer: the mapping between buffer positions and screen rows once one

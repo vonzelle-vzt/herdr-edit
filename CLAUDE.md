@@ -106,6 +106,13 @@ Every new source file gets the header block (file name, author, created
 date, copyright year). See existing files for the exact format. Keep
 copyright year matching the **current year** (2026 right now).
 
+🔴 **Put YOUR name in it, not upstream's.** Copying an existing header wholesale
+credits Spicer Matthews / Cloudmanic for a file they never wrote. Inherited files
+keep their original header; genuinely new files in this fork are
+`Author: Vonzelle Brown` / `Copyright: 2026 Vonzelle Brown`. This was got wrong on
+four files (`wrap.go`, `wrap_test.go`, `lspactions.go`, `lspactions_test.go`) by
+pattern-matching the convention instead of thinking about it.
+
 ### Comments
 - A short doc comment above every function (public **and** private)
   explaining intent. This is a project-wide convention — don't skip it.

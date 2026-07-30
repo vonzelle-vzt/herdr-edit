@@ -1,8 +1,8 @@
 // =============================================================================
 // File: internal/app/lspactions.go
-// Author: Spicer Matthews <spicer@cloudmanic.com>
+// Author: Vonzelle Brown
 // Created: 2026-07-30
-// Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+// Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
 // lspactions.go wires hover and go-to-definition to the UI.
