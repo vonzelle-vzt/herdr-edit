@@ -33,7 +33,19 @@ func (t *Tab) ScreenPos(line, col, viewW, viewH int) (dx, dy int, visible bool) 
 		return 0, 0, false
 	}
 	gut := t.GutterWidth()
-	dx = gut + (col - t.ScrollX)
+	// 🔴 col is a RUNE index; the screen is measured in CELLS, and a hard tab is
+	// not one cell. Treating them as interchangeable put every overlay a few
+	// columns to the left of the text it was describing on any tab-indented
+	// line -- which is most Go source. The diagnostic underline landed on the
+	// wrong characters and the inline message overwrote the end of the line
+	// instead of following it.
+	//
+	// This is the SAME arithmetic Render uses to place the cursor
+	// (LineVisualCol against ScrollX), and it has to stay that way: the cursor
+	// is the position users verify by eye, so anything that disagrees with it
+	// is wrong by definition.
+	runes := []rune(t.LineText(line))
+	dx = gut + (LineVisualCol(runes, col) - LineVisualCol(runes, t.ScrollX))
 	dy = line - t.ScrollY
 	if dx < gut || dx >= viewW {
 		return 0, 0, false

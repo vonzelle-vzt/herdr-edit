@@ -484,9 +484,9 @@ func TestBufferContentsAfterMixedHistory(t *testing.T) {
 	tab := newScratchTab("seed")
 	tab.MoveCursorTo(Position{Line: 0, Col: 4}, false)
 
-	tab.InsertRune(' ') // typing-1
-	tab.InsertRune('h') // typing-1
-	tab.InsertRune('i') // typing-1
+	tab.InsertRune(' ')         // typing-1
+	tab.InsertRune('h')         // typing-1
+	tab.InsertRune('i')         // typing-1
 	tab.InsertString("[paste]") // structural
 	tab.MoveCursorTo(Position{Line: 0, Col: len(tab.Buffer.LineRunes(0))}, false)
 	tab.InsertRune('!') // typing-2

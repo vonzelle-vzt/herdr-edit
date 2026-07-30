@@ -40,6 +40,40 @@ editor runs standalone on any terminal.
 
 ---
 
+## What it looks like
+
+Rendered by the editor itself, not drawn by hand — file tree, gutter, syntax, and an LSP
+diagnostic reported inline at the end of the offending line:
+
+```
+ EXPLORER                    │  ≡    routes.go ×
+ 001                         │    1  package api
+ ▾ src/                      │    2
+   ▾ api/                    │    3  import "net/http"
+       routes.go             │    4
+   go.mod                    │    5  // Health reports service liveness.
+   README.md                 │    6  func Health(w http.ResponseWriter, r *http.Request) {
+                             │    7      w.WriteHeader(http.StatusOK)
+                             │    8      w.Write([]byte(healthz)) undefined: healthz
+                             │    9  }
+                             │   10
+                             │   11  func Register(mux *http.ServeMux) {
+                             │   12      mux.HandleFunc("/healthz", Health)
+                             │   13  }
+                             │   14
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+ Opened routes.go
+```
+
 ## Why this fork exists
 
 Everything a VS Code user misses in a terminal is a shell command away — file tree, git, search,

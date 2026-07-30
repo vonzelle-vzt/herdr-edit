@@ -161,9 +161,9 @@ func TestResizeNearest_ZeroOrNilHandled(t *testing.T) {
 // and a degenerate zero-size cell rect.
 func TestHalfblockFitSize_PreservesAspect(t *testing.T) {
 	cases := []struct {
-		name                       string
-		srcW, srcH, cellW, cellH   int
-		wantPxW, wantPxH           int
+		name                     string
+		srcW, srcH, cellW, cellH int
+		wantPxW, wantPxH         int
 	}{
 		// 100x100 image into 50x50 cells. Cells give 50px wide × 100px
 		// tall; scaling preserves the source's 1:1 pixel aspect, so the
@@ -351,4 +351,3 @@ func writeJPEG(t *testing.T, path string, img image.Image) {
 		t.Fatalf("write: %v", err)
 	}
 }
-
