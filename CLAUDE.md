@@ -217,10 +217,12 @@ this and nothing else may duplicate their arithmetic:
   would drift the first time a glyph changed.
 
 - 🔴 `sidebarUserSized` — set by `resizeSidebar`, i.e. by a splitter drag, and it
-  turns auto-fit **off permanently** for that session. VS Code never
-  second-guesses a sash you dragged. Without this the auto-fit would silently
-  undo every drag on the next expand/collapse or resize, which reads as the
-  splitter being broken.
+  turns auto-fit off for that pane. VS Code never second-guesses a sash you
+  dragged. Without this the auto-fit would silently undo every drag on the next
+  expand/collapse or resize, which reads as the splitter being broken.
+  **Double-clicking the sash clears it** and returns to auto-fit, the way VS Code
+  resets a sash — without that escape hatch one drag disabled auto-fit for the
+  session and the only cure was closing the pane.
 
 - `maxSidebarWidth()` — the widest the explorer block may be right now: the
   editor keeps `minEditorAfterDrag` (40) whenever there is room, otherwise the
@@ -231,6 +233,13 @@ this and nothing else may duplicate their arithmetic:
 - `sidebarVisible()` — preference AND room, where room is `treeNeeds`
   (`minSidebarWidth + minWidth` = 42), the width below which even a minimum
   tree would push the editor under `minWidth`.
+
+`FitWidth` takes a **percentile, not the maximum**, and that distinction is the
+whole feature. Sizing to the widest row let one 34-character filename in an
+expanded folder pin the sidebar to 38% of the pane — worse than the fixed 30 it
+replaced, and it made resizing look inert because the panel just sat on its
+ceiling. `autoSidebarPercentile` is 85: rare long deep filenames get clipped,
+which VS Code does anyway, and the folder names you navigate by fit.
 
 This replaced a flat `sidebarNeeds = 76` that hid the tree outright below 76
 columns — which switched the explorer off in exactly the place it earns its

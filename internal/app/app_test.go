@@ -2626,3 +2626,34 @@ func TestDraggingPinsTheSidebar(t *testing.T) {
 		t.Fatalf("pinned width starved the editor: sidebar %d, editor %d", a.sidebarW(), editor)
 	}
 }
+
+// TestDoubleClickSashRestoresAutoFit closes a trap the pinning introduced: dragging the sash once
+// disabled auto-fit for the rest of the session with no way back, so the sidebar silently stopped
+// following the pane and the only cure was closing the pane. VS Code resets a sash on double-click.
+func TestDoubleClickSashRestoresAutoFit(t *testing.T) {
+	a := newTestAppWithLongNames(t)
+	a.width, a.height = 145, 40
+	auto := a.sidebarW()
+
+	// Pin it somewhere clearly different from the fit.
+	a.resizeSidebar(20)
+	if !a.sidebarUserSized || a.sidebarW() != 20 {
+		t.Fatalf("setup: userSized=%v width=%d", a.sidebarUserSized, a.sidebarW())
+	}
+
+	// Two presses on the sash within the double-click window.
+	sx := a.splitterX()
+	a.handleMouse(tcell.NewEventMouse(sx, 5, tcell.Button1, tcell.ModNone))
+	a.handleMouse(tcell.NewEventMouse(sx, 5, tcell.ButtonNone, tcell.ModNone)) // release
+	a.handleMouse(tcell.NewEventMouse(sx, 5, tcell.Button1, tcell.ModNone))
+
+	if a.sidebarUserSized {
+		t.Fatal("double-clicking the sash must clear the pinned width")
+	}
+	if got := a.sidebarW(); got != auto {
+		t.Fatalf("expected the auto width %d back, got %d", auto, got)
+	}
+	if a.dragMode == "sidebar" {
+		t.Fatal("a double-click must not also start a drag, which would re-pin immediately")
+	}
+}

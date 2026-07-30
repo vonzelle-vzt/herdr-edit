@@ -1423,6 +1423,18 @@ func (a *App) handleMouse(ev *tcell.EventMouse) {
 		splitX := a.splitterX()
 		switch {
 		case splitX >= 0 && x == splitX:
+			// Double-clicking the sash returns the sidebar to auto-fit, which is what VS Code does
+			// with a double-clicked sash. Without this, dragging it once pinned the width for the
+			// rest of the session with no way back -- the auto-fit silently stopped following the
+			// pane and the only cure was closing and reopening the pane.
+			now := time.Now()
+			if a.lastClick.x == x && a.lastClick.y == y && now.Sub(a.lastClick.when) < doubleClickMs {
+				a.sidebarUserSized = false
+				a.lastClick = clickRecord{} // a triple-click must not immediately re-pin
+				a.flash("File explorer width: auto")
+				return
+			}
+			a.lastClick = clickRecord{x: x, y: y, when: now}
 			a.dragMode = "sidebar"
 		case sw > 0 && x < splitX:
 			a.sidebarClick(x, y)
