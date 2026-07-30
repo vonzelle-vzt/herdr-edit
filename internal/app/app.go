@@ -55,17 +55,23 @@ const (
 	// the whole editor with "Window too small - please resize". A panel was only usable inside a
 	// narrow band and gave no hint which way to go.
 	//
-	// The fix is to degrade instead of refusing. Below sidebarNeeds the file tree hides itself and
-	// the editor takes the full width, which is what VS Code does when you shrink a window, so
-	// these floors only have to cover a bare editor: enough columns for line numbers plus some
-	// code, and enough rows for the tab bar, one line, and the status bar.
+	// The fix is to degrade instead of refusing, so these floors only have to cover a bare editor:
+	// enough columns for line numbers plus some code, and enough rows for the tab bar, one line,
+	// and the status bar.
 	minWidth  = 24
 	minHeight = 8
 
-	// sidebarNeeds is the total width at which the file tree stops earning its 30 columns. Below
-	// it the tree auto-hides so the editor stays readable; the user preference is untouched, so
-	// widening the pane brings the tree straight back.
-	sidebarNeeds   = 76
+	// treeNeeds is the total width below which the file tree cannot be shown at all: even at its
+	// own minimum it would leave the editor under minWidth. Above it the tree NARROWS rather than
+	// vanishing — see maxSidebarWidth.
+	//
+	// This replaced a flat `sidebarNeeds = 76`, which hid the tree outright below 76 columns and
+	// took the "degrade, never refuse" rule only half way. A file explorer pane is most useful
+	// exactly where it was being switched off: sitting beside an agent in a herdr split, where the
+	// pane is 60-odd columns because the agent needs the rest. That rendered a hamburger and the
+	// words "click open from the tree" with no tree in sight. The tree now gives up columns down to
+	// minSidebarWidth before it gives up existing.
+	treeNeeds      = minSidebarWidth + minWidth
 	statusFlashFor = 3 * time.Second
 	doubleClickMs  = 500 * time.Millisecond
 	doubleEscMs    = 500 * time.Millisecond
@@ -954,15 +960,41 @@ func (a *App) sidebarW() int {
 	if !a.sidebarVisible() {
 		return 0
 	}
-	return a.sidebarWidth
+	w := a.sidebarWidth
+	if max := a.maxSidebarWidth(); w > max {
+		w = max
+	}
+	return w
+}
+
+// maxSidebarWidth is the widest the file-explorer block may be at the current pane width: the
+// editor keeps minEditorAfterDrag columns whenever there is room for them, and on a pane too narrow
+// to afford that the tree pins to its own minimum and the editor takes whatever is left.
+//
+// Deliberately shared by the auto-narrow in sidebarW and the splitter drag in resizeSidebar. When
+// they were separate, a 60-column pane drew a 30-column tree that the very first drag snapped to
+// 20 — the splitter appeared to move the wrong way. Sharing the clamp makes what is on screen
+// exactly what a drag can reproduce, by construction rather than by keeping two numbers in step.
+//
+// Monotonic in a.width, which is what keeps a resize from stepping the tree backwards: the result
+// is max(minSidebarWidth, width-minEditorAfterDrag), and both terms only grow with width.
+func (a *App) maxSidebarWidth() int {
+	max := a.width - minEditorAfterDrag
+	if max < minSidebarWidth {
+		max = minSidebarWidth
+	}
+	return max
 }
 
 // sidebarVisible reports whether the file tree is actually on screen: the user has to want it AND
 // the window has to be wide enough to afford it. Keeping the auto-hide separate from the
 // sidebarShown preference means a narrow pane borrows the tree's columns without forgetting that
 // the user asked for a tree — widen the pane and it reappears with no keypress.
+//
+// The threshold is treeNeeds, not the tree's preferred width: between the two the tree narrows
+// (sidebarW) instead of disappearing.
 func (a *App) sidebarVisible() bool {
-	return a.sidebarShown && a.tree != nil && a.width >= sidebarNeeds
+	return a.sidebarShown && a.tree != nil && a.width >= treeNeeds
 }
 
 // sidebarRect returns the file tree's render rectangle (one column
@@ -978,26 +1010,30 @@ func (a *App) sidebarRect() (x, y, w, h int) {
 
 // splitterX returns the x coordinate of the resize splitter column, or -1
 // when the sidebar is hidden (no splitter to draw or click).
+//
+// Derived from sidebarW, not a.sidebarWidth: on a narrow pane the tree is drawn narrower than the
+// stored preference, and reading the preference here would draw the splitter — and hit-test drags
+// and hovers — one to twelve columns away from the divider the user can actually see.
 func (a *App) splitterX() int {
-	if !a.sidebarVisible() {
+	sw := a.sidebarW()
+	if sw <= 0 {
 		return -1
 	}
-	return a.sidebarWidth - 1
+	return sw - 1
 }
 
 // resizeSidebar applies the user's desired sidebar width while clamping it
 // to a sensible range — the file tree stays wide enough to read names and
 // the editor keeps at least minEditorAfterDrag columns. Tiny windows that
 // can't satisfy both fall back to the minimum and let the editor shrink.
+//
+// The upper bound comes from maxSidebarWidth, the same helper the auto-narrow uses, so a drag can
+// always reproduce exactly what is on screen.
 func (a *App) resizeSidebar(target int) {
 	if target < minSidebarWidth {
 		target = minSidebarWidth
 	}
-	max := a.width - minEditorAfterDrag
-	if max < minSidebarWidth {
-		max = minSidebarWidth
-	}
-	if target > max {
+	if max := a.maxSidebarWidth(); target > max {
 		target = max
 	}
 	a.sidebarWidth = target
@@ -2302,9 +2338,9 @@ func (a *App) menuToggleSidebar() {
 	}
 	// When the pane is too narrow the tree is already auto-hidden, so flipping the preference
 	// looks like the toggle did nothing. Say why instead of silently no-op-ing.
-	if a.sidebarShown && a.width < sidebarNeeds {
+	if a.sidebarShown && a.width < treeNeeds {
 		a.flash(fmt.Sprintf("File explorer is hidden automatically below %d columns (pane is %d)",
-			sidebarNeeds, a.width))
+			treeNeeds, a.width))
 		return
 	}
 	a.sidebarShown = !a.sidebarShown

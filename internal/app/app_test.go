@@ -109,6 +109,94 @@ func TestSplitterX(t *testing.T) {
 	}
 }
 
+// TestMaxSidebarWidthMonotonic pins the property that keeps a resize from stepping the tree
+// backwards. An earlier draft narrowed against minWidth with a fallback branch, which made the tree
+// WIDER at 55 columns than at 58 — dragging a pane wider shrank the explorer.
+func TestMaxSidebarWidthMonotonic(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	prev := 0
+	for w := treeNeeds; w <= 200; w++ {
+		a.width = w
+		got := a.maxSidebarWidth()
+		if got < minSidebarWidth {
+			t.Fatalf("width %d: max %d under minSidebarWidth %d", w, got, minSidebarWidth)
+		}
+		if got < prev {
+			t.Fatalf("width %d: max went backwards, %d then %d", w, prev, got)
+		}
+		prev = got
+	}
+}
+
+// TestSidebarWNarrowsRatherThanHiding is the behavior change itself: between treeNeeds and the
+// width that affords a full tree, the explorer gives up columns instead of vanishing. It used to
+// disappear entirely below 76, which switched it off in a herdr split beside an agent — the one
+// place a file panel earns its keep.
+func TestSidebarWNarrowsRatherThanHiding(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	for w := treeNeeds; w <= 200; w++ {
+		a.width = w
+		sw := a.sidebarW()
+		if sw < minSidebarWidth {
+			t.Fatalf("width %d: tree %d under minSidebarWidth %d", w, sw, minSidebarWidth)
+		}
+		if sw > defaultSidebarWidth {
+			t.Fatalf("width %d: tree %d over its preferred %d", w, sw, defaultSidebarWidth)
+		}
+		if editor := w - sw; editor < minWidth {
+			t.Fatalf("width %d: tree %d leaves the editor %d, under minWidth %d",
+				w, sw, editor, minWidth)
+		}
+	}
+
+	// One column below the floor it does hide — the guard still exists.
+	a.width = treeNeeds - 1
+	if got := a.sidebarW(); got != 0 {
+		t.Fatalf("width %d: expected a hidden tree, got %d", a.width, got)
+	}
+
+	// A 60-column pane is the herdr-split case that prompted this. It must show a tree.
+	a.width = 60
+	if got := a.sidebarW(); got < minSidebarWidth {
+		t.Fatalf("60-column pane must show a tree, got %d", got)
+	}
+}
+
+// TestSplitterXTracksTheDrawnTree guards the bug that made the splitter unclickable on a narrow
+// pane: splitterX read the stored preference while the tree was drawn at the narrowed width, so the
+// divider was hit-tested up to twelve columns away from where the user could see it.
+func TestSplitterXTracksTheDrawnTree(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	for _, w := range []int{treeNeeds, 52, 60, 70, 120, 200} {
+		a.width = w
+		sw := a.sidebarW()
+		if got, want := a.splitterX(), sw-1; got != want {
+			t.Fatalf("width %d: splitterX %d, but the tree is drawn %d wide (want %d)",
+				w, got, sw, want)
+		}
+	}
+}
+
+// TestResizeSidebarCanReproduceWhatIsDrawn is why the clamp is shared. With separate limits a
+// 60-column pane drew a 30-column tree that the first drag snapped to 20, so the splitter appeared
+// to move the wrong way. Dragging to exactly what is on screen must be a no-op.
+func TestResizeSidebarCanReproduceWhatIsDrawn(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	for _, w := range []int{treeNeeds, 52, 60, 70, 120} {
+		a.width = w
+		drawn := a.sidebarW()
+		a.resizeSidebar(drawn)
+		if a.sidebarWidth != drawn {
+			t.Fatalf("width %d: drew a %d-wide tree but a drag to %d landed on %d",
+				w, drawn, drawn, a.sidebarWidth)
+		}
+		if got := a.sidebarW(); got != drawn {
+			t.Fatalf("width %d: re-reading after the drag gave %d, want %d", w, got, drawn)
+		}
+		a.sidebarWidth = defaultSidebarWidth // reset the preference for the next width
+	}
+}
+
 // TestTabBarRect checks the tab bar starts after the sidebar and spans the
 // remaining width on row 0.
 func TestTabBarRect(t *testing.T) {

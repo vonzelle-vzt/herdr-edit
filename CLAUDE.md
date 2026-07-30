@@ -181,13 +181,39 @@ Min widths: `minSidebarWidth = 18`, `minEditorAfterDrag = 40`. Don't
 let the editor shrink below that.
 
 ### Responsive layout (fork) — degrade, never refuse
-`minWidth`/`minHeight` are 24x8, not 50x24. Below `sidebarNeeds` (76) the
-tree auto-hides and the editor takes the full width, because the tree is a
-fixed 30 columns and a side panel was otherwise only usable in a narrow
-band — one column narrower and the whole editor was replaced by "Window too
-small". `sidebarVisible()` is preference AND room; the `sidebarShown`
-preference is never cleared by the auto-hide, so widening brings the tree
-straight back.
+`minWidth`/`minHeight` are 24x8, not 50x24, because a side panel was otherwise
+only usable in a narrow band — one column narrower and the whole editor was
+replaced by "Window too small".
+
+The tree **narrows before it hides**. Two helpers own this and nothing else may
+duplicate their arithmetic:
+
+- `maxSidebarWidth()` — the widest the explorer block may be right now: the
+  editor keeps `minEditorAfterDrag` (40) whenever there is room, otherwise the
+  tree pins to `minSidebarWidth` (18) and the editor takes the rest. It is
+  `max(18, width-40)`, deliberately **monotonic in width** — an earlier draft
+  branched on `minWidth` and made the tree wider at 55 columns than at 58, so
+  dragging a pane wider shrank the explorer.
+- `sidebarVisible()` — preference AND room, where room is `treeNeeds`
+  (`minSidebarWidth + minWidth` = 42), the width below which even a minimum
+  tree would push the editor under `minWidth`.
+
+This replaced a flat `sidebarNeeds = 76` that hid the tree outright below 76
+columns — which switched the explorer off in exactly the place it earns its
+keep: a herdr split beside an agent, where the pane is 60-odd columns because
+the agent needs the rest. It rendered a `≡` and the words "click open from the
+tree" with no tree in sight.
+
+🔴 `splitterX()` and `resizeSidebar()` MUST go through these, not through
+`a.sidebarWidth`. The stored value is a *preference*; on a narrow pane the tree
+is drawn narrower. Reading the preference in `splitterX` hit-tests the divider
+up to twelve columns from where the user sees it, and a `resizeSidebar` with its
+own limit made a 60-column pane draw a 30-wide tree that the first drag snapped
+to 20 — the splitter appeared to move the wrong way. Sharing one clamp makes
+what is on screen exactly what a drag can reproduce, by construction.
+
+The `sidebarShown` preference is never cleared by the auto-hide, so widening
+brings the tree straight back with no keypress.
 
 ### Polled call sites, not scattered hooks (fork)
 `publishActive()` and `maybeSyncLSP()` are each called from ONE place in

@@ -130,10 +130,14 @@ func TestStartPageClickIgnoredWhenATabIsOpen(t *testing.T) {
 	}
 }
 
-// TestNarrowPaneHidesTreeInsteadOfRefusingToDraw is the whole point of the responsive work.
+// TestNarrowPaneNarrowsTreeInsteadOfRefusingToDraw is the whole point of the responsive work.
 // Previously anything under 50 columns replaced the entire editor with "Window too small", and
 // since the file tree alone is a fixed 30 columns a side panel was only usable in a narrow band.
-func TestNarrowPaneHidesTreeInsteadOfRefusingToDraw(t *testing.T) {
+//
+// The tree now NARROWS on a tight pane rather than hiding: a 52-column pane keeps a readable tree
+// AND draws the editor. Hiding outright below 76 columns switched the explorer off in exactly the
+// place it earns its keep — a herdr split beside an agent, where the pane is 60-odd columns.
+func TestNarrowPaneNarrowsTreeInsteadOfRefusingToDraw(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -141,21 +145,38 @@ func TestNarrowPaneHidesTreeInsteadOfRefusingToDraw(t *testing.T) {
 	a := newTestApp(t, root)
 	a.openFile(filepath.Join(root, "main.go"))
 
-	// Wide: the tree earns its space.
+	// Wide: the tree earns its full preferred width.
 	if out := paint(t, a, 120, 40); !a.sidebarVisible() {
 		t.Errorf("tree should be visible at 120 cols\n%s", out)
 	}
+	if got := a.sidebarW(); got != defaultSidebarWidth {
+		t.Errorf("120 cols should give the tree its full width: got %d, want %d",
+			got, defaultSidebarWidth)
+	}
 
-	// Narrow: the tree stands down, the editor keeps drawing.
+	// Narrow: the tree gives up columns but stays on screen, and the editor keeps drawing.
 	out := paint(t, a, 52, 30)
-	if a.sidebarVisible() {
-		t.Error("tree should auto-hide below sidebarNeeds")
+	if !a.sidebarVisible() {
+		t.Errorf("tree should narrow, not hide, at 52 cols\n%s", out)
+	}
+	if got := a.sidebarW(); got < minSidebarWidth || got >= defaultSidebarWidth {
+		t.Errorf("52 cols should narrow the tree into [%d, %d): got %d",
+			minSidebarWidth, defaultSidebarWidth, got)
 	}
 	if strings.Contains(out, "Window too small") {
 		t.Errorf("52 columns must still render the editor\n%s", out)
 	}
 	if !strings.Contains(out, "package main") {
 		t.Errorf("editor content missing at 52 cols\n%s", out)
+	}
+
+	// Below treeNeeds it does finally stand down — the floor still exists.
+	out = paint(t, a, treeNeeds-1, 30)
+	if a.sidebarVisible() {
+		t.Errorf("tree should hide below treeNeeds (%d)\n%s", treeNeeds, out)
+	}
+	if strings.Contains(out, "Window too small") {
+		t.Errorf("%d columns must still render the editor\n%s", treeNeeds-1, out)
 	}
 
 	// The preference survives, so widening brings it straight back with no keypress.
@@ -192,7 +213,7 @@ func TestTooSmallOnlyAtGenuinelyUnusableSizes(t *testing.T) {
 // flipping the preference would look like the toggle did nothing at all.
 func TestSidebarToggleExplainsAutoHide(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
-	a.width = sidebarNeeds - 1
+	a.width = treeNeeds - 1
 	a.menuToggleSidebar()
 	if !a.sidebarShown {
 		t.Error("toggle must not flip the preference while the tree is auto-hidden")
