@@ -43,6 +43,39 @@ func gutterWidthFor(lineCount int) int {
 	return defaultGutterWidth
 }
 
+// autoClosePairs maps an "opening" character InsertRune sees to the
+// character it should auto-insert immediately after it. Quotes map to
+// themselves because the opener and closer are the same rune — the
+// step-over and word-boundary rules in InsertRune / shouldAutoClose are
+// what keep that from producing duplicate quotes. Package-level (rather
+// than a local const) so a later per-language mode — e.g. no backtick
+// pairing outside Markdown/JS — can override it without touching
+// InsertRune itself.
+var autoClosePairs = map[rune]rune{
+	'(':  ')',
+	'[':  ']',
+	'{':  '}',
+	'"':  '"',
+	'\'': '\'',
+	'`':  '`',
+}
+
+// autoCloseClosers is the reverse index of autoClosePairs' values: the set
+// of characters InsertRune should treat as "step over the existing one"
+// when they're typed right where they already sit. Built once at package
+// init instead of scanning autoClosePairs on every keystroke.
+var autoCloseClosers = buildAutoCloseClosers()
+
+// buildAutoCloseClosers derives autoCloseClosers from autoClosePairs so
+// the two tables can never drift out of sync with each other.
+func buildAutoCloseClosers() map[rune]bool {
+	m := make(map[rune]bool, len(autoClosePairs))
+	for _, c := range autoClosePairs {
+		m[c] = true
+	}
+	return m
+}
+
 // GitLineChange describes the marker rendered in the editor gutter for a line.
 type GitLineChange int
 
@@ -120,6 +153,17 @@ type Tab struct {
 	FindMatches []Match
 	FindIndex   int // -1 = no current match; otherwise an index into FindMatches.
 
+	// FindCaseSensitive / FindWholeWord / FindRegex are the toggle state
+	// for the three FindOptions flags. They live on the tab (not passed
+	// per-call) for the same reason FindQuery does — they need to survive
+	// switching tabs and re-opening the find bar. FindErr holds the last
+	// regex compile error (nil otherwise) so the UI can show *why* a
+	// query produced no matches instead of a misleading "0 of 0".
+	FindCaseSensitive bool
+	FindWholeWord     bool
+	FindRegex         bool
+	FindErr           error
+
 	// IndentUnit is the string the editor inserts when the user presses
 	// Tab. Detected on file open (DetectIndent) so the editor matches
 	// whatever the file already does — a tab-indented Go file gets a
@@ -162,6 +206,11 @@ func NewTab(path string) (*Tab, error) {
 	// Record the on-open buffer state so RevertFile has somewhere to
 	// rewind to even after the user has typed away.
 	t.initUndo()
+	// Best-effort resume of a previous session's undo history — see
+	// persist.go. loadPersistedUndo only installs it when the file's
+	// content hash still matches what's on disk right now (data), so a
+	// stale or foreign history can never get replayed onto this buffer.
+	t.loadPersistedUndo(data)
 	return t, nil
 }
 
@@ -231,6 +280,12 @@ func (t *Tab) Save() error {
 	// clearly a separate intent, so don't let it merge into whatever was
 	// in flight before the save.
 	t.breakUndoGroup()
+	// Best-effort checkpoint of the undo history to disk — see persist.go.
+	// A save is the moment the on-disk content and t.undoStack's history
+	// are guaranteed to agree, so it's the natural point to snapshot.
+	// Deliberately ignored: persistence is a convenience, never allowed to
+	// turn a successful Save into a reported failure.
+	_ = t.PersistUndo()
 	return nil
 }
 
@@ -280,6 +335,11 @@ func (t *Tab) Reload() error {
 	// shifted, and the user explicitly asked to take the disk version),
 	// so reset both stacks and the revert anchor.
 	t.initUndo()
+	// A persisted history from a previous session may still apply to
+	// *this* on-disk content (e.g. reload after someone else re-saved the
+	// exact bytes we already had) — same hash-gated best-effort resume as
+	// NewTab.
+	t.loadPersistedUndo(data)
 	return nil
 }
 
@@ -343,15 +403,38 @@ func (t *Tab) InsertString(s string) {
 // with adjacent runes inside the undo window so a typed word collapses
 // into a single undo step rather than one entry per keystroke. No-op
 // on image tabs.
+//
+// Three auto-close behaviours short-circuit the plain insert, checked in
+// this order:
+//
+//  1. A selection plus an opener (`(` `[` `{` `"` `'` ``` ` ``` ) surrounds
+//     the selection instead of replacing it.
+//  2. Typing a closer that's already sitting immediately to the right of
+//     the cursor steps over it instead of inserting a duplicate.
+//  3. Typing an opener with no selection inserts the pair and leaves the
+//     cursor between them — unless it's a quote right after a word
+//     character (shouldAutoClose), which would turn `don` + `'` + `t`
+//     into `don”t`.
 func (t *Tab) InsertRune(r rune) {
 	if t.IsImage() {
 		return
 	}
 	if t.HasSelection() {
+		if closer, ok := autoClosePairs[r]; ok {
+			t.surroundSelection(r, closer)
+			return
+		}
 		// First-rune-after-selection: let DeleteSelection capture the
 		// pre-state, then run the insert without a second push.
 		t.DeleteSelection()
 	} else {
+		if t.stepOverAutoClose(r) {
+			return
+		}
+		if closer, ok := autoClosePairs[r]; ok && t.shouldAutoClose(r) {
+			t.insertAutoClosePair(r, closer)
+			return
+		}
 		t.pushUndo(undoGroupTyping)
 	}
 	t.Cursor = t.Buffer.InsertString(t.Cursor, string(r))
@@ -361,8 +444,99 @@ func (t *Tab) InsertRune(r rune) {
 	t.cursorMoved = true
 }
 
+// shouldAutoClose reports whether typing opener r should insert its
+// closing partner. Brackets always auto-close. Quote characters don't
+// when the cursor sits right after a word rune, because that's almost
+// always an apostrophe in prose or a contraction/possessive next to an
+// identifier ("don't", "it's") rather than the start of a string literal
+// — auto-closing there would turn "don't" into "don”t" as the user kept
+// typing.
+func (t *Tab) shouldAutoClose(r rune) bool {
+	if r != '"' && r != '\'' && r != '`' {
+		return true
+	}
+	if t.Cursor.Col == 0 {
+		return true
+	}
+	line := []rune(t.Buffer.Lines[t.Cursor.Line])
+	if t.Cursor.Col-1 >= len(line) {
+		return true
+	}
+	return !isWordRune(line[t.Cursor.Col-1])
+}
+
+// insertAutoClosePair inserts opener r immediately followed by closer and
+// leaves the cursor sitting between them, ready for the user to type the
+// pair's contents. Recorded as its own coalescing group (typing) so a
+// burst of "(foo)" style edits still collapses into one undo step.
+func (t *Tab) insertAutoClosePair(r, closer rune) {
+	t.pushUndo(undoGroupTyping)
+	pos := t.Buffer.InsertString(t.Cursor, string(r)+string(closer))
+	t.Cursor = Position{Line: pos.Line, Col: pos.Col - 1}
+	t.Anchor = t.Cursor
+	t.Dirty = true
+	t.StyleStale = true
+	t.cursorMoved = true
+}
+
+// stepOverAutoClose handles typing a closer that's already sitting
+// immediately to the right of the cursor: rather than inserting a second
+// copy (turning `(|)` into `()|)`), the cursor just moves past the
+// existing one. Returns true when it handled the keystroke, in which
+// case the caller must not also perform a normal insert.
+func (t *Tab) stepOverAutoClose(r rune) bool {
+	if !autoCloseClosers[r] {
+		return false
+	}
+	line := []rune(t.Buffer.Lines[t.Cursor.Line])
+	if t.Cursor.Col >= len(line) || line[t.Cursor.Col] != r {
+		return false
+	}
+	t.Cursor.Col++
+	t.Anchor = t.Cursor
+	t.cursorMoved = true
+	// Stepping over doesn't mutate the buffer, so it's not itself an undo
+	// step — but it is an explicit cursor move, same as any other, so the
+	// next typing burst should start a fresh coalescing group rather than
+	// merging with whatever came before the step-over.
+	t.breakUndoGroup()
+	return true
+}
+
+// surroundSelection wraps the current selection in opener/closer instead
+// of replacing it — typing `(` around `x + y` should produce `(x + y)`,
+// not delete the selection and insert a lone paren. The originally
+// selected text stays selected (now sitting between the inserted pair) so
+// a second bracket press can wrap it again, matching the surround-then-
+// re-wrap behaviour users expect from editors that support this.
+func (t *Tab) surroundSelection(opener, closer rune) {
+	selStart, selEnd := PosOrdered(t.Anchor, t.Cursor)
+	t.pushUndo(undoGroupStructural)
+	// Insert the closer first: it lands at selEnd, a position the opener
+	// insert (which lands at or before selStart) can never invalidate.
+	// Inserting in the other order would require shifting selEnd by hand
+	// whenever selStart and selEnd share a line.
+	t.Buffer.InsertString(selEnd, string(closer))
+	afterOpener := t.Buffer.InsertString(selStart, string(opener))
+	newCursor := selEnd
+	if selStart.Line == selEnd.Line {
+		// The opener we just inserted on this line shifted every column
+		// at or after selStart.Col by one, including where selEnd's
+		// original content now sits.
+		newCursor.Col++
+	}
+	t.Anchor = afterOpener
+	t.Cursor = newCursor
+	t.Dirty = true
+	t.StyleStale = true
+	t.cursorMoved = true
+}
+
 // Backspace deletes the character before the cursor (or the selection if any).
-// Coalesces with adjacent backspaces inside the undo window. No-op on
+// Coalesces with adjacent backspaces inside the undo window. When the
+// cursor sits directly between an auto-closed pair with nothing typed
+// inside yet (`(|)`), both characters are removed in one keystroke instead
+// of leaving a dangling closer behind — see deleteEmptyPair. No-op on
 // image tabs.
 func (t *Tab) Backspace() {
 	if t.IsImage() {
@@ -373,6 +547,9 @@ func (t *Tab) Backspace() {
 		return
 	}
 	if t.Cursor.Line == 0 && t.Cursor.Col == 0 {
+		return
+	}
+	if t.deleteEmptyPair() {
 		return
 	}
 	t.pushUndo(undoGroupBackspace)
@@ -388,6 +565,36 @@ func (t *Tab) Backspace() {
 	t.Dirty = true
 	t.StyleStale = true
 	t.cursorMoved = true
+}
+
+// deleteEmptyPair handles Backspace landing right between an auto-closed
+// pair with nothing typed inside it yet: `(|)` becomes `|` in one
+// keystroke instead of leaving a dangling, unmatched closer behind.
+// Returns true when it handled the deletion, in which case the caller
+// must not also run the normal single-char Backspace path.
+func (t *Tab) deleteEmptyPair() bool {
+	if t.Cursor.Col == 0 {
+		return false
+	}
+	line := []rune(t.Buffer.Lines[t.Cursor.Line])
+	if t.Cursor.Col >= len(line) {
+		return false
+	}
+	before := line[t.Cursor.Col-1]
+	after := line[t.Cursor.Col]
+	closer, ok := autoClosePairs[before]
+	if !ok || closer != after {
+		return false
+	}
+	t.pushUndo(undoGroupBackspace)
+	start := Position{Line: t.Cursor.Line, Col: t.Cursor.Col - 1}
+	end := Position{Line: t.Cursor.Line, Col: t.Cursor.Col + 1}
+	t.Cursor = t.Buffer.DeleteRange(start, end)
+	t.Anchor = t.Cursor
+	t.Dirty = true
+	t.StyleStale = true
+	t.cursorMoved = true
+	return true
 }
 
 // Delete removes the character after the cursor (or the selection if any).

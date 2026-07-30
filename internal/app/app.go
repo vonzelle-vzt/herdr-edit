@@ -33,6 +33,7 @@ import (
 	"github.com/cloudmanic/spice-edit/internal/filetree"
 	"github.com/cloudmanic/spice-edit/internal/finder"
 	"github.com/cloudmanic/spice-edit/internal/icons"
+	"github.com/cloudmanic/spice-edit/internal/lsp"
 	"github.com/cloudmanic/spice-edit/internal/spiceconfig"
 	"github.com/cloudmanic/spice-edit/internal/state"
 	"github.com/cloudmanic/spice-edit/internal/theme"
@@ -338,6 +339,13 @@ type App struct {
 	tree      *filetree.Tree
 	tabs      []*editor.Tab
 	activeTab int
+
+	// lsp owns the language servers for this project; diagnostics is the latest published set
+	// per absolute path. Both nil when no server is available, which every call site tolerates.
+	lsp         *lsp.Manager
+	diagnostics map[string][]lsp.Diagnostic
+	lspSentText map[string]string // last text each document was sent with, to skip no-op syncs
+	lspSyncedAt time.Time
 
 	// startRows maps start-page rows back to files so a click can open them. Rebuilt each draw.
 	startRows []startRow
@@ -741,6 +749,10 @@ func (a *App) Close() {
 // each event, redraws, and exits when a.quit is set.
 func (a *App) Run() error {
 	a.width, a.height = a.screen.Size()
+	a.startLSP()
+	if tab := a.activeTabPtr(); tab != nil {
+		a.lspDidOpen(tab.Path, tab.Buffer.String())
+	}
 	a.draw()
 	a.screen.Show()
 
@@ -752,9 +764,13 @@ func (a *App) Run() error {
 		a.handleEvent(ev)
 		a.draw()
 		a.publishActive()
+		a.maybeSyncLSP()
 		a.screen.Show()
 	}
 	a.active.Flush() // do not lose the final position inside the debounce window
+	if a.lsp != nil {
+		a.lsp.Stop()
+	}
 	return nil
 }
 
@@ -783,6 +799,10 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleAutoScroll()
 	case *treeRefreshEvent:
 		a.refreshTreeNow()
+	case *diagnosticsEvent:
+		a.handleDiagnostics(e)
+	case *lspLogEvent:
+		a.flash(e.msg)
 	case *customActionDoneEvent:
 		a.handleCustomActionDone(e)
 	case *formatDoneEvent:
@@ -1755,6 +1775,9 @@ func (a *App) openFile(path string) {
 	a.tabs = append(a.tabs, t)
 	a.activeTab = len(a.tabs) - 1
 	t.GitLines = loadGitLineChanges(a.rootDir, t.Path)
+	// Diagnostics generally do not arrive for a file the server has not been told about, so this
+	// is what actually starts the flow. It also spawns the server on the first file of a language.
+	a.lspDidOpen(t.Path, t.Buffer.String())
 	a.flash(fmt.Sprintf("Opened %s", filepath.Base(path)))
 }
 
@@ -1783,6 +1806,9 @@ func (a *App) saveTabAt(idx int) bool {
 		return false
 	}
 	a.refreshGitStatus()
+	// Lint-style servers (eslint, and anything shelling out to a linter) only run a full analysis
+	// on save, so this is what makes their diagnostics appear at all.
+	a.lspDidSave(tab.Path, tab.Buffer.String())
 	a.flash(fmt.Sprintf("Saved %s", filepath.Base(tab.Path)))
 	// Format-on-save runs after the disk write succeeds, so a broken
 	// formatter never blocks the user's save from landing. The
@@ -1859,6 +1885,7 @@ func (a *App) closeTab(idx int) {
 	if idx < 0 || idx >= len(a.tabs) {
 		return
 	}
+	a.lspDidClose(a.tabs[idx].Path)
 	a.tabs = append(a.tabs[:idx], a.tabs[idx+1:]...)
 	if a.activeTab >= len(a.tabs) {
 		a.activeTab = len(a.tabs) - 1
@@ -2349,6 +2376,9 @@ func (a *App) draw() {
 	if tab := a.activeTabPtr(); tab != nil {
 		ex, ey, ew, eh := a.editorRect()
 		tab.Render(a.screen, a.theme, ex, ey, ew, eh)
+		// After Render, so the underline sits on top of the syntax colours rather than being
+		// overwritten by them.
+		a.drawDiagnostics()
 	} else {
 		a.drawStartPage()
 	}
@@ -2577,6 +2607,11 @@ func (a *App) drawStatusBar() {
 			}
 			left = fmt.Sprintf(" %s · Ln %d, Col %d · %d lines%s",
 				lang, tab.Cursor.Line+1, tab.Cursor.Col+1, tab.Buffer.LineCount(), dirty)
+			// The underline says WHERE the problem is; this says what it is. Without somewhere to
+			// read the message, a squiggle is only half a feature.
+			if diag := a.diagnosticStatus(); diag != "" {
+				left += " · " + diag
+			}
 		}
 	} else {
 		left = " " + filepath.Base(a.rootDir)

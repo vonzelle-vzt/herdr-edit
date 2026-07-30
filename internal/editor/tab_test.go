@@ -344,6 +344,113 @@ func TestTab_InsertRune(t *testing.T) {
 	}
 }
 
+// TestTab_InsertRune_AutoClosesBracketsAndQuotes pins the "type an opener,
+// get the pair with the cursor in the middle" behaviour for every entry in
+// autoClosePairs.
+func TestTab_InsertRune_AutoClosesBracketsAndQuotes(t *testing.T) {
+	cases := []struct {
+		opener rune
+		want   string
+	}{
+		{'(', "()"},
+		{'[', "[]"},
+		{'{', "{}"},
+		{'"', `""`},
+		{'\'', "''"},
+		{'`', "``"},
+	}
+	for _, c := range cases {
+		tab := &Tab{Buffer: NewBuffer("")}
+		tab.InsertRune(c.opener)
+		if tab.Buffer.Lines[0] != c.want {
+			t.Fatalf("opener %q: got %q, want %q", c.opener, tab.Buffer.Lines[0], c.want)
+		}
+		if tab.Cursor != (Position{Line: 0, Col: 1}) {
+			t.Fatalf("opener %q: cursor should sit between the pair, got %+v", c.opener, tab.Cursor)
+		}
+	}
+}
+
+// TestTab_InsertRune_StepsOverExistingCloser proves that typing the closer
+// which is already immediately right of the cursor moves past it instead
+// of inserting a duplicate — the "type through an auto-closed pair" flow.
+func TestTab_InsertRune_StepsOverExistingCloser(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("()")}
+	tab.Cursor = Position{Line: 0, Col: 1}
+	tab.Anchor = tab.Cursor
+	tab.InsertRune(')')
+	if tab.Buffer.Lines[0] != "()" {
+		t.Fatalf("buffer should be unchanged, got %q", tab.Buffer.Lines[0])
+	}
+	if tab.Cursor != (Position{Line: 0, Col: 2}) {
+		t.Fatalf("cursor should step past the closer, got %+v", tab.Cursor)
+	}
+}
+
+// TestTab_InsertRune_QuoteAfterWordCharDoesNotAutoClose is the apostrophe
+// guard: typing `'` right after a word character (as in "don" + "'" + "t")
+// must insert a single quote, not a pair — otherwise "don't" turns into
+// "don”t" as the user keeps typing.
+func TestTab_InsertRune_QuoteAfterWordCharDoesNotAutoClose(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("don")}
+	tab.Cursor = Position{Line: 0, Col: 3}
+	tab.Anchor = tab.Cursor
+	tab.InsertRune('\'')
+	if tab.Buffer.Lines[0] != "don'" {
+		t.Fatalf("got %q, want %q", tab.Buffer.Lines[0], "don'")
+	}
+	tab.InsertRune('t')
+	if tab.Buffer.Lines[0] != "don't" {
+		t.Fatalf("got %q, want %q", tab.Buffer.Lines[0], "don't")
+	}
+}
+
+// TestTab_InsertRune_QuoteAtLineStartStillAutoCloses makes sure the word-
+// boundary guard doesn't over-fire: a quote at column 0 (no preceding
+// character at all) should still auto-close normally.
+func TestTab_InsertRune_QuoteAtLineStartStillAutoCloses(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("")}
+	tab.InsertRune('"')
+	if tab.Buffer.Lines[0] != `""` {
+		t.Fatalf("got %q, want %q", tab.Buffer.Lines[0], `""`)
+	}
+}
+
+// TestTab_InsertRune_OpenerSurroundsSelection proves that typing an opener
+// with an active selection wraps the selected text in the pair instead of
+// replacing it, and leaves the original text selected between the pair.
+func TestTab_InsertRune_OpenerSurroundsSelection(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("x + y")}
+	tab.Anchor = Position{Line: 0, Col: 0}
+	tab.Cursor = Position{Line: 0, Col: 5}
+	tab.InsertRune('(')
+	if tab.Buffer.Lines[0] != "(x + y)" {
+		t.Fatalf("got %q, want %q", tab.Buffer.Lines[0], "(x + y)")
+	}
+	if tab.Anchor != (Position{Line: 0, Col: 1}) {
+		t.Fatalf("anchor should sit right after the opener, got %+v", tab.Anchor)
+	}
+	if tab.Cursor != (Position{Line: 0, Col: 6}) {
+		t.Fatalf("cursor should sit right before the closer, got %+v", tab.Cursor)
+	}
+	if tab.SelectionText() != "x + y" {
+		t.Fatalf("original selection should still be selected, got %q", tab.SelectionText())
+	}
+}
+
+// TestTab_InsertRune_NonOpenerReplacesSelection proves surround-selection
+// only kicks in for openers — typing an ordinary character with a
+// selection still replaces it as before.
+func TestTab_InsertRune_NonOpenerReplacesSelection(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("hello")}
+	tab.Anchor = Position{Line: 0, Col: 0}
+	tab.Cursor = Position{Line: 0, Col: 5}
+	tab.InsertRune('X')
+	if tab.Buffer.Lines[0] != "X" {
+		t.Fatalf("got %q, want %q", tab.Buffer.Lines[0], "X")
+	}
+}
+
 // TestTab_Backspace_MidLine deletes the rune to the left of the cursor.
 func TestTab_Backspace_MidLine(t *testing.T) {
 	tab := &Tab{Buffer: NewBuffer("hello")}
@@ -395,6 +502,35 @@ func TestTab_Backspace_DeletesSelection(t *testing.T) {
 	tab.Backspace()
 	if tab.Buffer.String() != "ho" {
 		t.Fatalf("got %q", tab.Buffer.String())
+	}
+}
+
+// TestTab_Backspace_DeletesEmptyPair proves the auto-close-aware
+// Backspace: with the cursor sitting between a freshly auto-closed pair
+// and nothing typed inside, one Backspace removes both characters instead
+// of leaving a dangling closer.
+func TestTab_Backspace_DeletesEmptyPair(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("")}
+	tab.InsertRune('(') // buffer: "()", cursor between them
+	tab.Backspace()
+	if tab.Buffer.Lines[0] != "" {
+		t.Fatalf("got %q, want empty buffer", tab.Buffer.Lines[0])
+	}
+	if tab.Cursor != (Position{Line: 0, Col: 0}) {
+		t.Fatalf("cursor wrong: %+v", tab.Cursor)
+	}
+}
+
+// TestTab_Backspace_NonEmptyPairDeletesOneChar makes sure the empty-pair
+// fast path doesn't over-fire: with content between the pair, Backspace
+// only removes the single character to the left, same as always.
+func TestTab_Backspace_NonEmptyPairDeletesOneChar(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("(x)")}
+	tab.Cursor = Position{Line: 0, Col: 2}
+	tab.Anchor = tab.Cursor
+	tab.Backspace()
+	if tab.Buffer.Lines[0] != "()" {
+		t.Fatalf("got %q, want %q", tab.Buffer.Lines[0], "()")
 	}
 }
 

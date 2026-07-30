@@ -204,6 +204,300 @@ func TestTab_ClearFind(t *testing.T) {
 	}
 }
 
+// TestMatches_CaseSensitive proves the CaseSensitive toggle actually
+// restricts matching — without it every FindOptions test below could pass
+// vacuously against the always-case-insensitive FindAll path.
+func TestMatches_CaseSensitive(t *testing.T) {
+	buf := NewBuffer("Foo foo FOO")
+	got, err := Matches(buf, "foo", FindOptions{CaseSensitive: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].Col != 4 {
+		t.Fatalf("expected exactly one case-sensitive hit at col 4, got %v", got)
+	}
+}
+
+// TestMatches_WholeWord proves whole-word matching rejects a hit that's
+// embedded inside a longer identifier ("foobar" containing "foo") while
+// still accepting a standalone occurrence.
+func TestMatches_WholeWord(t *testing.T) {
+	buf := NewBuffer("foobar foo_bar foo bar")
+	got, err := Matches(buf, "foo", FindOptions{WholeWord: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []Match{{Line: 0, Col: 15, Width: 3}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("whole-word mismatch: got=%v want=%v", got, want)
+	}
+}
+
+// TestMatches_WholeWord_CaseInsensitiveByDefault proves the two toggles
+// are independent: whole-word alone should still match case-insensitively.
+func TestMatches_WholeWord_CaseInsensitiveByDefault(t *testing.T) {
+	buf := NewBuffer("FOO bar")
+	got, err := Matches(buf, "foo", FindOptions{WholeWord: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 case-insensitive whole-word hit, got %v", got)
+	}
+}
+
+// TestMatches_Regex_Basic pins down that a regex pattern matches
+// literally as a regular expression (not as a literal substring), and
+// that byte offsets from the stdlib matcher get converted to the same
+// rune-indexed Col/Width contract as every other match source.
+func TestMatches_Regex_Basic(t *testing.T) {
+	buf := NewBuffer("foo1 foo22 foo333")
+	got, err := Matches(buf, `foo\d+`, FindOptions{Regex: true, CaseSensitive: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []Match{
+		{Line: 0, Col: 0, Width: 4},
+		{Line: 0, Col: 5, Width: 5},
+		{Line: 0, Col: 11, Width: 6},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("regex mismatch: got=%v want=%v", got, want)
+	}
+}
+
+// TestMatches_Regex_CaseInsensitiveDefault proves the CaseSensitive
+// toggle also governs regex matching (via the injected (?i) flag), not
+// just the plain-substring path.
+func TestMatches_Regex_CaseInsensitiveDefault(t *testing.T) {
+	buf := NewBuffer("FOO foo")
+	got, err := Matches(buf, `foo`, FindOptions{Regex: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 case-insensitive regex hits, got %v", got)
+	}
+}
+
+// TestMatches_Regex_InvalidPatternReturnsUsableError is the correctness
+// bar from the brief: an invalid regex must return an error the caller
+// can display, not panic and not silently report zero matches (which
+// would look like the pattern legitimately didn't match anything).
+func TestMatches_Regex_InvalidPatternReturnsUsableError(t *testing.T) {
+	buf := NewBuffer("anything")
+	got, err := Matches(buf, `(unclosed`, FindOptions{Regex: true})
+	if err == nil {
+		t.Fatal("expected an error for an invalid regex pattern")
+	}
+	if got != nil {
+		t.Fatalf("expected nil matches alongside the error, got %v", got)
+	}
+	if err.Error() == "" {
+		t.Fatal("error message should not be empty")
+	}
+}
+
+// TestMatches_Regex_MultiByteRunes pins down UTF-8 safety for the regex
+// path specifically, since it converts *byte* offsets from the stdlib
+// matcher back to rune columns — getting that wrong corrupts every
+// Position downstream (cursor placement, replace ranges, ...).
+func TestMatches_Regex_MultiByteRunes(t *testing.T) {
+	buf := NewBuffer("✓✓foo")
+	got, err := Matches(buf, `foo`, FindOptions{Regex: true, CaseSensitive: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []Match{{Line: 0, Col: 2, Width: 3}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("multi-byte regex handling wrong, got %v", got)
+	}
+}
+
+// TestMatches_Regex_ZeroWidthSkipped proves a pattern that can match zero
+// runes (like "a*" against a line with no "a") is dropped rather than
+// producing a Match the UI could never usefully jump to or replace, and
+// which FindNext could loop on forever without advancing.
+func TestMatches_Regex_ZeroWidthSkipped(t *testing.T) {
+	buf := NewBuffer("bbb")
+	got, err := Matches(buf, `a*`, FindOptions{Regex: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected zero-width matches to be filtered out, got %v", got)
+	}
+}
+
+// TestTab_SetFindOptions_RecomputesImmediately proves flipping a toggle
+// takes effect right away against the existing query, without the caller
+// having to re-set the query string.
+func TestTab_SetFindOptions_RecomputesImmediately(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("Foo foo")
+	tab.SetFindQuery("foo")
+	if len(tab.FindMatches) != 2 {
+		t.Fatalf("setup: expected 2 case-insensitive matches, got %d", len(tab.FindMatches))
+	}
+	tab.SetFindOptions(true, false, false)
+	if len(tab.FindMatches) != 1 {
+		t.Fatalf("expected 1 case-sensitive match after toggling, got %d", len(tab.FindMatches))
+	}
+}
+
+// TestTab_SetFindQuery_RegexErrorClearsMatchesAndSetsFindErr proves an
+// invalid regex query surfaces through FindErr instead of the tab quietly
+// reporting "no matches" for a query the user just mistyped.
+func TestTab_SetFindQuery_RegexErrorClearsMatchesAndSetsFindErr(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("anything")
+	tab.SetFindOptions(false, false, true)
+	tab.SetFindQuery(`(unclosed`)
+	if tab.FindErr == nil {
+		t.Fatal("expected FindErr to be set for an invalid regex")
+	}
+	if tab.FindMatches != nil || tab.FindIndex != -1 {
+		t.Fatalf("expected matches cleared on regex error, got matches=%v index=%d", tab.FindMatches, tab.FindIndex)
+	}
+}
+
+// TestTab_Replace_ReplacesCurrentMatchAndAdvances proves Replace swaps
+// the focused match's text and moves on to the next match, mirroring the
+// "replace and jump to the next one" flow of a find/replace bar.
+func TestTab_Replace_ReplacesCurrentMatchAndAdvances(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("foo foo foo")
+	tab.SetFindQuery("foo") // FindIndex = 0, at col 0
+
+	if ok := tab.Replace("bar"); !ok {
+		t.Fatal("Replace should report success on a valid current match")
+	}
+	if tab.Buffer.Lines[0] != "bar foo foo" {
+		t.Fatalf("got %q", tab.Buffer.Lines[0])
+	}
+	// The match list was recomputed against the mutated buffer; the
+	// remaining two "foo"s should still be found.
+	if len(tab.FindMatches) != 2 {
+		t.Fatalf("expected 2 remaining matches, got %d: %v", len(tab.FindMatches), tab.FindMatches)
+	}
+}
+
+// TestTab_Replace_NoCurrentMatchIsNoOp proves Replace is safe to call
+// with no active query — a stray hotkey shouldn't panic or corrupt state.
+func TestTab_Replace_NoCurrentMatchIsNoOp(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("hello")
+	if tab.Replace("x") {
+		t.Fatal("Replace should report false with no current match")
+	}
+	if tab.Buffer.Lines[0] != "hello" {
+		t.Fatalf("buffer should be untouched, got %q", tab.Buffer.Lines[0])
+	}
+}
+
+// TestTab_ReplaceAll_ReplacesEveryMatch proves ReplaceAll swaps every
+// match, including on multiple lines, and correctness holds when
+// replacement text is longer or shorter than the match (so a naive
+// fixed-offset implementation would misplace later matches on the same
+// line).
+func TestTab_ReplaceAll_ReplacesEveryMatch(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("foo bar foo\nfoo baz")
+	tab.SetFindQuery("foo")
+
+	n := tab.ReplaceAll("quux")
+	if n != 3 {
+		t.Fatalf("expected 3 replacements, got %d", n)
+	}
+	want := "quux bar quux\nquux baz"
+	if tab.Buffer.String() != want {
+		t.Fatalf("got %q, want %q", tab.Buffer.String(), want)
+	}
+}
+
+// TestTab_ReplaceAll_ReplacementContainingQueryDoesNotReMatch is the
+// explicit infinite-rematch guard from the brief: replacing "foo" with
+// "foofoo" must not cause the newly inserted text to be picked up as
+// additional matches in the same pass.
+func TestTab_ReplaceAll_ReplacementContainingQueryDoesNotReMatch(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("foo foo")
+	tab.SetFindQuery("foo")
+
+	n := tab.ReplaceAll("foofoo")
+	if n != 2 {
+		t.Fatalf("expected exactly 2 replacements (the original matches), got %d", n)
+	}
+	want := "foofoo foofoo"
+	if tab.Buffer.String() != want {
+		t.Fatalf("got %q, want %q", tab.Buffer.String(), want)
+	}
+}
+
+// TestTab_ReplaceAll_IsOneUndoStep is the coalescing requirement from the
+// brief: undoing a ReplaceAll of N matches must be a single Undo call,
+// not N of them, and that one Undo must fully restore the pre-replace
+// buffer.
+func TestTab_ReplaceAll_IsOneUndoStep(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("foo bar foo baz foo")
+	tab.initUndo() // establish a clean baseline, same as NewTab would
+	tab.SetFindQuery("foo")
+
+	before := tab.Buffer.String()
+	n := tab.ReplaceAll("X")
+	if n != 3 {
+		t.Fatalf("expected 3 replacements, got %d", n)
+	}
+	if !tab.CanUndo() {
+		t.Fatal("ReplaceAll should have pushed an undo entry")
+	}
+	if len(tab.undoStack) != 1 {
+		t.Fatalf("ReplaceAll should be exactly one undo entry, got %d", len(tab.undoStack))
+	}
+	if !tab.Undo() {
+		t.Fatal("Undo should succeed")
+	}
+	if tab.Buffer.String() != before {
+		t.Fatalf("single Undo did not fully restore the pre-ReplaceAll buffer: got %q, want %q", tab.Buffer.String(), before)
+	}
+	if tab.CanUndo() {
+		t.Fatal("expected no further undo history after the one ReplaceAll step")
+	}
+}
+
+// TestTab_ReplaceAll_MultiByteSafe proves ReplaceAll's rune-indexed
+// positions stay correct across a replacement that changes a multi-byte
+// line's rune-count, both before and after the edited match on the same
+// line.
+func TestTab_ReplaceAll_MultiByteSafe(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("✓foo✓foo")
+	tab.SetFindQuery("foo")
+
+	n := tab.ReplaceAll("π")
+	if n != 2 {
+		t.Fatalf("expected 2 replacements, got %d", n)
+	}
+	want := "✓π✓π"
+	if tab.Buffer.String() != want {
+		t.Fatalf("got %q, want %q", tab.Buffer.String(), want)
+	}
+}
+
+// TestTab_ReplaceAll_NoMatchesIsNoOp proves ReplaceAll is safe to call
+// with an empty match list.
+func TestTab_ReplaceAll_NoMatchesIsNoOp(t *testing.T) {
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("hello")
+	if n := tab.ReplaceAll("x"); n != 0 {
+		t.Fatalf("expected 0 replacements, got %d", n)
+	}
+	if tab.CanUndo() {
+		t.Fatal("a no-op ReplaceAll should not push an undo entry")
+	}
+}
+
 // TestMatchAtRune_HitAndMiss proves the per-cell renderer probe finds
 // the right match index for cells inside a hit and -1 outside.
 func TestMatchAtRune_HitAndMiss(t *testing.T) {
