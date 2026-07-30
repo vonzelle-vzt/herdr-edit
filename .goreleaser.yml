@@ -83,7 +83,11 @@ brews:
     directory: Formula
     commit_msg_template: "Update {{ .ProjectName }} brew formula to {{ .Tag }} [skip ci]"
     homepage: "https://github.com/vonzelle-vzt/herdr-edit"
-    description: "herdr-edit — mouse-first terminal code editor with LSP diagnostics, for herdr."
+    # `brew audit --strict` rejects three things at once here, and this string is the source of
+    # truth because GoReleaser regenerates Formula/herdr-edit.rb on every release -- editing the
+    # formula directly would be undone by the next tag. Audit requires: starts with a capital,
+    # does not start with the formula name, and does not end with a full stop.
+    description: "Mouse-first terminal code editor with LSP diagnostics, for herdr"
     license: "MIT"
     commit_author:
       name: github-actions[bot]

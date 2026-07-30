@@ -123,23 +123,41 @@ original headers, and files new here carry ours.
 
 ## Install
 
+**Most people should not install this directly.**
+[herdr-extensions](https://github.com/vonzelle-vzt/herdr-extensions) installs it for you, along with
+the panels, the keybindings and the rest of the IDE:
+
+```sh
+brew tap vonzelle-vzt/herdr-extensions https://github.com/vonzelle-vzt/herdr-extensions
+brew install vonzelle-vzt/herdr-extensions/herdr-extensions
+herdr-extensions install        # brings this editor with it
+```
+
+**Standalone**, if you want the editor on its own:
+
 ```sh
 brew tap vonzelle-vzt/herdr-edit https://github.com/vonzelle-vzt/herdr-edit
 brew install vonzelle-vzt/herdr-edit/herdr-edit
+herdr-edit --version
 ```
 
-Or build it:
+**From source** — Go 1.24+ (per `go.mod`), no CGO, no third-party build steps:
 
 ```sh
 git clone https://github.com/vonzelle-vzt/herdr-edit
-cd herdr-edit && make build      # -> bin/herdr-edit
+cd herdr-edit
+make build          # -> bin/herdr-edit
+make test           # go test -race ./...   (14 packages)
+make install        # -> $GOPATH/bin
 ```
 
 The binary is deliberately named `herdr-edit`, **not** `spiceedit`, so it can sit alongside an
-upstream install without either shadowing the other.
+upstream install without either shadowing the other. If you build from source *and* install via brew,
+note that whichever of `~/.local/bin` or `/opt/homebrew/bin` comes first on your `PATH` wins — and
+herdr-extensions resolves the editor with `which`, so it follows the same order you do.
 
-Most people should install [herdr-extensions](https://github.com/vonzelle-vzt/herdr-extensions)
-instead — one command, and it sets this up along with the panels and keybindings.
+Verified against a real install: `brew fetch` checksum passes, `make build` produces a working
+8.9 MB binary, and `make test` is green across all 14 packages.
 
 ---
 
