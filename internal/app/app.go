@@ -634,6 +634,12 @@ func (a *App) loadSpiceConfig() {
 	}
 	if a.tree != nil {
 		a.tree.IconsEnabled = icons.Resolve(cfg.Icons)
+		// Only re-derive when the user turned it OFF: New() already built the set with the filter
+		// on, and rebuilding it here would mean a second `git ls-files` on every startup.
+		if !cfg.RespectGitignore {
+			a.tree.RespectGitignore(false)
+			a.refreshTree()
+		}
 	}
 }
 

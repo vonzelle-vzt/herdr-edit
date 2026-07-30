@@ -33,6 +33,12 @@ type Node struct {
 	Expanded bool
 	Loaded   bool
 	Children []*Node
+
+	// ign is the git-ignore filter, shared by pointer with the whole tree and inherited by every
+	// child at creation. It lives on Node rather than Tree because reload() is a Node method
+	// reached from both loadChildren and refreshNode, and threading it through either a package
+	// global or a Tree back-pointer would be worse.
+	ign *ignoreSet
 }
 
 // GitChangeKind describes the strongest git status a tree row should show.
@@ -54,6 +60,10 @@ type Tree struct {
 	Root    *Node
 	visible []*Node // index = screen row in the list area; nil for blank rows.
 	ScrollY int
+
+	// ignore withholds git-ignored paths. Shared by pointer with every Node, so toggling it
+	// reshapes the whole tree on the next reload without rebuilding anything.
+	ignore *ignoreSet
 
 	// ActiveFolder is the absolute path of the folder the user is
 	// currently "working in" — the default target for actions like New
@@ -95,11 +105,14 @@ func New(root string) (*Tree, error) {
 	if !info.IsDir() {
 		return nil, os.ErrInvalid
 	}
-	n := &Node{Path: abs, Name: filepath.Base(abs), IsDir: true, Expanded: true}
+	// Default ON, matching VS Code, which hides files.exclude entries out of the box. The tree
+	// was the only view that did not already respect .gitignore — the fuzzy finder always has.
+	ign := newIgnoreSet(abs)
+	n := &Node{Path: abs, Name: filepath.Base(abs), IsDir: true, Expanded: true, ign: ign}
 	if err := loadChildren(n); err != nil {
 		return nil, err
 	}
-	return &Tree{Root: n}, nil
+	return &Tree{Root: n, ignore: ign}, nil
 }
 
 // loadChildren is the lazy-load entry point used the first time a directory
@@ -135,14 +148,20 @@ func (n *Node) reload() error {
 		if shouldHide(e.Name()) {
 			continue
 		}
+		full := filepath.Join(n.Path, e.Name())
+		if !n.ign.allows(full) {
+			continue
+		}
 		if old, ok := existing[e.Name()]; ok && old.IsDir == e.IsDir() {
+			old.ign = n.ign // inherit, in case the filter was toggled since this node was built
 			children = append(children, old)
 			continue
 		}
 		children = append(children, &Node{
-			Path:  filepath.Join(n.Path, e.Name()),
+			Path:  full,
 			Name:  e.Name(),
 			IsDir: e.IsDir(),
+			ign:   n.ign,
 		})
 	}
 	sort.SliceStable(children, func(i, j int) bool {
@@ -161,6 +180,15 @@ func (n *Node) reload() error {
 // entries keep their Node pointers so deeper Expanded state is preserved;
 // new files appear, deleted files vanish.
 func (t *Tree) Refresh() {
+	// Rebuild the ignore set first: .gitignore is itself an editable file, and a stale set would
+	// keep showing a directory the user just ignored (or keep hiding one they just un-ignored)
+	// until the editor restarted.
+	if t.ignore != nil && t.ignore.active {
+		fresh := newIgnoreSet(t.Root.Path)
+		if fresh.active {
+			*t.ignore = *fresh // in place, so every Node sharing the pointer sees it
+		}
+	}
 	refreshNode(t.Root)
 }
 

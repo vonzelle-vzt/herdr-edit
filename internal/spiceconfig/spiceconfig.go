@@ -49,13 +49,20 @@ const (
 // any field the file omitted, so consumers never need to nil-check.
 type Config struct {
 	Icons IconsMode
+
+	// RespectGitignore hides git-ignored paths from the file tree. Default ON, matching VS Code,
+	// which hides files.exclude entries out of the box — and matching the fuzzy finder, which has
+	// always built its index from `git ls-files --exclude-standard`. The tree was the odd one out.
+	// A pointer in fileFormat distinguishes "absent" from "explicitly false"; this is the promoted
+	// plain bool.
+	RespectGitignore bool
 }
 
 // Defaults returns a Config populated with the values used when no
 // config file is present (or every field in it is blank). Centralised
 // so tests and the loader can't drift from each other.
 func Defaults() Config {
-	return Config{Icons: IconsAuto}
+	return Config{Icons: IconsAuto, RespectGitignore: true}
 }
 
 // fileFormat mirrors the on-disk JSON shape. We decode into this and
@@ -63,6 +70,13 @@ func Defaults() Config {
 // JSON tags or pointer fields just for "field was absent" detection.
 type fileFormat struct {
 	Icons string `json:"icons,omitempty"`
+	Tree  *tree  `json:"tree,omitempty"`
+}
+
+// tree groups file-explorer settings. Nested rather than flat so future tree options have an
+// obvious home, and a pointer so an absent block keeps the default instead of reading as false.
+type tree struct {
+	RespectGitignore *bool `json:"respectGitignore,omitempty"`
 }
 
 // DefaultPath returns the canonical config-file location:
@@ -128,6 +142,11 @@ func Load(path string) (Config, error) {
 			"%s: icons must be %q, %q, or %q (got %q)",
 			path, IconsAuto, IconsOn, IconsOff, ff.Icons,
 		)
+	}
+
+	// Absent block or absent key keeps the default; only an explicit false turns it off.
+	if ff.Tree != nil && ff.Tree.RespectGitignore != nil {
+		cfg.RespectGitignore = *ff.Tree.RespectGitignore
 	}
 	return cfg, nil
 }
