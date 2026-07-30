@@ -3,6 +3,15 @@
   Copyright: 2026 Cloudmanic, LLC. (upstream) / 2026 Vonzelle Brown (fork)
 -->
 
+<p align="center">
+  <picture>
+    <source srcset="docs/assets/banner.webp" type="image/webp">
+    <img src="docs/assets/banner.jpg"
+         alt="herdr-edit — VS Code intelligence, terminal speed. A mouse-first terminal editor showing a file explorer, Rust source with an inline diagnostic on line 134, a hover card documenting the width() method, and an AI agent pane suggesting a fix. Feature chips read: LSP Diagnostics, Hover, Go to Definition, Git-aware Tree, Replace, Word Wrap."
+         width="100%">
+  </picture>
+</p>
+
 # herdr-edit
 
 > A mouse-first terminal code editor **with real language intelligence** — inline diagnostics,
