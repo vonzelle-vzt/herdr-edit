@@ -832,6 +832,10 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleAutoScroll()
 	case *treeRefreshEvent:
 		a.refreshTreeNow()
+	case *lspHoverEvent:
+		a.handleLSPHover(e)
+	case *lspJumpEvent:
+		a.handleLSPJump(e)
 	case *diagnosticsEvent:
 		a.handleDiagnostics(e)
 	case *lspLogEvent:

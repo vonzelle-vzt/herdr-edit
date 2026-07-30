@@ -47,6 +47,10 @@ func leaderBindings() []leaderBinding {
 		{'/', (*App).menuToggleLineComment},
 		{'f', (*App).openFind},
 		{'p', (*App).openFinder},
+		// LSP. Both requests were implemented, tested and advertised in initialize with no caller;
+		// these two keys are the entire wiring.
+		{'h', (*App).menuHover},
+		{'d', (*App).menuGoToDefinition},
 	}
 }
 

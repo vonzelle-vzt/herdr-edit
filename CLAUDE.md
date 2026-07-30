@@ -271,6 +271,20 @@ an underline so syntax colours survive. It is a separate pass because the
 render path is hot and diagnostics arrive on their own schedule — keeping
 them apart means a project with no language server pays nothing.
 
+### LSP features reachable from the UI (fork)
+`Esc h` = hover, `Esc d` = go-to-definition, plus diagnostics. Both requests, the
+`Manager` methods, and the `hover`/`definition` client capabilities in
+`initialize` existed and were tested for a long time with **no caller at all** —
+an audit of every LSP method found the two most-used features after diagnostics
+complete and unreachable. If you add another (`references`, `rename`,
+`documentSymbol`), remember that implementing the request is the easy half;
+grep for a call site before believing it works.
+
+Both run on a goroutine and deliver a **posted event**, like diagnostics. Calling
+inline would block `Run`'s `PollEvent` loop on a language server — gopls answers
+in milliseconds, but an indexing or wedged server would freeze the editor for the
+whole timeout with no way to type.
+
 🔴 LSP counts columns in **UTF-16 code units**; the buffer is **rune**
 indexed. Identical for ASCII, so a mistake here survives testing right up
 until a line contains an emoji or CJK text. Convert at the boundary
