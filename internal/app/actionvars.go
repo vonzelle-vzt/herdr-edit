@@ -139,4 +139,3 @@ func relOrEmpty(base, target string) string {
 	// so normalise. This is a no-op on Mac / Linux.
 	return filepath.ToSlash(rel)
 }
-

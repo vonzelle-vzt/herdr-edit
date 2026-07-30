@@ -240,6 +240,11 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Find file in project", shortcut: "Esc p", action: (*App).menuFindFile, enabled: (*App).hasFinder},
 			{label: "Run a command", shortcut: "Esc k", action: (*App).menuCommandPalette, enabled: alwaysTrue},
 			{label: "Complete at cursor", shortcut: "Esc space", action: (*App).menuComplete, enabled: (*App).hasFindable},
+			{label: "Find references", shortcut: "Esc j", action: (*App).menuFindReferences, enabled: (*App).hasFileTab},
+			{label: "Rename symbol", shortcut: "Esc y", action: (*App).menuRenameSymbol, enabled: (*App).hasFileTab},
+			{label: "Toggle bookmark", shortcut: "Esc m", action: (*App).menuToggleBookmark, enabled: (*App).hasFileTab},
+			{label: "Next bookmark", shortcut: "Esc '", action: (*App).menuNextBookmark, enabled: (*App).hasBookmarks},
+			{label: "Clear bookmarks", action: (*App).menuClearBookmarks, enabled: (*App).hasBookmarks},
 			{label: "Open changes (diff)", shortcut: "Esc o", action: (*App).menuOpenChanges, enabled: (*App).hasFileTab},
 			{shortcut: "Esc b", action: (*App).menuToggleInlineBlame, enabled: alwaysTrue, labelFor: (*App).inlineBlameLabel},
 			{label: "Go to line", shortcut: "Esc g", action: (*App).menuGoToLine, enabled: (*App).hasFindable},
@@ -428,6 +433,11 @@ type App struct {
 	hoveredMenuRow int       // index into menuItems of the row under the mouse, or -1.
 	lastEscape     time.Time // timestamp of the previous Esc press, for double-tap detection.
 
+	// menuScroll is how many rows the action menu is scrolled by. Used
+	// identically by the renderer and by BOTH hit-tests, so a click always
+	// lands on the row the user can actually see.
+	menuScroll int
+
 	// Prompt modal — single-line text input with OK / Cancel. Used by
 	// Rename and New File. See modals.go for render + event handling.
 	promptOpen     bool
@@ -568,6 +578,11 @@ type App struct {
 	// showing, so a second Esc o can flip the baseline instead of stacking tabs.
 	diffSource   string
 	diffBaseline diffBaseline
+
+	// Bookmarks — Esc m marks, Esc ' cycles. No plugin in herdr's marketplace
+	// bookmarks a file:line; the harpoon ports mark panes, not places in code.
+	bookmarks     []bookmark
+	bookmarkIndex int
 
 	finderOpen     bool
 	finderQuery    []rune
@@ -930,6 +945,10 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleDiagnostics(e)
 	case *completionEvent:
 		a.handleCompletion(e)
+	case *referencesEvent:
+		a.handleReferences(e)
+	case *renameEvent:
+		a.handleRename(e)
 	case *blameEvent:
 		a.handleBlame(e)
 	case *lspLogEvent:
@@ -1234,9 +1253,42 @@ func (a *App) menuButtonRect() (x, y, w, h int) {
 // menuModalRect returns the on-screen rectangle of the action modal,
 // centered in the window. Height is derived from the current layout
 // so adding custom actions grows the modal automatically.
+// menuModalRect is the action menu's rectangle, CLAMPED to the screen.
+//
+// 🔴 It used to take menuLayout's natural height unclamped, which was fine while
+// the menu was short and silently broken once it was not: at 33 rows the modal
+// wanted 43 lines and simply drew past the bottom of a 40-row pane, taking the
+// last rows — Quit among them — off screen with no indication. The menu is this
+// editor's PRIMARY surface (macOS Terminal + tmux frequently swallows
+// right-click), so it has to work at the pane heights this project targets: a
+// 60-column split beside an agent, not a full-screen terminal.
+//
+// Overflow is handled by menuScroll rather than by hiding rows, because every
+// action is required to stay reachable here.
+// scrollMenu moves the action menu by delta rows, clamped so it can never
+// scroll past its own content in either direction.
+func (a *App) scrollMenu(delta int) {
+	_, _, natural := a.menuLayout()
+	_, _, _, mh := a.menuModalRect()
+	maxScroll := natural - mh
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	a.menuScroll += delta
+	if a.menuScroll > maxScroll {
+		a.menuScroll = maxScroll
+	}
+	if a.menuScroll < 0 {
+		a.menuScroll = 0
+	}
+}
+
 func (a *App) menuModalRect() (x, y, w, h int) {
 	w = modalWidth
 	_, _, h = a.menuLayout()
+	if max := a.height - 2; h > max && max > 4 {
+		h = max
+	}
 	x = (a.width - w) / 2
 	y = (a.height - h) / 2
 	if x < 0 {
@@ -1457,6 +1509,17 @@ func (a *App) handleMouse(ev *tcell.EventMouse) {
 	}
 
 	if a.menuOpen {
+		// The menu can be taller than the pane, so the wheel scrolls it rather
+		// than the text underneath — scrolling the buffer behind a modal you are
+		// reading is never what was meant.
+		if btn&tcell.WheelUp != 0 {
+			a.scrollMenu(-2)
+			return
+		}
+		if btn&tcell.WheelDown != 0 {
+			a.scrollMenu(2)
+			return
+		}
 		a.updateMenuHover(x, y)
 		a.handleMenuMouse(x, y, btn)
 		return
@@ -1590,7 +1653,7 @@ func (a *App) handleMenuMouse(x, y int, btn tcell.ButtonMask) {
 		a.closeMenu()
 		return
 	}
-	relY := y - my
+	relY := y - my + a.menuScroll
 	items, _, _ := a.menuLayout()
 	for _, item := range items {
 		if item.relY != relY {
@@ -2190,6 +2253,12 @@ func (a *App) openMenu() {
 	a.closeAllModals()
 	a.menuOpen = true
 	a.menuMoveSelection(1)
+	// Open at the TOP, always. menuMoveSelection reveals whatever row it lands
+	// on, and with no file open the first ENABLED row can be most of the way
+	// down the list — so without this the menu would open already scrolled,
+	// hiding its own first rows for no reason the user can see. The first arrow
+	// press scrolls from here.
+	a.menuScroll = 0
 }
 
 // menuMoveSelection advances hoveredMenuRow to the next (dir=+1) or
@@ -2217,10 +2286,28 @@ func (a *App) menuMoveSelection(dir int) {
 		idx := ((start+dir*i)%n + n) % n
 		if items[idx].enabled(a) {
 			a.hoveredMenuRow = idx
+			a.revealMenuRow(items[idx].relY)
 			return
 		}
 	}
 	a.hoveredMenuRow = -1
+}
+
+// revealMenuRow scrolls the menu so relY is inside the visible window. Keyboard
+// navigation must never move the selection somewhere the user cannot see it —
+// that reads as the arrow keys having stopped working.
+func (a *App) revealMenuRow(relY int) {
+	_, _, _, mh := a.menuModalRect()
+	top, bottom := 1, mh-2 // inside the border rows
+	if relY-a.menuScroll < top {
+		a.menuScroll = relY - top
+	}
+	if relY-a.menuScroll > bottom {
+		a.menuScroll = relY - bottom
+	}
+	if a.menuScroll < 0 {
+		a.menuScroll = 0
+	}
 }
 
 // menuActivate runs the currently-highlighted menu item, if any. It's the
@@ -2252,7 +2339,7 @@ func (a *App) updateMenuHover(x, y int) {
 	if x < mx || x >= mx+mw || y < my || y >= my+mh {
 		return
 	}
-	relY := y - my
+	relY := y - my + a.menuScroll
 	items, _, _ := a.menuLayout()
 	for i, item := range items {
 		if item.relY == relY && item.enabled(a) {
@@ -2971,7 +3058,10 @@ func (a *App) drawMenu() {
 	hoverStyle := tcell.StyleDefault.Background(hoverBg).Foreground(a.theme.Text).Bold(true)
 	hoverChevStyle := tcell.StyleDefault.Background(hoverBg).Foreground(a.theme.AccentSoft).Bold(true)
 	for i, item := range items {
-		cy := my + item.relY
+		cy := my + item.relY - a.menuScroll
+		if cy <= my || cy >= my+mh-1 {
+			continue
+		}
 		enabled := item.enabled(a)
 		hovered := enabled && i == a.hoveredMenuRow
 

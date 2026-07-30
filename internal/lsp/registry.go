@@ -297,6 +297,24 @@ func (m *Manager) Completion(ctx context.Context, path string, pos Position) ([]
 	return c.Completion(ctx, URI(path), pos)
 }
 
+// References proxies textDocument/references for path.
+func (m *Manager) References(ctx context.Context, path string, pos Position) ([]Location, error) {
+	c := m.existing(path)
+	if c == nil {
+		return nil, nil
+	}
+	return c.References(ctx, URI(path), pos)
+}
+
+// Rename proxies textDocument/rename for path.
+func (m *Manager) Rename(ctx context.Context, path string, pos Position, newName string) (map[string][]TextEdit, error) {
+	c := m.existing(path)
+	if c == nil {
+		return nil, nil
+	}
+	return c.Rename(ctx, URI(path), pos, newName)
+}
+
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	clients := make([]*Client, 0, len(m.clients))

@@ -78,6 +78,8 @@ embeds standalone Monaco with no LSP at all.
 | **Go to line, select all** | `Esc g`, `Esc a`. `SelectAll` had been complete and unit-tested in `internal/editor` with **zero** non-test callers; only the wiring was missing. |
 | **`--open-at`, the reverse contract** | `herdr-edit --open-at path:line[:col]` asks an **already-running** editor to jump there. `active.json` flows editor → panels; this flows panels → editor, which is what turns a read-only review into an edit: the Review panel hands you a line from the agent's diff and you land on it with a language server attached. |
 | **A diff view** | `Esc o` opens the active file's diff as a real tab, and pressing it again flips the baseline between your branch's **merge-base** and **HEAD** — "what does this branch change" versus "what have I not committed", which are different questions and the first is the one you ask of an agent's work. Built as a *synthetic tab* rather than a new render mode: word wrap already taught this codebase what a second geometry path costs, so a tab whose buffer happens to hold diff text inherits scrolling, search, selection and mouse hit-testing for free, and refuses to save. |
+| **Rename and find-references** | `Esc y` renames a symbol project-wide; `Esc j` lists every use. Rename decodes **both** WorkspaceEdit wire shapes — servers send either `changes` or `documentChanges`, and handling one makes rename silently do nothing against half of them. Edits apply back-to-front per file, because changing text length at one position invalidates every position after it. |
+| **Bookmarks** | `Esc m` pins a `file:line`, `Esc '` cycles them. A 401-repo sweep of herdr's marketplace found **no plugin that bookmarks a place in the code** — the "harpoon" ports mark panes and workspaces, which is navigation between windows, not between lines. |
 | **Persistent undo** | History used to die with the process. |
 | **Active-file publishing** | A debounced `{file,line,col,root}` snapshot other tools can read. |
 
@@ -119,6 +121,10 @@ primary surface, because macOS Terminal and tmux frequently swallow right-click.
 | `Esc` `a` | **Select all** | |
 | `Esc` `b` | Toggle **inline git blame** | author and commit on the cursor's line |
 | `Esc` `o` | **Open changes** — the file's diff as a tab | press again to flip merge-base ⟷ HEAD |
+| `Esc` `j` | **Find references** | every use of the symbol, as a list you can open from |
+| `Esc` `y` | **Rename symbol** | project-wide, applied across files on disk |
+| `Esc` `m` | **Toggle bookmark** on this line | |
+| `Esc` `'` | **Next bookmark** | cycles, wrapping |
 
 Deliberately unbound: `c` / `x` / `v`, because the terminal's own copy and paste already own that
 path; and rename / delete / revert, which are destructive enough to want the menu's confirm dialog.

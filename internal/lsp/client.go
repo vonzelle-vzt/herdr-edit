@@ -148,6 +148,12 @@ func (c *Client) initialize(ctx context.Context, rootURI string) error {
 					"contentFormat": []string{"plaintext", "markdown"},
 				},
 				"definition": map[string]interface{}{},
+				"references": map[string]interface{}{},
+				"rename": map[string]interface{}{
+					// We apply a plain WorkspaceEdit.changes map; we do not
+					// implement prepareRename or documentChanges/versioning.
+					"prepareSupport": false,
+				},
 				"completion": map[string]interface{}{
 					"completionItem": map[string]interface{}{
 						// Plain text only: this editor has no snippet engine, and
@@ -301,6 +307,36 @@ func (c *Client) Completion(ctx context.Context, uri string, pos Position) ([]Co
 		return nil, err
 	}
 	return completionItems(raw), nil
+}
+
+// References finds every use of the symbol at pos, including its declaration.
+func (c *Client) References(ctx context.Context, uri string, pos Position) ([]Location, error) {
+	raw, err := c.call(ctx, "textDocument/references", referenceParams{
+		TextDocument: textDocumentIdentifier{URI: uri},
+		Position:     pos,
+		Context:      referenceContext{IncludeDeclaration: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return locations(raw), nil
+}
+
+// Rename asks the server for the edits that rename the symbol at pos.
+//
+// It returns the edits rather than applying them: the server answers with a
+// WorkspaceEdit spanning files that may not be open, and deciding what to do
+// about that is the editor's business, not the protocol client's.
+func (c *Client) Rename(ctx context.Context, uri string, pos Position, newName string) (map[string][]TextEdit, error) {
+	raw, err := c.call(ctx, "textDocument/rename", renameParams{
+		TextDocument: textDocumentIdentifier{URI: uri},
+		Position:     pos,
+		NewName:      newName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return workspaceEdits(raw), nil
 }
 
 // call issues a request and waits for its response or the context deadline.

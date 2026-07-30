@@ -635,4 +635,3 @@ func ctxDelete(a *App, n *filetree.Node) {
 		app.doDeletePath(target)
 	})
 }
-

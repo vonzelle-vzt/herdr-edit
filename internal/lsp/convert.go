@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -381,4 +382,68 @@ func CompletionKindName(kind int) string {
 	default:
 		return ""
 	}
+}
+
+// workspaceEdits unwraps a textDocument/rename result into path -> edits.
+//
+// The spec offers TWO ways to say the same thing: a flat `changes` map, and a
+// `documentChanges` array carrying versioned document identifiers. Servers pick
+// per implementation — gopls prefers documentChanges, others send changes — so
+// decoding only one yields "rename did nothing" against half of them, with no
+// error to explain it.
+//
+// Edits are returned in DESCENDING position order per file. Applying them in
+// document order would invalidate every later range as soon as the first edit
+// changed the text length; walking backwards keeps every remaining range valid
+// without re-deriving anything. Same reason ReplaceAll walks its matches
+// last-to-first.
+func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	type wireEdit struct {
+		Range   Range  `json:"range"`
+		NewText string `json:"newText"`
+	}
+	var payload struct {
+		Changes         map[string][]wireEdit `json:"changes"`
+		DocumentChanges []struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Edits []wireEdit `json:"edits"`
+		} `json:"documentChanges"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+
+	out := map[string][]TextEdit{}
+	add := func(uri string, edits []wireEdit) {
+		path := PathFromURI(uri)
+		if path == "" {
+			return
+		}
+		for _, e := range edits {
+			out[path] = append(out[path], TextEdit{Range: e.Range, NewText: e.NewText})
+		}
+	}
+	for uri, edits := range payload.Changes {
+		add(uri, edits)
+	}
+	for _, dc := range payload.DocumentChanges {
+		add(dc.TextDocument.URI, dc.Edits)
+	}
+
+	for path := range out {
+		edits := out[path]
+		sort.SliceStable(edits, func(i, j int) bool {
+			if edits[i].Range.Start.Line != edits[j].Range.Start.Line {
+				return edits[i].Range.Start.Line > edits[j].Range.Start.Line
+			}
+			return edits[i].Range.Start.Character > edits[j].Range.Start.Character
+		})
+		out[path] = edits
+	}
+	return out
 }

@@ -220,3 +220,51 @@ func TestCompletionKindName(t *testing.T) {
 		t.Errorf("an unknown kind should render blank, got %q", CompletionKindName(999))
 	}
 }
+
+// TestWorkspaceEdits_BothWireShapes pins the decode. The spec offers a flat
+// `changes` map AND a `documentChanges` array; servers pick per implementation
+// (gopls prefers documentChanges), so handling only one makes rename silently
+// do nothing against half of them, with no error to explain it.
+func TestWorkspaceEdits_BothWireShapes(t *testing.T) {
+	flat := []byte(`{"changes":{"file:///tmp/a.go":[{"range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}},"newText":"neo"}]}}`)
+	got := workspaceEdits(flat)
+	if len(got["/tmp/a.go"]) != 1 || got["/tmp/a.go"][0].NewText != "neo" {
+		t.Fatalf("flat changes decoded to %+v", got)
+	}
+
+	docs := []byte(`{"documentChanges":[{"textDocument":{"uri":"file:///tmp/b.go","version":3},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"x"}]}]}`)
+	got = workspaceEdits(docs)
+	if len(got["/tmp/b.go"]) != 1 || got["/tmp/b.go"][0].NewText != "x" {
+		t.Fatalf("documentChanges decoded to %+v", got)
+	}
+}
+
+// TestWorkspaceEdits_DescendingOrder is the property that makes applying them
+// safe. Editing a line front-to-back shifts every later range; walking
+// backwards keeps each remaining range valid with no offset bookkeeping.
+func TestWorkspaceEdits_DescendingOrder(t *testing.T) {
+	raw := []byte(`{"changes":{"file:///tmp/c.go":[
+      {"range":{"start":{"line":1,"character":1},"end":{"line":1,"character":2}},"newText":"a"},
+      {"range":{"start":{"line":5,"character":0},"end":{"line":5,"character":1}},"newText":"b"},
+      {"range":{"start":{"line":1,"character":9},"end":{"line":1,"character":10}},"newText":"c"}]}}`)
+	edits := workspaceEdits(raw)["/tmp/c.go"]
+	if len(edits) != 3 {
+		t.Fatalf("got %d edits", len(edits))
+	}
+	for i := 1; i < len(edits); i++ {
+		prev, cur := edits[i-1].Range.Start, edits[i].Range.Start
+		if prev.Line < cur.Line || (prev.Line == cur.Line && prev.Character < cur.Character) {
+			t.Fatalf("edits are not descending: %+v", edits)
+		}
+	}
+}
+
+// TestWorkspaceEdits_Degrades pins that junk yields nothing rather than a panic
+// or a half-decoded edit that would corrupt a file.
+func TestWorkspaceEdits_Degrades(t *testing.T) {
+	for _, in := range []string{"", "null", "{}", "not json", `{"changes":{}}`} {
+		if got := workspaceEdits([]byte(in)); len(got) != 0 {
+			t.Errorf("workspaceEdits(%q) = %+v, want empty", in, got)
+		}
+	}
+}

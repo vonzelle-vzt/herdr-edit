@@ -165,3 +165,31 @@ type positionParams struct {
 	TextDocument textDocumentIdentifier `json:"textDocument"`
 	Position     Position               `json:"position"`
 }
+
+// referenceContext tells the server whether the symbol's own declaration counts
+// as a reference. It does here: "where is this used" almost always means "show
+// me everywhere including where it is defined", and a list that omits the
+// declaration reads as if one hit went missing.
+type referenceContext struct {
+	IncludeDeclaration bool `json:"includeDeclaration"`
+}
+
+// referenceParams is positionParams plus that context.
+type referenceParams struct {
+	TextDocument textDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	Context      referenceContext       `json:"context"`
+}
+
+// renameParams asks for the edits that rename the symbol at Position.
+type renameParams struct {
+	TextDocument textDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	NewName      string                 `json:"newName"`
+}
+
+// TextEdit is one replacement inside a file, in LSP's UTF-16 coordinates.
+type TextEdit struct {
+	Range   Range
+	NewText string
+}

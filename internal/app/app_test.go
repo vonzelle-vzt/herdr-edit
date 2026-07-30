@@ -260,7 +260,14 @@ func TestMenuButtonRect(t *testing.T) {
 func TestMenuModalRect_Centered(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
 	x, y, w, h := a.menuModalRect()
-	_, _, expectedH := a.menuLayout()
+	_, _, natural := a.menuLayout()
+	// The height is the CLAMPED height. The menu has outgrown a 40-row pane, so
+	// it scrolls rather than drawing off the bottom — see
+	// TestMenuModalRect_ClampedToScreen.
+	expectedH := natural
+	if maxH := a.height - 2; expectedH > maxH && maxH > 4 {
+		expectedH = maxH
+	}
 	if w != modalWidth || h != expectedH {
 		t.Fatalf("modal size: got (%d,%d), want (%d,%d)", w, h, modalWidth, expectedH)
 	}
@@ -1682,7 +1689,12 @@ func TestHandleMenuMouse_ClicksRowAndOutside(t *testing.T) {
 		t.Fatal("sidebar toggle row not found")
 	}
 	before := a.sidebarShown
-	a.handleMenuMouse(mx+5, my+toggleRelY, tcell.Button1)
+	// The menu is now taller than a 40-row pane, so the target row may sit below
+	// the fold. Scroll it into view first and click where it is actually drawn —
+	// which is exactly what a user does, and what the shared menuScroll offset
+	// exists to keep consistent between the renderer and the hit-test.
+	a.revealMenuRow(toggleRelY)
+	a.handleMenuMouse(mx+5, my+toggleRelY-a.menuScroll, tcell.Button1)
 	if a.sidebarShown == before {
 		t.Fatal("expected toggle to fire")
 	}
@@ -1815,13 +1827,13 @@ func TestMenuLayout_NoCustomActions(t *testing.T) {
 	a.customActions = nil
 	items, dividers, h := a.menuLayout()
 
-	if h != 38 {
-		t.Errorf("modalHeight = %d, want 38", h)
+	if h != 43 {
+		t.Errorf("modalHeight = %d, want 43", h)
 	}
-	if got := len(items); got != 28 {
-		t.Errorf("item count = %d, want 28 built-ins", got)
+	if got := len(items); got != 33 {
+		t.Errorf("item count = %d, want 33 built-ins", got)
 	}
-	wantDiv := []int{2, 6, 10, 20, 28, 33, 35}
+	wantDiv := []int{2, 6, 10, 25, 33, 38, 40}
 	if len(dividers) != len(wantDiv) {
 		t.Fatalf("dividers = %v, want %v", dividers, wantDiv)
 	}
@@ -1982,8 +1994,8 @@ func TestMenuLayout_WithCustomActions(t *testing.T) {
 	}
 	items, _, h := a.menuLayout()
 
-	if h != 41 { // 38 + 2 items + 1 divider
-		t.Errorf("modalHeight = %d, want 41", h)
+	if h != 46 { // 43 + 2 items + 1 divider
+		t.Errorf("modalHeight = %d, want 46", h)
 	}
 	// Custom actions should be the second-to-last and third-to-last
 	// rows, with Quit as the final row.
@@ -2655,5 +2667,69 @@ func TestDoubleClickSashRestoresAutoFit(t *testing.T) {
 	}
 	if a.dragMode == "sidebar" {
 		t.Fatal("a double-click must not also start a drag, which would re-pin immediately")
+	}
+}
+
+// TestMenuModalRect_ClampedToScreen pins the regression that the growing action
+// menu caused: menuModalRect took menuLayout's natural height unclamped, so at
+// 33 rows it wanted 43 lines and simply drew past the bottom of a 40-row pane,
+// taking Quit off screen with no indication. The menu is the PRIMARY surface
+// here — macOS Terminal + tmux frequently swallows right-click — so it has to
+// work at the pane heights this project targets.
+func TestMenuModalRect_ClampedToScreen(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	for _, h := range []int{40, 24, 12, 8} {
+		a.height = h
+		_, my, _, mh := a.menuModalRect()
+		if my < 0 {
+			t.Errorf("height %d: modal starts off-screen at y=%d", h, my)
+		}
+		if my+mh > h {
+			t.Errorf("height %d: modal bottom %d overflows the screen", h, my+mh)
+		}
+	}
+}
+
+// TestMenuScroll_ClampedBothWays pins that the menu can never scroll past its
+// own content in either direction.
+func TestMenuScroll_ClampedBothWays(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	a.height = 12 // force overflow
+	a.openMenu()
+	if a.menuScroll != 0 {
+		t.Fatalf("opening the menu left it scrolled to %d", a.menuScroll)
+	}
+	a.scrollMenu(-50)
+	if a.menuScroll != 0 {
+		t.Errorf("scrolled above the top to %d", a.menuScroll)
+	}
+	a.scrollMenu(1000)
+	_, _, natural := a.menuLayout()
+	_, _, _, mh := a.menuModalRect()
+	if want := natural - mh; a.menuScroll > want {
+		t.Errorf("scrolled past the end: %d > %d", a.menuScroll, want)
+	}
+}
+
+// TestMenuScroll_KeyboardKeepsSelectionVisible pins that arrowing down through a
+// menu taller than the pane scrolls to follow. A selection that moves somewhere
+// invisible reads as the arrow keys having stopped working.
+func TestMenuScroll_KeyboardKeepsSelectionVisible(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	a.height = 14
+	a.openMenu()
+	items, _, _ := a.menuLayout()
+	_, _, _, mh := a.menuModalRect()
+
+	for i := 0; i < len(items); i++ {
+		a.menuMoveSelection(1)
+		if a.hoveredMenuRow < 0 {
+			continue
+		}
+		rel := items[a.hoveredMenuRow].relY - a.menuScroll
+		if rel < 1 || rel > mh-2 {
+			t.Fatalf("selection row %d is outside the visible window (rel=%d, mh=%d)",
+				a.hoveredMenuRow, rel, mh)
+		}
 	}
 }

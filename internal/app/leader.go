@@ -55,6 +55,10 @@ func leaderBindings() []leaderBinding {
 		{'b', (*App).menuToggleInlineBlame},
 		{' ', (*App).menuComplete},
 		{'o', (*App).menuOpenChanges},
+		{'j', (*App).menuFindReferences},
+		{'y', (*App).menuRenameSymbol},
+		{'m', (*App).menuToggleBookmark},
+		{'\'', (*App).menuNextBookmark},
 		// LSP. Both requests were implemented, tested and advertised in initialize with no caller;
 		// these two keys are the entire wiring.
 		{'h', (*App).menuHover},

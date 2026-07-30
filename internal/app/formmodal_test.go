@@ -85,11 +85,14 @@ func TestForm_TabCyclesFocus(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
 	a.openForm("Test", scpPrompts(), nil)
 
-	steps := []struct{ key tcell.Key; want int }{
+	steps := []struct {
+		key  tcell.Key
+		want int
+	}{
 		{tcell.KeyTab, 1},
 		{tcell.KeyTab, 2},
-		{tcell.KeyTab, 0},      // wraps
-		{tcell.KeyBacktab, 2},  // wraps backward
+		{tcell.KeyTab, 0},     // wraps
+		{tcell.KeyBacktab, 2}, // wraps backward
 		{tcell.KeyBacktab, 1},
 	}
 	for i, s := range steps {
