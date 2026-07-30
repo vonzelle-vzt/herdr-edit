@@ -315,6 +315,33 @@ func (m *Manager) Rename(ctx context.Context, path string, pos Position, newName
 	return c.Rename(ctx, URI(path), pos, newName)
 }
 
+// DocumentSymbol proxies textDocument/documentSymbol.
+func (m *Manager) DocumentSymbol(ctx context.Context, path string) ([]Symbol, error) {
+	c := m.existing(path)
+	if c == nil {
+		return nil, nil
+	}
+	return c.DocumentSymbol(ctx, URI(path))
+}
+
+// SignatureHelp proxies textDocument/signatureHelp.
+func (m *Manager) SignatureHelp(ctx context.Context, path string, pos Position) (string, error) {
+	c := m.existing(path)
+	if c == nil {
+		return "", nil
+	}
+	return c.SignatureHelp(ctx, URI(path), pos)
+}
+
+// CodeAction proxies textDocument/codeAction.
+func (m *Manager) CodeAction(ctx context.Context, path string, rng Range, diags []Diagnostic) ([]CodeAction, error) {
+	c := m.existing(path)
+	if c == nil {
+		return nil, nil
+	}
+	return c.CodeAction(ctx, URI(path), rng, diags)
+}
+
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	clients := make([]*Client, 0, len(m.clients))

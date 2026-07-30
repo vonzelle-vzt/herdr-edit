@@ -447,3 +447,202 @@ func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
 	}
 	return out
 }
+
+// symbols unwraps a documentSymbol result.
+//
+// The spec allows TWO completely different payloads here and servers genuinely
+// differ: the modern nested DocumentSymbol[] (children inside parents, ranges
+// under "selectionRange"/"range") and the legacy flat SymbolInformation[]
+// (no children, position under "location.range"). Decoding one shape leaves the
+// outline empty against every server that chose the other — which reads as "this
+// language has no symbols" rather than as a missing branch.
+func symbols(raw json.RawMessage) []Symbol {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	type nested struct {
+		Name           string          `json:"name"`
+		Detail         string          `json:"detail"`
+		Kind           int             `json:"kind"`
+		Range          Range           `json:"range"`
+		SelectionRange Range           `json:"selectionRange"`
+		Children       json.RawMessage `json:"children"`
+	}
+
+	// 🔴 SHAPE DETECTION, not "try one and fall back". A flat SymbolInformation[]
+	// unmarshals into the nested struct WITHOUT error — name and kind match, and
+	// the unknown "location" field is simply ignored — leaving every entry with a
+	// zero Range. The fallback would then never run and the whole outline would
+	// silently point at line 0. Probe for the discriminating key instead.
+	var probe []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return nil
+	}
+	if len(probe) == 0 {
+		return nil
+	}
+	_, isFlat := probe[0]["location"]
+
+	var out []Symbol
+	if isFlat {
+		var flat []struct {
+			Name     string `json:"name"`
+			Kind     int    `json:"kind"`
+			Location struct {
+				Range Range `json:"range"`
+			} `json:"location"`
+		}
+		if err := json.Unmarshal(raw, &flat); err != nil {
+			return nil
+		}
+		for _, it := range flat {
+			if it.Name == "" {
+				continue
+			}
+			out = append(out, Symbol{Name: it.Name, Kind: it.Kind, Line: it.Location.Range.Start.Line})
+		}
+		return out
+	}
+
+	var walk func(payload json.RawMessage, depth int)
+	walk = func(payload json.RawMessage, depth int) {
+		if len(payload) == 0 || string(payload) == "null" {
+			return
+		}
+		var items []nested
+		if err := json.Unmarshal(payload, &items); err != nil {
+			return
+		}
+		for _, it := range items {
+			if it.Name == "" {
+				continue
+			}
+			line := it.SelectionRange.Start.Line
+			if line == 0 && it.Range.Start.Line != 0 {
+				line = it.Range.Start.Line
+			}
+			out = append(out, Symbol{
+				Name: it.Name, Detail: it.Detail, Kind: it.Kind, Line: line, Depth: depth,
+			})
+			walk(it.Children, depth+1)
+		}
+	}
+	walk(raw, 0)
+	return out
+}
+
+// SymbolKindName maps the spec's numeric SymbolKind to a short label. Unknown
+// kinds render blank rather than as a bare number, which would tell a reader
+// nothing.
+func SymbolKindName(kind int) string {
+	switch kind {
+	case 2:
+		return "module"
+	case 5:
+		return "class"
+	case 6:
+		return "method"
+	case 7:
+		return "prop"
+	case 8:
+		return "field"
+	case 9:
+		return "ctor"
+	case 10:
+		return "enum"
+	case 11:
+		return "iface"
+	case 12:
+		return "func"
+	case 13:
+		return "var"
+	case 14:
+		return "const"
+	case 23:
+		return "struct"
+	case 26:
+		return "type"
+	default:
+		return ""
+	}
+}
+
+// signatureText renders a signatureHelp result as one readable line: the active
+// signature, and its active parameter marked. Returns "" when the cursor is not
+// inside a call, which is the common case and must stay silent.
+func signatureText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var help struct {
+		Signatures []struct {
+			Label      string `json:"label"`
+			Parameters []struct {
+				Label json.RawMessage `json:"label"`
+			} `json:"parameters"`
+		} `json:"signatures"`
+		ActiveSignature int `json:"activeSignature"`
+		ActiveParameter int `json:"activeParameter"`
+	}
+	if err := json.Unmarshal(raw, &help); err != nil || len(help.Signatures) == 0 {
+		return ""
+	}
+	idx := help.ActiveSignature
+	if idx < 0 || idx >= len(help.Signatures) {
+		idx = 0
+	}
+	sig := help.Signatures[idx]
+	if sig.Label == "" {
+		return ""
+	}
+	if p := help.ActiveParameter; p >= 0 && p < len(sig.Parameters) {
+		// A parameter label is EITHER a string or a [start,end] offset pair into
+		// the signature label. Both are legal; assuming the string form drops the
+		// marker entirely against servers using offsets.
+		var name string
+		if err := json.Unmarshal(sig.Parameters[p].Label, &name); err == nil && name != "" {
+			return sig.Label + "   ← " + name
+		}
+		var span [2]int
+		if err := json.Unmarshal(sig.Parameters[p].Label, &span); err == nil {
+			r := []rune(sig.Label)
+			if span[0] >= 0 && span[1] <= len(r) && span[0] < span[1] {
+				return sig.Label + "   ← " + string(r[span[0]:span[1]])
+			}
+		}
+	}
+	return sig.Label
+}
+
+// codeActions unwraps a codeAction result, keeping only the actions this editor
+// can actually carry out.
+//
+// A server may answer with a Command instead of a CodeAction with edits, and
+// executing a command needs workspace/executeCommand plus whatever the server
+// does on the far side. Offering one we cannot run would be a menu entry that
+// silently does nothing, so those are dropped here rather than surfaced.
+func codeActions(raw json.RawMessage) []CodeAction {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var items []struct {
+		Title string          `json:"title"`
+		Kind  string          `json:"kind"`
+		Edit  json.RawMessage `json:"edit"`
+	}
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil
+	}
+	var out []CodeAction
+	for _, it := range items {
+		if it.Title == "" || len(it.Edit) == 0 {
+			continue
+		}
+		edits := workspaceEdits(it.Edit)
+		if len(edits) == 0 {
+			continue
+		}
+		out = append(out, CodeAction{Title: it.Title, Kind: it.Kind, Edits: edits})
+	}
+	return out
+}

@@ -240,11 +240,14 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Find file in project", shortcut: "Esc p", action: (*App).menuFindFile, enabled: (*App).hasFinder},
 			{label: "Run a command", shortcut: "Esc k", action: (*App).menuCommandPalette, enabled: alwaysTrue},
 			{label: "Complete at cursor", shortcut: "Esc space", action: (*App).menuComplete, enabled: (*App).hasFindable},
+			{label: "Go to symbol (outline)", shortcut: "Esc i", action: (*App).menuOutline, enabled: (*App).hasLSPFile},
+			{label: "Fix at cursor", shortcut: "Esc l", action: (*App).menuCodeActions, enabled: (*App).hasLSPFile},
 			{label: "Find references", shortcut: "Esc j", action: (*App).menuFindReferences, enabled: (*App).hasFileTab},
 			{label: "Rename symbol", shortcut: "Esc y", action: (*App).menuRenameSymbol, enabled: (*App).hasFileTab},
 			{label: "Toggle bookmark", shortcut: "Esc m", action: (*App).menuToggleBookmark, enabled: (*App).hasFileTab},
 			{label: "Next bookmark", shortcut: "Esc '", action: (*App).menuNextBookmark, enabled: (*App).hasBookmarks},
 			{label: "Clear bookmarks", action: (*App).menuClearBookmarks, enabled: (*App).hasBookmarks},
+			{label: "Jump to source line", shortcut: "Esc e", action: (*App).menuJumpToDiffSource, enabled: (*App).hasDiffTab},
 			{label: "Open changes (diff)", shortcut: "Esc o", action: (*App).menuOpenChanges, enabled: (*App).hasFileTab},
 			{shortcut: "Esc b", action: (*App).menuToggleInlineBlame, enabled: alwaysTrue, labelFor: (*App).inlineBlameLabel},
 			{label: "Go to line", shortcut: "Esc g", action: (*App).menuGoToLine, enabled: (*App).hasFindable},
@@ -557,6 +560,9 @@ type App struct {
 	paletteSelected int
 	paletteScroll   int
 	paletteResults  []paletteResult
+	// A non-nil override makes the palette a general picker (outline, fixes).
+	paletteOverride []paletteCommand
+	paletteTitle    string
 
 	// LSP completion popup — Esc c, explicitly invoked.
 	completionOpen     bool
@@ -947,6 +953,10 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleCompletion(e)
 	case *referencesEvent:
 		a.handleReferences(e)
+	case *symbolsEvent:
+		a.handleSymbols(e)
+	case *codeActionsEvent:
+		a.handleCodeActions(e)
 	case *renameEvent:
 		a.handleRename(e)
 	case *blameEvent:

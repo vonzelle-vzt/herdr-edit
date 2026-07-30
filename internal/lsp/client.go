@@ -147,8 +147,11 @@ func (c *Client) initialize(ctx context.Context, rootURI string) error {
 				"hover": map[string]interface{}{
 					"contentFormat": []string{"plaintext", "markdown"},
 				},
-				"definition": map[string]interface{}{},
-				"references": map[string]interface{}{},
+				"definition":     map[string]interface{}{},
+				"references":     map[string]interface{}{},
+				"documentSymbol": map[string]interface{}{"hierarchicalDocumentSymbolSupport": true},
+				"signatureHelp":  map[string]interface{}{},
+				"codeAction":     map[string]interface{}{},
 				"rename": map[string]interface{}{
 					// We apply a plain WorkspaceEdit.changes map; we do not
 					// implement prepareRename or documentChanges/versioning.
@@ -337,6 +340,47 @@ func (c *Client) Rename(ctx context.Context, uri string, pos Position, newName s
 		return nil, err
 	}
 	return workspaceEdits(raw), nil
+}
+
+// DocumentSymbol lists the symbols declared in a file.
+func (c *Client) DocumentSymbol(ctx context.Context, uri string) ([]Symbol, error) {
+	raw, err := c.call(ctx, "textDocument/documentSymbol", documentParams{
+		TextDocument: textDocumentIdentifier{URI: uri},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return symbols(raw), nil
+}
+
+// SignatureHelp describes the call the cursor is sitting inside.
+func (c *Client) SignatureHelp(ctx context.Context, uri string, pos Position) (string, error) {
+	raw, err := c.call(ctx, "textDocument/signatureHelp", positionParams{
+		TextDocument: textDocumentIdentifier{URI: uri},
+		Position:     pos,
+	})
+	if err != nil {
+		return "", err
+	}
+	return signatureText(raw), nil
+}
+
+// CodeAction lists the fixes and refactors offered at pos.
+//
+// Only the diagnostics that actually cover pos are sent as context. Servers use
+// that list to decide which quick fixes apply, so sending everything in the file
+// offers fixes for problems elsewhere, and sending none often yields an empty
+// list from servers that key their fixes off a diagnostic.
+func (c *Client) CodeAction(ctx context.Context, uri string, rng Range, diags []Diagnostic) ([]CodeAction, error) {
+	raw, err := c.call(ctx, "textDocument/codeAction", codeActionParams{
+		TextDocument: textDocumentIdentifier{URI: uri},
+		Range:        rng,
+		Context:      codeActionContext{Diagnostics: diags},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return codeActions(raw), nil
 }
 
 // call issues a request and waits for its response or the context deadline.

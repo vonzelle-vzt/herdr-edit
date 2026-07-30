@@ -80,6 +80,8 @@ embeds standalone Monaco with no LSP at all.
 | **A diff view** | `Esc o` opens the active file's diff as a real tab, and pressing it again flips the baseline between your branch's **merge-base** and **HEAD** — "what does this branch change" versus "what have I not committed", which are different questions and the first is the one you ask of an agent's work. Built as a *synthetic tab* rather than a new render mode: word wrap already taught this codebase what a second geometry path costs, so a tab whose buffer happens to hold diff text inherits scrolling, search, selection and mouse hit-testing for free, and refuses to save. |
 | **Rename and find-references** | `Esc y` renames a symbol project-wide; `Esc j` lists every use. Rename decodes **both** WorkspaceEdit wire shapes — servers send either `changes` or `documentChanges`, and handling one makes rename silently do nothing against half of them. Edits apply back-to-front per file, because changing text length at one position invalidates every position after it. |
 | **Bookmarks** | `Esc m` pins a `file:line`, `Esc '` cycles them. A 401-repo sweep of herdr's marketplace found **no plugin that bookmarks a place in the code** — the "harpoon" ports mark panes and workspaces, which is navigation between windows, not between lines. |
+| **The outline, fixes and signature help** | `Esc i` lists the file's symbols, `Esc l` offers code actions, and signature help folds into `Esc h` — it has no separate moment, since you want it while the cursor is inside a call, which is when you would reach for hover anyway. Both pickers reuse the command palette rather than adding a third list widget. Code actions that answer with a *command* rather than edits are dropped: running one needs `workspace/executeCommand`, and offering it would be a menu entry that silently does nothing. |
+| **Cursor selection on a diff** | `Esc e` on any row of a diff jumps to that line in the real file. Deleted lines map to where they were removed from. The arithmetic honours the fact that a `-` line exists only in the old file and must not advance the new-file counter — counting rows instead drifts by one per deletion, which is invisible on a small diff and wrong by dozens on a real one. |
 | **Persistent undo** | History used to die with the process. |
 | **Active-file publishing** | A debounced `{file,line,col,root}` snapshot other tools can read. |
 
@@ -122,6 +124,9 @@ primary surface, because macOS Terminal and tmux frequently swallow right-click.
 | `Esc` `b` | Toggle **inline git blame** | author and commit on the cursor's line |
 | `Esc` `o` | **Open changes** — the file's diff as a tab | press again to flip merge-base ⟷ HEAD |
 | `Esc` `j` | **Find references** | every use of the symbol, as a list you can open from |
+| `Esc` `i` | **Go to symbol** — the file's outline | nested symbols indented |
+| `Esc` `l` | **Fix at cursor** — code actions | the lightbulb, as in VS Code |
+| `Esc` `e` | **Jump to source line** from a diff | put the cursor on any diff row |
 | `Esc` `y` | **Rename symbol** | project-wide, applied across files on disk |
 | `Esc` `m` | **Toggle bookmark** on this line | |
 | `Esc` `'` | **Next bookmark** | cycles, wrapping |

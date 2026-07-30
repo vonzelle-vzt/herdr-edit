@@ -193,3 +193,38 @@ type TextEdit struct {
 	Range   Range
 	NewText string
 }
+
+// documentParams is a request scoped to a whole file.
+type documentParams struct {
+	TextDocument textDocumentIdentifier `json:"textDocument"`
+}
+
+// codeActionContext narrows which fixes a server offers.
+type codeActionContext struct {
+	Diagnostics []Diagnostic `json:"diagnostics"`
+}
+
+// codeActionParams asks what can be done about Range.
+type codeActionParams struct {
+	TextDocument textDocumentIdentifier `json:"textDocument"`
+	Range        Range                  `json:"range"`
+	Context      codeActionContext      `json:"context"`
+}
+
+// Symbol is one entry from documentSymbol, already flattened out of whatever
+// nesting the server used.
+type Symbol struct {
+	Name   string
+	Detail string
+	Kind   int
+	Line   int // zero-based, in the file the request named
+	Depth  int // nesting level, for indenting the outline
+}
+
+// CodeAction is one offered fix or refactor. Edits is nil when the server chose
+// to answer with a command instead, which this editor cannot execute.
+type CodeAction struct {
+	Title string
+	Kind  string
+	Edits map[string][]TextEdit
+}

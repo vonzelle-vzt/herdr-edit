@@ -56,6 +56,13 @@ type paletteResult struct {
 // not fire, which is more useful than an empty result list that looks like a
 // typo.
 func (a *App) paletteCommands() []paletteCommand {
+	// An override turns the palette into a general-purpose picker — the outline
+	// and the code-action list both use it. Reusing it rather than writing a
+	// third list widget keeps fuzzy matching, keyboard selection and mouse
+	// clicks defined in exactly one place.
+	if a.paletteOverride != nil {
+		return a.paletteOverride
+	}
 	items, _, _ := a.menuLayout()
 	out := make([]paletteCommand, 0, len(items))
 	for _, it := range items {
@@ -80,11 +87,30 @@ func (a *App) paletteCommands() []paletteCommand {
 	return out
 }
 
+// openPaletteWith opens the palette over an explicit command list instead of
+// the action menu, titled for whatever it is picking from.
+func (a *App) openPaletteWith(cmds []paletteCommand, title string) {
+	if len(cmds) == 0 {
+		return
+	}
+	a.closeAllModals()
+	a.paletteOpen = true
+	a.paletteOverride = cmds
+	a.paletteTitle = title
+	a.paletteQuery = nil
+	a.paletteCursor = 0
+	a.paletteSelected = 0
+	a.paletteScroll = 0
+	a.refreshPaletteResults()
+}
+
 // openCommandPalette shows the palette with an empty query. Bound to Esc k and
 // to a menu row of its own.
 func (a *App) openCommandPalette() {
 	a.closeAllModals()
 	a.paletteOpen = true
+	a.paletteOverride = nil
+	a.paletteTitle = ""
 	a.paletteQuery = nil
 	a.paletteCursor = 0
 	a.paletteSelected = 0
@@ -100,6 +126,8 @@ func (a *App) closePalette() {
 	a.paletteSelected = 0
 	a.paletteScroll = 0
 	a.paletteResults = nil
+	a.paletteOverride = nil
+	a.paletteTitle = ""
 }
 
 // menuCommandPalette is the action-menu entry point.
@@ -303,7 +331,11 @@ func (a *App) drawPalette() {
 	drawBorder(a.screen, mx, my, mw, mh, borderStyle)
 	drawHDivider(a.screen, mx, my+2, mw, borderStyle)
 
-	drawAt(a.screen, mx+1, my+1, " Run a command", titleStyle)
+	title := " Run a command"
+	if a.paletteTitle != "" {
+		title = " " + a.paletteTitle
+	}
+	drawAt(a.screen, mx+1, my+1, title, titleStyle)
 	hint := "esc "
 	drawAt(a.screen, mx+mw-1-runeLen(hint), my+1, hint, mutedStyle)
 

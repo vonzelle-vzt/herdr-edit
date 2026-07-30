@@ -86,6 +86,18 @@ func (a *App) menuHover() {
 		if err != nil {
 			text = ""
 		}
+		// Signature help is folded in here rather than given a key of its own,
+		// because it has no separate moment: you want it while the cursor is
+		// inside a call, which is exactly when you would reach for hover. The
+		// server answers empty when the cursor is not in one, so this costs
+		// nothing the rest of the time.
+		if sig, sigErr := m.SignatureHelp(ctx, path, pos); sigErr == nil && sig != "" {
+			if text == "" {
+				text = sig
+			} else {
+				text = sig + "  ·  " + text
+			}
+		}
 		a.post(&lspHoverEvent{when: time.Now(), text: text})
 	}()
 }

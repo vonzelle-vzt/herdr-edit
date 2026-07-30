@@ -268,3 +268,91 @@ func TestWorkspaceEdits_Degrades(t *testing.T) {
 		}
 	}
 }
+
+// TestSymbols_BothWireShapes pins the decode. documentSymbol allows a nested
+// DocumentSymbol[] AND a flat SymbolInformation[]; servers genuinely differ, and
+// handling one leaves the outline empty against the other — which reads as "this
+// language has no symbols" rather than as a missing branch.
+func TestSymbols_BothWireShapes(t *testing.T) {
+	nested := []byte(`[{"name":"Outer","kind":5,"selectionRange":{"start":{"line":4,"character":0},"end":{"line":4,"character":5}},
+	   "children":[{"name":"inner","kind":6,"selectionRange":{"start":{"line":7,"character":2},"end":{"line":7,"character":7}}}]}]`)
+	got := symbols(nested)
+	if len(got) != 2 {
+		t.Fatalf("nested decoded to %d symbols, want 2", len(got))
+	}
+	if got[0].Name != "Outer" || got[0].Line != 4 || got[0].Depth != 0 {
+		t.Errorf("parent = %+v", got[0])
+	}
+	if got[1].Name != "inner" || got[1].Line != 7 || got[1].Depth != 1 {
+		t.Errorf("child = %+v (depth must indent the outline)", got[1])
+	}
+
+	flat := []byte(`[{"name":"Legacy","kind":12,"location":{"range":{"start":{"line":9,"character":0},"end":{"line":9,"character":6}}}}]`)
+	got = symbols(flat)
+	if len(got) != 1 || got[0].Name != "Legacy" || got[0].Line != 9 {
+		t.Fatalf("flat decoded to %+v", got)
+	}
+}
+
+// TestSymbols_Degrades pins junk yields nothing rather than a phantom entry.
+func TestSymbols_Degrades(t *testing.T) {
+	for _, in := range []string{"", "null", "[]", "not json", `[{"name":""}]`} {
+		if got := symbols([]byte(in)); len(got) != 0 {
+			t.Errorf("symbols(%q) = %+v, want empty", in, got)
+		}
+	}
+}
+
+// TestSignatureText_BothLabelForms pins the parameter marker. A parameter label
+// is EITHER a string or a [start,end] offset pair into the signature; assuming
+// the string form silently drops the marker against servers using offsets.
+func TestSignatureText_BothLabelForms(t *testing.T) {
+	str := []byte(`{"signatures":[{"label":"func f(a int, b string)","parameters":[{"label":"a int"},{"label":"b string"}]}],"activeSignature":0,"activeParameter":1}`)
+	if got := signatureText(str); got != "func f(a int, b string)   ← b string" {
+		t.Errorf("string labels gave %q", got)
+	}
+
+	off := []byte(`{"signatures":[{"label":"func f(a int, b string)","parameters":[{"label":[7,12]},{"label":[14,22]}]}],"activeSignature":0,"activeParameter":0}`)
+	got := signatureText(off)
+	if got != "func f(a int, b string)   ← a int" {
+		t.Errorf("offset labels gave %q", got)
+	}
+}
+
+// TestSignatureText_SilentWhenNotInACall pins the common case: outside a call
+// the server answers empty and the UI must stay quiet.
+func TestSignatureText_SilentWhenNotInACall(t *testing.T) {
+	for _, in := range []string{"", "null", `{"signatures":[]}`, `{"signatures":[{"label":""}]}`} {
+		if got := signatureText([]byte(in)); got != "" {
+			t.Errorf("signatureText(%q) = %q, want empty", in, got)
+		}
+	}
+}
+
+// TestCodeActions_DropsUnrunnable is the honesty guard. A server may answer with
+// a Command rather than edits, and running one needs workspace/executeCommand
+// which this editor does not implement — offering it would be a menu entry that
+// silently does nothing.
+func TestCodeActions_DropsUnrunnable(t *testing.T) {
+	raw := []byte(`[
+	  {"title":"Has edits","kind":"quickfix","edit":{"changes":{"file:///tmp/a.go":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]}}},
+	  {"title":"Command only","kind":"quickfix","command":{"command":"do.thing"}},
+	  {"title":"Empty edit","kind":"quickfix","edit":{"changes":{}}}]`)
+	got := codeActions(raw)
+	if len(got) != 1 {
+		t.Fatalf("kept %d actions, want only the runnable one: %+v", len(got), got)
+	}
+	if got[0].Title != "Has edits" {
+		t.Errorf("kept the wrong action: %+v", got[0])
+	}
+}
+
+// TestSymbolKindName covers the mapping and its blank fallback.
+func TestSymbolKindName(t *testing.T) {
+	if SymbolKindName(12) != "func" {
+		t.Errorf("kind 12 = %q, want func", SymbolKindName(12))
+	}
+	if SymbolKindName(999) != "" {
+		t.Errorf("unknown kind should be blank, got %q", SymbolKindName(999))
+	}
+}
