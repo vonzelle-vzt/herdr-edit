@@ -51,6 +51,7 @@ func leaderBindings() []leaderBinding {
 		// these two keys are the entire wiring.
 		{'h', (*App).menuHover},
 		{'d', (*App).menuGoToDefinition},
+		{'z', (*App).menuToggleWrap},
 	}
 }
 

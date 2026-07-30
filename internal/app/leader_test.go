@@ -27,12 +27,29 @@ func TestLeaderActionFor_AllBindingsResolve(t *testing.T) {
 	}
 }
 
+// unboundLeaderRune finds a letter the leader table does not claim.
+//
+// Derived rather than hardcoded: this used to be a literal 'z', and adding word wrap on Esc z broke
+// two tests that were only ever asserting "some key is unbound". A test about the miss path should not
+// fail because the table grew.
+func unboundLeaderRune(t *testing.T) rune {
+	t.Helper()
+	for r := 'a'; r <= 'z'; r++ {
+		if leaderActionFor(r) == nil {
+			return r
+		}
+	}
+	t.Fatal("every letter is bound; this test needs a new strategy")
+	return 0
+}
+
 // TestLeaderActionFor_UnboundReturnsNil pins down the contract that
 // leaderActionFor reports a miss with nil so handleKey can distinguish
 // "leader fired" from "key was unbound — fall through".
 func TestLeaderActionFor_UnboundReturnsNil(t *testing.T) {
-	if leaderActionFor('z') != nil {
-		t.Fatal("'z' should not be a leader binding (no editor action mapped)")
+	r := unboundLeaderRune(t)
+	if leaderActionFor(r) != nil {
+		t.Fatalf("%q should not be a leader binding", r)
 	}
 }
 
@@ -144,11 +161,12 @@ func TestHandleKey_LeaderUnboundFallsThrough(t *testing.T) {
 	a := newTestApp(t, dir)
 	a.openFile(target)
 
+	r := unboundLeaderRune(t)
 	a.handleKey(keyEv(tcell.KeyEsc, 0))
-	a.handleKey(keyEv(tcell.KeyRune, 'z'))
+	a.handleKey(keyEv(tcell.KeyRune, r))
 
-	if got := a.activeTabPtr().Buffer.Lines[0]; got != "z" {
-		t.Fatalf("unbound key after Esc should reach the editor, got %q", got)
+	if got, want := a.activeTabPtr().Buffer.Lines[0], string(r); got != want {
+		t.Fatalf("unbound key after Esc should reach the editor, got %q want %q", got, want)
 	}
 }
 

@@ -135,3 +135,50 @@ func TestLSPLeaderBindings(t *testing.T) {
 		}
 	}
 }
+
+// TestToggleWrapFlipsTheActiveTab pins the toggle and, importantly, that it re-anchors the viewport:
+// flipping the mode changes how many rows a line occupies, so a cursor that was on screen can fall off
+// it the instant wrap turns on unless cursorMoved forces EnsureVisible.
+func TestToggleWrapFlipsTheActiveTab(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "x.go")
+	if err := os.WriteFile(path, []byte(strings.Repeat("word ", 100)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestApp(t, root)
+	a.openFile(path)
+	tab := a.activeTabPtr()
+	if tab == nil {
+		t.Fatal("no tab")
+	}
+	if tab.Wrap {
+		t.Fatal("wrap should default to off, like VS Code")
+	}
+
+	a.menuToggleWrap()
+	if !tab.Wrap {
+		t.Fatal("toggle did not enable wrap")
+	}
+	if !strings.Contains(a.statusMsg, "Word wrap: on") {
+		t.Fatalf("status: %q", a.statusMsg)
+	}
+
+	a.menuToggleWrap()
+	if tab.Wrap {
+		t.Fatal("toggle did not disable wrap")
+	}
+
+	// Reachable, which is the point.
+	if leaderActionFor('z') == nil {
+		t.Fatal("Esc z is not bound")
+	}
+}
+
+// TestToggleWrapWithNoTab — the leader key is live at all times, so it must degrade rather than panic.
+func TestToggleWrapWithNoTab(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	a.menuToggleWrap()
+	if !strings.Contains(a.statusMsg, "No file open") {
+		t.Fatalf("status: %q", a.statusMsg)
+	}
+}

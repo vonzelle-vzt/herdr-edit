@@ -258,6 +258,34 @@ what is on screen exactly what a drag can reproduce, by construction.
 The `sidebarShown` preference is never cleared by the auto-hide, so widening
 brings the tree straight back with no keypress.
 
+### Word wrap is a SEPARATE geometry path (fork)
+`Esc z` toggles `Tab.Wrap`, per tab, default off like VS Code. Everything wrapped
+lives in `internal/editor/wrap.go` behind that flag, and that isolation is
+deliberate: `Render`, `HitTest`, `EnsureVisible`, `clampScroll` and 21 uses of
+`ScrollX` all assume **one buffer line == one screen row**. With `Wrap` false not
+one line of that original arithmetic runs differently. A cursor that lands on the
+wrong character is the worst bug an editor can have, so the new coordinate system
+is quarantined rather than threaded through the old one.
+
+- `lineSegments` splits a line into rows, breaking at the last space before the
+  limit so words stay whole. A token longer than a row (URL, base64, minified
+  line) has no break point and is cut hard. It must **never** emit a zero-width
+  segment — that is an infinite loop, not a rendering glitch, and
+  `TestWrapNeverLoops` guards it at widths 1–3.
+- 🔴 `ScrollSub` counts how many of `ScrollY`'s wrapped rows are above the
+  viewport. Without it a single minified line longer than the screen is
+  unscrollable: you see its first screenful and cannot reach the rest.
+- `segmentOfCol` / `colAtSegmentVisual` are inverses, and
+  `TestWrapColumnRoundTrip` sweeps every column of every line at four widths to
+  prove it. That round trip is what makes clicks land on the right character.
+- Tab stops are measured from the start of each ROW, not the buffer line —
+  anchoring to the line would put stops at screen positions that do not exist.
+- Continuation rows draw `↪` instead of repeating the line number, which would
+  read as several separate lines sharing one number.
+- `renderWrapped` is a sibling of `Render`, not a set of branches inside it: the
+  two differ in their innermost loop (offset by `ScrollX` vs divide into rows),
+  and the unwrapped one is the path that must not regress.
+
 ### Polled call sites, not scattered hooks (fork)
 `publishActive()` and `maybeSyncLSP()` are each called from ONE place in
 the Run loop. The cursor moves and the buffer mutates from dozens of sites;

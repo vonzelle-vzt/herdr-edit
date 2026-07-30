@@ -53,6 +53,7 @@ embeds standalone Monaco with no LSP at all.
 | **Find and *replace*** | Upstream find is case-insensitive substring **jump only** — there was no replace at all. Adds regex, whole-word, case-sensitive, replace, and replace-all **as one undo step**. |
 | **Auto-closing brackets and quotes** | Pairs close, closers step over, backspace removes both, and a selection gets *surrounded*. Quotes are suppressed after a word character so `don't` never becomes `don''t`. |
 | **A start page** | With no tab open, the pane showed two lines of grey text. It now shows the project, branch, and changed files — each clickable. |
+| **Word wrap** | Upstream has none. `Esc z` reflows long lines to the pane width, breaking on word boundaries, and re-wraps whenever the pane resizes. Off by default, per tab, like VS Code. |
 | **A layout that degrades instead of refusing** | Below 50×24 upstream shows *"Window too small — please resize"*. Since the tree is a fixed 30 columns, a side panel was only usable in a narrow band. The tree now **auto-fits**: it grows to show full folder names and narrows toward 18 columns as the pane tightens, hiding only below 42 — a 60-column panel beside an agent still shows files. A splitter drag pins it. Floors drop to **24×8**. |
 | **Persistent undo** | History used to die with the process. |
 | **Active-file publishing** | A debounced `{file,line,col,root}` snapshot other tools can read. |

@@ -95,7 +95,17 @@ type Tab struct {
 	Cursor     Position // Where new typed text appears.
 	Anchor     Position // Selection anchor; equals Cursor when nothing is selected.
 	ScrollY    int      // Index of the first visible line.
-	ScrollX    int      // Index of the first visible column (rune-indexed).
+	ScrollX    int      // Index of the first visible column (rune-indexed). Always 0 when Wrap.
+
+	// Wrap reflows long lines onto extra screen rows instead of letting them run off to the right.
+	// Off by default, matching VS Code, and it gates an entirely separate geometry path (wrap.go) --
+	// with Wrap false none of the original one-line-per-row arithmetic changes at all.
+	Wrap bool
+
+	// ScrollSub is how many of ScrollY's wrapped rows are scrolled off the top. Only meaningful when
+	// Wrap is set. Without it a single line longer than the viewport could not be scrolled through:
+	// you would see its first screenful and have no way to reach the rest.
+	ScrollSub int
 	Dirty      bool
 	Styles     [][]tcell.Style
 	StyleStale bool
@@ -109,6 +119,10 @@ type Tab struct {
 	// number and only carries the visible rows.
 	lastHighlightScrollY int
 	lastHighlightHeight  int
+
+	// lastWrapContentW is the content width Render last drew at. Scroll and the app's wheel handler
+	// have no rect, and wrapped scrolling needs one to know how many rows a line occupies.
+	lastWrapContentW int
 
 	// Mtime is the file's modification time as of the last successful
 	// read or write. The app's periodic disk-reconcile loop compares it
@@ -724,6 +738,10 @@ func (t *Tab) EnsureVisible(viewW, viewH int) {
 	if contentW < 1 {
 		contentW = 1
 	}
+	if t.Wrap {
+		t.wrapEnsureVisible(contentW, viewH)
+		return
+	}
 	if t.Cursor.Line < t.ScrollY {
 		t.ScrollY = t.Cursor.Line
 	}
@@ -750,6 +768,10 @@ func (t *Tab) EnsureVisible(viewW, viewH int) {
 func (t *Tab) Render(scr tcell.Screen, th theme.Theme, x, y, w, h int) {
 	if t.IsImage() {
 		t.renderImage(scr, th, x, y, w, h)
+		return
+	}
+	if t.Wrap {
+		t.renderWrapped(scr, th, x, y, w, h)
 		return
 	}
 	// Only re-center on the cursor if the cursor moved this tick. Doing it
@@ -945,6 +967,21 @@ func (t *Tab) HitTest(localX, localY, w, h int) (Position, bool) {
 		return Position{}, false
 	}
 	contentX := gutterWidthFor(t.Buffer.LineCount()) + 1
+	if t.Wrap {
+		contentW := w - contentX
+		if contentW < 1 {
+			contentW = 1
+		}
+		lineIdx, segIdx, ok := t.wrapRowAt(localY, contentW)
+		if !ok {
+			return Position{}, false
+		}
+		if localX < contentX {
+			return Position{Line: lineIdx, Col: t.lineSegments(lineIdx, contentW)[segIdx].Start}, true
+		}
+		col := t.colAtSegmentVisual(lineIdx, segIdx, localX-contentX, contentW)
+		return Position{Line: lineIdx, Col: col}, true
+	}
 	line := t.ScrollY + localY
 	if line < 0 || line >= t.Buffer.LineCount() {
 		return Position{}, false
@@ -973,6 +1010,12 @@ func (t *Tab) HitTest(localX, localY, w, h int) (Position, bool) {
 // clampScroll afterwards so the user never scrolls into pure void; here we
 // just adjust the raw value.
 func (t *Tab) Scroll(deltaLines int) {
+	if t.Wrap {
+		// contentW is not known here, so use the last width Render saw. A wheel notch should travel
+		// the same visual distance whether the lines under it wrap or not.
+		t.wrapScroll(deltaLines, t.lastWrapContentW)
+		return
+	}
 	t.ScrollY += deltaLines
 	if t.ScrollY < 0 {
 		t.ScrollY = 0
@@ -998,6 +1041,14 @@ func (t *Tab) ScrollH(deltaCols int) {
 // the viewport — which feels much better than abruptly stopping when the
 // last line hits the bottom row.
 func (t *Tab) clampScroll(viewH int) {
+	if t.Wrap {
+		// contentW is unknown here; callers that need the wrapped clamp use wrapClampScroll directly
+		// from Render, where the rect is known. Just keep the raw value sane.
+		if t.ScrollY < 0 {
+			t.ScrollY = 0
+		}
+		return
+	}
 	if t.ScrollY < 0 {
 		t.ScrollY = 0
 	}

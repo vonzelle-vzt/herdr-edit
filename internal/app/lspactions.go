@@ -169,3 +169,28 @@ func (a *App) handleLSPJump(e *lspJumpEvent) {
 	col := lsp.UTF16ToRuneCol(tab.LineText(target.Line), target.Character)
 	tab.MoveCursorTo(editor.Position{Line: target.Line, Col: col}, false)
 }
+
+// menuToggleWrap flips word wrap for the active tab. Bound to Esc z, mirroring the alt+Z most editors
+// use for this, and per-tab rather than global because whether you want wrap depends on the file:
+// prose and JSON yes, a wide table or aligned columns no.
+//
+// Wrap changes the geometry, not the content, but StyleStale is set anyway: the highlighter caches per
+// viewport, and cursorMoved forces the scroll anchor to be recomputed for the new row layout so the
+// cursor does not end up off screen the instant the mode flips.
+func (a *App) menuToggleWrap() {
+	a.closeMenu()
+	tab := a.activeTabPtr()
+	if tab == nil {
+		a.flash("No file open")
+		return
+	}
+	tab.Wrap = !tab.Wrap
+	tab.ScrollSub = 0
+	tab.StyleStale = true
+	tab.MoveCursorTo(tab.Cursor, false) // sets cursorMoved, so the viewport re-anchors
+	if tab.Wrap {
+		a.flash("Word wrap: on")
+	} else {
+		a.flash("Word wrap: off")
+	}
+}
