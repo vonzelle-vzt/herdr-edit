@@ -31,10 +31,16 @@ features, make sure they're reachable from the main menu first.
 
 ## Module / repo
 
-- Module: `github.com/cloudmanic/spice-edit`
-- Binary name: `spiceedit` (one word, lowercase — Makefile, goreleaser,
-  brew formula all assume this)
-- Brew tap: this same repo, `Formula/` directory (no separate tap repo)
+- Module: `github.com/cloudmanic/spice-edit` (import path kept from upstream to keep
+  merges clean; the REPO is github.com/vonzelle-vzt/herdr-edit)
+- Binary name: `herdr-edit` (Makefile, goreleaser and the brew formula all
+  assume this). Deliberately NOT `spiceedit`, so this can sit alongside an
+  upstream install without either shadowing the other.
+- Brew tap: this same repo, `Formula/` directory (no separate tap repo).
+  🔴 The goreleaser `brews.repository` MUST point at vonzelle-vzt/herdr-edit.
+  Inherited from upstream it pointed at cloudmanic/spice-edit, so the first
+  release here tried to commit a formula into someone else's repository; only
+  a GitHub 403 stopped it.
 
 ## Architecture map
 
@@ -171,7 +177,7 @@ Pushes to `main` trigger `.github/workflows/release.yml`:
    auto-bumped, committed back to main with `[skip ci]`, and pushed.
 3. Tags `v<x.y.z>`.
 4. GoReleaser cross-compiles, attaches archives to a GitHub Release,
-   and writes `Formula/spice-edit.rb` back into this repo (using the
+   and writes `Formula/herdr-edit.rb` back into THIS fork (using the
    default `GITHUB_TOKEN` — no PAT). The formula commit also carries
    `[skip ci]` to break the loop.
 

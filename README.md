@@ -543,7 +543,7 @@ Releases are fully automated. Every push to `main`:
 3. Tags `v<x.y.z>` and pushes the tag.
 4. [GoReleaser](https://goreleaser.com/) cross-compiles for
    linux/darwin/windows × amd64/arm64, attaches archives to a GitHub
-   Release, and pushes an updated formula into `Formula/spice-edit.rb`
+   Release, and pushes an updated formula into `Formula/herdr-edit.rb`
    on this same repo.
 
 No PAT, no separate tap repo — the default workflow `GITHUB_TOKEN` is

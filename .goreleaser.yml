@@ -71,16 +71,19 @@ changelog:
 # no separate tap repo. The [skip ci] marker on the formula-update commit
 # stops the new push from triggering a second release run.
 brews:
-  - name: spice-edit
+  - name: herdr-edit
     repository:
-      owner: cloudmanic
-      name: spice-edit
+      # MUST be this fork, not upstream. Inherited from cloudmanic/spice-edit, this pointed at
+      # THEIR repo, so the first release here tried to commit a formula into someone else's
+      # project. GitHub refused it with a 403, which is the only reason it was harmless.
+      owner: vonzelle-vzt
+      name: herdr-edit
       branch: main
       token: "{{ .Env.GITHUB_TOKEN }}"
     directory: Formula
     commit_msg_template: "Update {{ .ProjectName }} brew formula to {{ .Tag }} [skip ci]"
-    homepage: "https://github.com/cloudmanic/spice-edit"
-    description: "SpiceEdit — opinionated mouse-first terminal code editor."
+    homepage: "https://github.com/vonzelle-vzt/herdr-edit"
+    description: "herdr-edit — mouse-first terminal code editor with LSP diagnostics, for herdr."
     license: "MIT"
     commit_author:
       name: github-actions[bot]

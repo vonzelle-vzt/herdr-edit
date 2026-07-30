@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-SpiceEdit is a Go terminal editor module at `github.com/cloudmanic/spice-edit`; the CLI entry point is `main.go` and the binary is `spiceedit`. Core packages live under `internal/`: `app` owns the event loop and rendering, `editor` owns buffers/tabs/editing behavior, `filetree` manages the sidebar tree, and supporting packages cover clipboard, formatting, icons, config, theme, finder, and versioning. Tests sit beside source files as `*_test.go`. Website assets and docs live in `website/` as a Hugo + Tailwind site. Release packaging includes `Formula/spice-edit.rb`, `install.sh`, and samples under `samples/`.
+SpiceEdit is a Go terminal editor module at `github.com/cloudmanic/spice-edit`; the CLI entry point is `main.go` and the binary is `herdr-edit`. Core packages live under `internal/`: `app` owns the event loop and rendering, `editor` owns buffers/tabs/editing behavior, `filetree` manages the sidebar tree, and supporting packages cover clipboard, formatting, icons, config, theme, finder, and versioning. Tests sit beside source files as `*_test.go`. Release packaging includes `install.sh` and samples under `samples/`. (Upstream's `website/` Hugo site and `Formula/spice-edit.rb` were removed in this fork — they belong to cloudmanic/spice-edit.)
 
 ## Build, Test, and Development Commands
 
@@ -29,4 +29,4 @@ Recent commits use concise, imperative summaries, often with PR numbers, such as
 
 ## Security & Configuration Tips
 
-Format-on-save commands are project config and require trust prompts; do not bypass that flow. Keep generated artifacts (`bin/`, `coverage.out`, `coverage.html`, `website/public/`, built CSS) out of normal feature commits unless the release or website workflow explicitly requires them.
+Format-on-save commands are project config and require trust prompts; do not bypass that flow. Keep generated artifacts (`bin/`, `coverage.out`, `coverage.html`, built CSS) out of normal feature commits unless the release workflow explicitly requires them.
