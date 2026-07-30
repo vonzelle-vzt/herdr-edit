@@ -71,7 +71,16 @@ const (
 	// pane is 60-odd columns because the agent needs the rest. That rendered a hamburger and the
 	// words "click open from the tree" with no tree in sight. The tree now gives up columns down to
 	// minSidebarWidth before it gives up existing.
-	treeNeeds      = minSidebarWidth + minWidth
+	treeNeeds = minSidebarWidth + minWidth
+
+	// maxAutoSidebarNum/Den bound the AUTO-FIT width as a fraction of the pane (2/5). Auto-fit asks
+	// the tree how many columns its longest row needs, and on a deep tree with long names that
+	// answer can exceed the whole pane -- fitting it literally would leave no editor. A dragged
+	// width is not subject to this: it is an explicit choice, and maxSidebarWidth already stops it
+	// starving the editor.
+	maxAutoSidebarNum = 2
+	maxAutoSidebarDen = 5
+
 	statusFlashFor = 3 * time.Second
 	doubleClickMs  = 500 * time.Millisecond
 	doubleEscMs    = 500 * time.Millisecond
@@ -378,6 +387,12 @@ type App struct {
 	// + 1-cell splitter on its right edge), in screen cells. The user can
 	// drag the splitter to change it within [minSidebarWidth, width-minEditorAfterDrag].
 	sidebarWidth int
+
+	// sidebarUserSized records that the user has dragged the splitter, which switches the sidebar
+	// from auto-fit to the explicit width they chose. VS Code behaves the same way: it never
+	// second-guesses a sash you dragged. Without this flag the auto-fit would silently undo every
+	// drag on the next expand/collapse, which reads as the splitter not working at all.
+	sidebarUserSized bool
 
 	clipBuf      string
 	statusMsg    string
@@ -961,10 +976,40 @@ func (a *App) sidebarW() int {
 		return 0
 	}
 	w := a.sidebarWidth
+	if !a.sidebarUserSized {
+		w = a.autoSidebarWidth()
+	}
 	if max := a.maxSidebarWidth(); w > max {
 		w = max
 	}
+	if w < minSidebarWidth {
+		w = minSidebarWidth
+	}
 	return w
+}
+
+// autoSidebarWidth is the width the file tree wants in order to show its names in full: the tree
+// reports what its longest expanded row needs, and we bound that by a fraction of the pane so a
+// deeply nested project cannot push the editor out.
+//
+// This is what makes the sidebar grow as well as shrink. It only ever narrowed before -- clamped
+// down from a fixed 30-column preference -- so a 145-column pane still clipped ".pending-shots/"
+// with 80 columns going spare, and widening the pane changed nothing on the left. The +1 is the
+// splitter column, which sidebarRect subtracts back off before drawing.
+//
+// Never returns less than defaultSidebarWidth, so a project with only short names keeps a normal
+// sidebar rather than collapsing to a sliver.
+func (a *App) autoSidebarWidth() int {
+	want := defaultSidebarWidth
+	if a.tree != nil {
+		if n := a.tree.NaturalWidth() + 1; n > want {
+			want = n
+		}
+	}
+	if cap := a.width * maxAutoSidebarNum / maxAutoSidebarDen; want > cap {
+		want = cap
+	}
+	return want
 }
 
 // maxSidebarWidth is the widest the file-explorer block may be at the current pane width: the
@@ -1030,6 +1075,8 @@ func (a *App) splitterX() int {
 // The upper bound comes from maxSidebarWidth, the same helper the auto-narrow uses, so a drag can
 // always reproduce exactly what is on screen.
 func (a *App) resizeSidebar(target int) {
+	// A drag is an explicit choice, so it pins the width and turns auto-fit off for good.
+	a.sidebarUserSized = true
 	if target < minSidebarWidth {
 		target = minSidebarWidth
 	}

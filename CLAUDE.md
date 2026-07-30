@@ -199,8 +199,28 @@ let the editor shrink below that.
 only usable in a narrow band — one column narrower and the whole editor was
 replaced by "Window too small".
 
-The tree **narrows before it hides**. Two helpers own this and nothing else may
-duplicate their arithmetic:
+The tree **fits its content, and narrows before it hides**. Three helpers own
+this and nothing else may duplicate their arithmetic:
+
+- `autoSidebarWidth()` — what the tree *wants*: `Tree.NaturalWidth()+1` (the +1
+  is the splitter column), floored at `defaultSidebarWidth` so a short-named
+  project still looks normal, and capped at `maxAutoSidebarNum/Den` (2/5) of the
+  pane so a deep tree with long names cannot push the editor out. This is what
+  makes the sidebar **grow** as well as shrink — it previously only ever clamped
+  down from a fixed 30, so a 145-column pane still clipped `.pending-shots/`
+  with 80 columns going spare.
+
+  `Tree.NaturalWidth()` counts only **expanded** rows, which is what keeps it
+  stable: independent of scroll position, so scrolling never resizes the
+  sidebar. It shares `rowParts()` with `drawNodeRow` on purpose — the fit has to
+  agree with what is painted, and a second copy of the indent/chevron arithmetic
+  would drift the first time a glyph changed.
+
+- 🔴 `sidebarUserSized` — set by `resizeSidebar`, i.e. by a splitter drag, and it
+  turns auto-fit **off permanently** for that session. VS Code never
+  second-guesses a sash you dragged. Without this the auto-fit would silently
+  undo every drag on the next expand/collapse or resize, which reads as the
+  splitter being broken.
 
 - `maxSidebarWidth()` — the widest the explorer block may be right now: the
   editor keeps `minEditorAfterDrag` (40) whenever there is room, otherwise the

@@ -324,9 +324,65 @@ func (t *Tree) changeKind(n *Node) GitChangeKind {
 // styling. That's the visual cue you find in nvim-tree and friends:
 // a quick eye-scan picks out Go from Ruby from Markdown without
 // reading any text.
+// rowParts builds the two text chunks of a tree row: the left chunk (leading space, indent,
+// chevron) and the right chunk (name, with a trailing slash for directories).
+//
+// Shared by drawNodeRow and NaturalWidth on purpose. The auto-fit width has to agree with what is
+// actually painted to the column, and the only way to guarantee that is for both to build the same
+// strings — a second copy of the indent-and-chevron arithmetic would drift the first time a glyph
+// or a space changed.
+func rowParts(item flatNode) (prefix, suffix string) {
+	indent := strings.Repeat("  ", item.Depth)
+	if item.Node.IsDir {
+		chev := "▸"
+		if item.Node.Expanded {
+			chev = "▾"
+		}
+		return " " + indent + chev + " ", item.Node.Name + "/"
+	}
+	return " " + indent + "  ", item.Node.Name
+}
+
+// NaturalWidth reports how many columns the tree needs to draw every currently-expanded row, and
+// both header rows, without clipping any name. Callers clamp it — this is the content requirement,
+// not a recommendation, and a deep tree with long names can ask for more than the pane has.
+//
+// Counts only EXPANDED rows, which is what makes the result stable: it is independent of scroll
+// position, so scrolling never changes the width, and it only moves when you expand or collapse a
+// folder or the tree refreshes. Fitting the currently-scrolled-into-view rows instead would make
+// the sidebar twitch as you scrolled, which is far worse than a clipped name.
+func (t *Tree) NaturalWidth() int {
+	if t == nil || t.Root == nil {
+		return 0
+	}
+
+	// The two header rows: " EXPLORER" and the project name.
+	need := len([]rune(" EXPLORER"))
+	if n := len([]rune(" " + t.Root.Name)); n > need {
+		need = n
+	}
+
+	flat := make([]flatNode, 0, 128)
+	for _, c := range t.Root.Children {
+		flattenInto(c, 0, &flat)
+	}
+	for _, item := range flat {
+		prefix, suffix := rowParts(item)
+		w := len([]rune(prefix)) + len([]rune(suffix))
+		if t.IconsEnabled {
+			// drawNodeRow paints prefix, then the glyph, then two spaces and the name.
+			glyph := icons.For(item.Node.Name, item.Node.IsDir, item.Node.Expanded)
+			w += len([]rune(glyph)) + 2
+		}
+		if w > need {
+			need = w
+		}
+	}
+	return need
+}
+
 func drawNodeRow(scr tcell.Screen, th theme.Theme, x, y, w int, item flatNode, active bool, change GitChangeKind, withIcons bool) {
 	bg := th.SidebarBG
-	indent := strings.Repeat("  ", item.Depth)
 
 	// Compute the row-level foreground via this priority cascade
 	// (highest wins last):
@@ -360,21 +416,7 @@ func drawNodeRow(scr tcell.Screen, th theme.Theme, x, y, w int, item flatNode, a
 		rowStyle = rowStyle.Bold(true)
 	}
 
-	// Build the left chunk (indent + chevron + space) and right chunk
-	// (name, with a trailing slash for dirs). Both render in rowStyle;
-	// only the glyph between them gets its own colour.
-	var prefix, suffix string
-	if item.Node.IsDir {
-		chev := "▸"
-		if item.Node.Expanded {
-			chev = "▾"
-		}
-		prefix = " " + indent + chev + " "
-		suffix = item.Node.Name + "/"
-	} else {
-		prefix = " " + indent + "  "
-		suffix = item.Node.Name
-	}
+	prefix, suffix := rowParts(item)
 
 	if !withIcons {
 		drawString(scr, x, y, w, prefix+suffix, rowStyle)

@@ -2520,3 +2520,109 @@ func TestDrawTabBar_NoIconWhenDisabled(t *testing.T) {
 		}
 	}
 }
+
+// newTestAppWithLongNames builds an app whose tree has a name too long for the old fixed 30-column
+// sidebar, which is the whole point: auto-fit is invisible on a project with short names.
+func newTestAppWithLongNames(t *testing.T) *App {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a-directory-with-a-really-long-name"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return newTestApp(t, root)
+}
+
+// TestAutoSidebarGrowsToFitNames is the reported bug: the sidebar only ever narrowed, clamped down
+// from a fixed 30-column preference, so a 145-column pane still clipped ".pending-shots/" with 80
+// columns going spare and widening the pane changed nothing on the left.
+func TestAutoSidebarGrowsToFitNames(t *testing.T) {
+	a := newTestAppWithLongNames(t)
+	a.width = 145
+
+	need := a.tree.NaturalWidth() + 1 // +1 splitter column
+	if need <= defaultSidebarWidth {
+		t.Fatalf("fixture is not wide enough to exercise auto-fit: need=%d", need)
+	}
+	if got := a.sidebarW(); got != need {
+		t.Fatalf("roomy pane should fit the names: got %d, want %d", got, need)
+	}
+
+	// The names fit, which is the user-visible claim.
+	if got, editor := a.sidebarW(), 145-a.sidebarW(); editor < minWidth {
+		t.Fatalf("fitting the names starved the editor: sidebar %d, editor %d", got, editor)
+	}
+}
+
+// TestAutoSidebarNeverBelowDefault keeps a short-named project looking normal: auto-fit must not
+// collapse the sidebar to a sliver just because every name is short.
+func TestAutoSidebarNeverBelowDefault(t *testing.T) {
+	a := newTestApp(t, t.TempDir()) // empty project, nothing but the header rows
+	a.width = 145
+	if got := a.sidebarW(); got != defaultSidebarWidth {
+		t.Fatalf("short-named project: got %d, want the %d default", got, defaultSidebarWidth)
+	}
+}
+
+// TestAutoSidebarCapped bounds the fit. NaturalWidth is a content requirement, not a
+// recommendation, and a deep tree with long names can ask for more columns than the pane has.
+func TestAutoSidebarCapped(t *testing.T) {
+	a := newTestAppWithLongNames(t)
+	for w := treeNeeds; w <= 200; w++ {
+		a.width = w
+		sw := a.sidebarW()
+		if cap := w * maxAutoSidebarNum / maxAutoSidebarDen; sw > cap && sw > minSidebarWidth {
+			t.Fatalf("width %d: sidebar %d exceeds the %d/%d cap of %d",
+				w, sw, maxAutoSidebarNum, maxAutoSidebarDen, cap)
+		}
+		if editor := w - sw; editor < minWidth {
+			t.Fatalf("width %d: sidebar %d leaves the editor %d, under minWidth %d",
+				w, sw, editor, minWidth)
+		}
+	}
+}
+
+// TestAutoSidebarTracksThePaneBothWays is the behaviour asked for: it widens as well as narrows.
+func TestAutoSidebarTracksThePaneBothWays(t *testing.T) {
+	a := newTestAppWithLongNames(t)
+	a.width = 60
+	narrow := a.sidebarW()
+	a.width = 200
+	wide := a.sidebarW()
+	if wide <= narrow {
+		t.Fatalf("widening the pane must widen the sidebar: %d at 60 cols, %d at 200", narrow, wide)
+	}
+	a.width = 60
+	if back := a.sidebarW(); back != narrow {
+		t.Fatalf("narrowing again should return to %d, got %d", narrow, back)
+	}
+}
+
+// TestDraggingPinsTheSidebar is why sidebarUserSized exists. Without it the auto-fit would silently
+// undo every splitter drag on the next expand or resize, which reads as the splitter not working.
+func TestDraggingPinsTheSidebar(t *testing.T) {
+	a := newTestAppWithLongNames(t)
+	a.width = 145
+	auto := a.sidebarW()
+
+	a.resizeSidebar(24)
+	if !a.sidebarUserSized {
+		t.Fatal("a drag must mark the sidebar as user-sized")
+	}
+	if got := a.sidebarW(); got != 24 {
+		t.Fatalf("after dragging to 24: got %d", got)
+	}
+	if auto == 24 {
+		t.Fatal("fixture is useless: the dragged width equals the auto width")
+	}
+
+	// And it stays pinned across a resize, rather than snapping back to the fit.
+	a.width = 200
+	if got := a.sidebarW(); got != 24 {
+		t.Fatalf("a dragged width must survive a pane resize: got %d", got)
+	}
+	// Still bounded, though: a pinned width cannot starve the editor on a tight pane.
+	a.width = treeNeeds
+	if editor := a.width - a.sidebarW(); editor < minWidth {
+		t.Fatalf("pinned width starved the editor: sidebar %d, editor %d", a.sidebarW(), editor)
+	}
+}

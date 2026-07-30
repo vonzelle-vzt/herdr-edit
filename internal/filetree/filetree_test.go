@@ -1188,3 +1188,80 @@ func TestFlatIndexOf_MatchesRenderOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestNaturalWidthFitsTheLongestRow pins the number the sidebar auto-fit depends on. It has to be
+// the width drawNodeRow would actually need, so the assertions are built from the same rowParts the
+// renderer uses rather than from a hand-copied guess at the indent and chevron arithmetic.
+func TestNaturalWidthFitsTheLongestRow(t *testing.T) {
+	root := t.TempDir()
+	long := "a-very-long-directory-name-here"
+	if err := os.MkdirAll(filepath.Join(root, long), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "x.go"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The longest row is the long directory. Build its expected width the way the renderer does.
+	var want int
+	for _, c := range tr.Root.Children {
+		prefix, suffix := rowParts(flatNode{Node: c, Depth: 0})
+		if n := len([]rune(prefix)) + len([]rune(suffix)); n > want {
+			want = n
+		}
+	}
+	if got := tr.NaturalWidth(); got != want {
+		t.Fatalf("icons off: got %d, want %d", got, want)
+	}
+	if want <= len([]rune(long)) {
+		t.Fatalf("expected the long name to dominate, want=%d name=%d", want, len([]rune(long)))
+	}
+
+	// Icons add a glyph plus its two-space gap to every row, so the requirement grows with them on.
+	tr.IconsEnabled = true
+	withIcons := tr.NaturalWidth()
+	if withIcons <= want {
+		t.Fatalf("icons on should need more room: %d vs %d", withIcons, want)
+	}
+
+	// Collapsed children must not count: the width may only reflect rows that are actually drawn.
+	tr.IconsEnabled = false
+	deep := filepath.Join(root, long, "an-even-longer-nested-directory-name")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tr.Refresh()
+	if got := tr.NaturalWidth(); got != want {
+		t.Fatalf("collapsed child leaked into the width: got %d, want %d", got, want)
+	}
+
+	// Expanding it must then be reflected, since that row is now on screen.
+	for _, c := range tr.Root.Children {
+		if c.Name == long {
+			tr.Toggle(c)
+		}
+	}
+	if got := tr.NaturalWidth(); got <= want {
+		t.Fatalf("expanding a deeper long name should widen the requirement: got %d, want > %d", got, want)
+	}
+}
+
+// TestNaturalWidthEmptyAndNil covers the degenerate cases the sidebar calls this with on startup.
+func TestNaturalWidthEmptyAndNil(t *testing.T) {
+	var nilTree *Tree
+	if got := nilTree.NaturalWidth(); got != 0 {
+		t.Fatalf("nil tree: got %d, want 0", got)
+	}
+	tr, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An empty project still has to leave room for the two header rows.
+	if got := tr.NaturalWidth(); got < len([]rune(" EXPLORER")) {
+		t.Fatalf("empty project: got %d, want at least the header width", got)
+	}
+}
