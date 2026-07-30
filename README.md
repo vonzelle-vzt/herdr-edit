@@ -17,18 +17,26 @@
 > A mouse-first terminal code editor **with real language intelligence** — inline diagnostics,
 > hover, and go-to-definition — built to sit beside an AI agent in a [herdr](https://herdr.dev) pane.
 
-A fork of [**cloudmanic/spice-edit**](https://github.com/cloudmanic/spice-edit) by
-[Spicer Matthews](https://github.com/cloudmanic), which is where the credit for this belongs.
-SpiceEdit is a genuinely good editor; this fork exists because a handful of the things it
-deliberately leaves out are the same handful a VS Code user notices on day one.
+Built on [**cloudmanic/spice-edit**](https://github.com/cloudmanic/spice-edit) by
+[Spicer Matthews](https://github.com/cloudmanic) — a genuinely good editor, and the foundation this
+stands on. That base gives us the buffer, the renderer, the mouse UI and the event loop; the fork adds
+the language intelligence and the responsive layout on top. See
+[What's new in this fork](#whats-new-in-this-fork) for exactly which parts are which.
 
-It pairs with [**herdr-extensions**](https://github.com/vonzelle-vzt/herdr-extensions), which
-installs it, wires up the panels around it, and keeps them out of herdr's own keybindings.
+This is the editor half of a two-part stack. The other half is
+[**herdr-extensions**](https://github.com/vonzelle-vzt/herdr-extensions) — original work, no upstream —
+which turns a herdr session into an IDE: eleven panels, the layout, the keybindings, a live app
+preview, screenshot paste, and the installer that puts this editor in place.
 
 ```
-herdr-extensions   the installer, the panels, the skin
-herdr-edit         the editor those panels drive     ← you are here
+herdr-extensions   the IDE: panels, layout, install    (100% original)
+herdr-edit         the editor those panels drive       ← you are here
+                   ├─ internal/lsp     language intelligence   (new here)
+                   └─ core editor      buffer, render, mouse    (from spice-edit)
 ```
+
+Either can be used without the other: the extension falls back to upstream `spiceedit`, and this
+editor runs standalone on any terminal.
 
 ---
 
@@ -78,6 +86,40 @@ The decisions that make SpiceEdit what it is are untouched, on purpose:
 - **No new third-party dependencies.** The LSP client is stdlib-only for exactly this reason.
 
 ---
+
+## What's new in this fork
+
+[FORK.md](FORK.md) explains *why* each addition exists. This is the ownership map — which code is
+new here and which came from upstream — measured from git history rather than estimated:
+
+| | lines | files |
+| --- | --- | --- |
+| **New in this fork** | 5,678 | 23 |
+| From upstream spice-edit | 26,599 | 64 |
+
+Two packages exist only here, and they are the ones the headline rests on:
+
+| Package | Lines | What it is |
+| --- | --- | --- |
+| **`internal/lsp`** | 1,740 | The whole LSP client — protocol types, stdio transport, server registry, UTF-16 ↔ rune conversion. Hand-rolled on the standard library, no new dependencies. |
+| **`internal/state`** | 323 | The `active.json` contract: publishes `{file,line,col,root}` so companion tools can follow the cursor. Every herdr-extensions panel reads it. |
+
+And inside packages shared with upstream, these files are new:
+
+| Area | Files |
+| --- | --- |
+| Diagnostics overlay + status summary | `internal/app/diagnostics.go` |
+| Hover / go-to-definition wiring | `internal/app/lspactions.go` |
+| Word wrap (a separate geometry path) | `internal/editor/wrap.go` |
+| Start page instead of "No file open" | `internal/app/startpage.go` |
+| Undo history that survives the process | `internal/editor/persist.go` |
+| `.gitignore`-aware file tree | `internal/filetree/gitignore.go` |
+| Gutter/screen mapping for the overlay | `internal/editor/geometry.go` |
+
+The remaining 82% — buffer, tab, renderer, event loop, modals, mouse handling, file operations,
+finder, formatting, icons, theme — is upstream's, and stays credited as such. spice-edit is MIT and
+this fork keeps its copyright notice, which is both required and correct: inherited files keep their
+original headers, and files new here carry ours.
 
 ## Install
 
