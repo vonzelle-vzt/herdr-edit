@@ -54,6 +54,14 @@ changelog:
   use: github
   filters:
     exclude:
+      # The release job's OWN commits. Without this, every release's notes are dominated by
+      # "Release vX.Y.Z [skip ci]" and "Update herdr-edit brew formula to vX.Y.Z [skip ci]" --
+      # v0.5.5 shipped with two of its three changelog lines written by the bot. Release notes are
+      # the shop window on a public repo; they should not be mostly bookkeeping.
+      - "\\[skip ci\\]"
+      # Conventional-commit prefixes. Kept for anyone who uses them, but note this repo writes prose
+      # subjects ("Warn that a source build goes stale…"), so these match nothing here -- they are not
+      # quietly doing the filtering above.
       - "^docs:"
       - "^chore:"
       - "^test:"
