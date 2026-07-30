@@ -94,6 +94,22 @@ jobs:
       # Commit the bumped version.go back to main. The [skip ci] marker
       # in the commit message tells GitHub Actions not to re-run this
       # workflow (which would loop forever).
+      # Git identity, set once for EVERY step that writes a git object. This used
+      # to live inside "Commit version bump" below, which is gated on the
+      # auto-bump path — so "Tag release" borrowed it as a side effect and only
+      # worked when a bump had happened. Hand-edit version.go and the bump step
+      # is skipped, leaving `git tag -a` (annotated, so it needs a committer) to
+      # die with "fatal: empty ident name". That is the path the file header
+      # documents as supported for a manual major/minor bump, and it had never
+      # once run: v0.2.0 was merged, the job failed in 17s, and nothing shipped.
+      #
+      # A step that configures state must not be gated on a branch that other
+      # steps depend on.
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Commit version bump
         if: steps.version.outputs.bumped == 'true'
         run: |
@@ -102,8 +118,6 @@ jobs:
 
           sed -i -E "s/(const Version = )\"[0-9]+\.[0-9]+\.[0-9]+\"/\1\"$NEW\"/" internal/version/version.go
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add internal/version/version.go
           git commit -m "Release v$NEW [skip ci]"
           git push origin HEAD:main

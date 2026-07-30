@@ -279,6 +279,24 @@ If you're touching the workflow or `.goreleaser.yml`, make sure both
 auto-commits keep their `[skip ci]` markers — without them the workflow
 loops forever.
 
+🔴 **The git identity must stay in its own ungated step.** It used to live inside
+`Commit version bump`, which is gated on the auto-bump path (step 2 above), and
+`Tag release` borrowed it as a side effect. So hand-editing `version.go` — the
+documented way to do a manual major/minor bump — skipped the bump step and left
+`git tag -a` with no committer: `fatal: empty ident name`, job dead in 17s,
+nothing tagged and nothing shipped. That path had never once run successfully.
+A step that configures state must not be gated on a branch other steps depend on.
+
+🔴 **Do not re-add a Pages dispatch.** Upstream deploys a marketing site from
+`pages.yml`; this fork has no such workflow, so the inherited
+`gh workflow run pages.yml` step failed with *"HTTP 422: Workflow does not have
+workflow_dispatch trigger"* and took the job down with it. Releases v0.1.2
+through v0.1.6 are all marked FAILED for that reason alone — **after** tagging,
+building five platforms, publishing the Release and writing the formula. A red
+release that actually shipped is worse than either outcome alone, because a
+genuine GoReleaser failure looks identical. Same shape as the `brews.repository`
+bug: inherited upstream config pointing at infrastructure this fork lacks.
+
 ## What NOT to add
 
 - `Ctrl+` editor shortcuts (they fight tmux/terminals — that's the
