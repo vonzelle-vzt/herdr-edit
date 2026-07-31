@@ -364,15 +364,7 @@ func (c *Client) Caps() Capabilities {
 // owns that sequence because only the caller knows what breakpoints to set in
 // the middle of it.
 func (c *Client) Initialize(ctx context.Context, adapterID string) (Capabilities, error) {
-	raw, err := c.call(ctx, "initialize", initializeArgs{
-		ClientID:        "herdr-edit",
-		ClientName:      "herdr-edit",
-		AdapterID:       adapterID,
-		Locale:          "en-us",
-		LinesStartAt1:   true,
-		ColumnsStartAt1: true,
-		PathFormat:      "path",
-	})
+	raw, err := c.call(ctx, "initialize", initializeArgsForClient(adapterID))
 	if err != nil {
 		return Capabilities{}, err
 	}
@@ -386,6 +378,25 @@ func (c *Client) Initialize(ctx context.Context, adapterID string) (Capabilities
 	c.caps = caps
 	c.mu.Unlock()
 	return caps, nil
+}
+
+// initializeArgsForClient is the capability declaration sent at initialize,
+// kept next to Initialize so the two cannot drift.
+func initializeArgsForClient(adapterID string) initializeArgs {
+	return initializeArgs{
+		ClientID:        "herdr-edit",
+		ClientName:      "herdr-edit",
+		AdapterID:       adapterID,
+		Locale:          "en-us",
+		LinesStartAt1:   true,
+		ColumnsStartAt1: true,
+		PathFormat:      "path",
+
+		// Both are honoured: Variables reads Type, and sends start/count when
+		// the adapter says it can page. See initializeArgs' comment.
+		SupportsVariableType:   true,
+		SupportsVariablePaging: true,
+	}
 }
 
 // Launch SENDS the launch request and returns a channel carrying its eventual
@@ -540,10 +551,129 @@ func (c *Client) Continue(ctx context.Context, threadID int) error {
 	return err
 }
 
+// Next steps over the current line: a call on it runs to completion rather than
+// being descended into. Bound to F10.
+//
+// 🔴 Stepping is ASYNCHRONOUS, and every one of these three is. The response
+// says only that the adapter accepted the request; where the program ended up
+// arrives later as a `stopped` event with reason "step". A caller that reads a
+// stack trace off the back of this response gets the location it had BEFORE the
+// step — plausible, wrong, and indistinguishable from a step that did nothing.
+func (c *Client) Next(ctx context.Context, threadID int) error {
+	_, err := c.call(ctx, "next", threadArgs{ThreadID: threadID})
+	return err
+}
+
+// StepIn descends into the call on the current line, or behaves like Next when
+// there is none. Bound to F11. Asynchronous — see Next.
+func (c *Client) StepIn(ctx context.Context, threadID int) error {
+	_, err := c.call(ctx, "stepIn", threadArgs{ThreadID: threadID})
+	return err
+}
+
+// StepOut runs to the return of the current function and stops in the caller.
+// Bound to F12. Asynchronous — see Next.
+func (c *Client) StepOut(ctx context.Context, threadID int) error {
+	_, err := c.call(ctx, "stepOut", threadArgs{ThreadID: threadID})
+	return err
+}
+
 // Pause interrupts a running program so it reports where it is. Bound to F6.
 func (c *Client) Pause(ctx context.Context, threadID int) error {
 	_, err := c.call(ctx, "pause", threadArgs{ThreadID: threadID})
 	return err
+}
+
+// Scopes lists the variable groups belonging to one stack FRAME.
+//
+// frameID comes from StackFrame.ID and is not a thread id: asking for scopes
+// with a thread id is the classic spelling of this bug, and delve answers it
+// with an unrelated frame's variables rather than an error — so the caller sees
+// a plausible, wrong set of values. The live oracle walks
+// stackTrace → scopes → variables end to end for exactly that reason.
+func (c *Client) Scopes(ctx context.Context, frameID int) ([]Scope, error) {
+	raw, err := c.call(ctx, "scopes", scopesArgs{FrameID: frameID})
+	if err != nil {
+		return nil, err
+	}
+	var body scopesBody
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return nil, err
+		}
+	}
+	return body.Scopes, nil
+}
+
+// Variables reads the contents of one variables reference — a scope's, or an
+// expandable variable's.
+//
+// count caps how many are asked for, and is sent ONLY when the adapter
+// advertised supportsVariablePaging. That gate is not politeness: an adapter
+// without paging support ignores start/count silently instead of refusing, so a
+// client that always sent them would believe it had bounded the answer while
+// receiving the whole of a million-element slice.
+//
+// 🔴 Delve does NOT advertise it (measured, 1.27), so on the adapter this fork
+// actually ships the window is never sent and this always returns everything.
+// Callers MUST cap what comes back — see internal/app's maxDebugVariables.
+//
+// 🔴 ref is PERISHABLE. It is valid until the program next runs, and after a
+// continue or a step the adapter may reuse the number for something else or
+// reject it outright. Caching a variables tree across a step therefore shows
+// another frame's values with no error at all, which is the worst failure a
+// debugger has. internal/app drops every cached reference on `continued` and on
+// `stopped`.
+func (c *Client) Variables(ctx context.Context, ref, start, count int) ([]Variable, error) {
+	args := variablesArgs{VariablesReference: ref}
+	if c.Caps().SupportsVariablePaging {
+		args.Start = start
+		args.Count = count
+	}
+	raw, err := c.call(ctx, "variables", args)
+	if err != nil {
+		return nil, err
+	}
+	var body variablesBody
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return nil, err
+		}
+	}
+	return body.Variables, nil
+}
+
+// Terminate asks the adapter to end the debuggee politely, giving it a chance
+// to run its own shutdown. Only meaningful when the adapter advertised
+// supportsTerminateRequest; use TerminateOrDisconnect rather than calling this
+// directly.
+func (c *Client) Terminate(ctx context.Context) error {
+	_, err := c.call(ctx, "terminate", terminateArgs{})
+	return err
+}
+
+// TerminateOrDisconnect stops the debugged process by whichever route this
+// adapter actually supports, and is the ONLY place that decision is made.
+//
+// 🔴 supportsTerminateRequest is ABSENT from delve's capabilities — measured
+// against 1.27. Sending `terminate` to an adapter that never claimed it comes
+// back as an unknown-command error, so a stop button wired straight to it does
+// NOTHING on delve while reporting nothing: the editor drops the session, the
+// debugged process keeps running, and the only evidence is a stray dlv in the
+// process table. The fallback is disconnect{terminateDebuggee:true}, which is
+// what delve requires and what Stop has always used.
+//
+// The terminate branch also falls through on failure rather than reporting it.
+// An adapter is allowed to advertise the capability and still refuse a
+// particular terminate, and "we asked nicely and it said no" must not be the
+// end of the story when a live process is at stake.
+func (c *Client) TerminateOrDisconnect(ctx context.Context) error {
+	if c.Caps().SupportsTerminateRequest {
+		if err := c.Terminate(ctx); err == nil {
+			return nil
+		}
+	}
+	return c.Disconnect(ctx, true)
 }
 
 // Disconnect ends the session and, by default, kills the debuggee.
@@ -575,7 +705,9 @@ func (c *Client) Stop() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
 		defer cancel()
-		_ = c.Disconnect(ctx, true)
+		// Whichever route this adapter supports — on delve that is still
+		// disconnect{terminateDebuggee:true}. See TerminateOrDisconnect.
+		_ = c.TerminateOrDisconnect(ctx)
 		close(disconnected)
 	}()
 	select {
@@ -627,10 +759,24 @@ func (c *Client) send(command string, args interface{}) (<-chan Response, error)
 	return ch, nil
 }
 
+// isShutdownCommand names the requests that are still legal AFTER Stop has
+// marked the client closed.
+//
+// 🔴 Both belong here, not just disconnect. Stop sets closed and then asks
+// TerminateOrDisconnect to end the debuggee; with only disconnect exempt, an
+// adapter that DOES advertise supportsTerminateRequest would have its terminate
+// refused by our own guard, fall through to disconnect, and appear to work —
+// hiding the fact that the polite path had never once run. A guard that makes a
+// branch unreachable is worse than no guard, because the branch still looks
+// tested.
+func isShutdownCommand(command string) bool {
+	return command == "disconnect" || command == "terminate"
+}
+
 // call issues a request and waits for its answer or the context deadline.
 func (c *Client) call(ctx context.Context, command string, args interface{}) (json.RawMessage, error) {
 	c.mu.Lock()
-	if c.closed && command != "disconnect" {
+	if c.closed && !isShutdownCommand(command) {
 		c.mu.Unlock()
 		return nil, fmt.Errorf("%s: client closed", c.name)
 	}

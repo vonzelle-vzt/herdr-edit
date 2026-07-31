@@ -9,8 +9,11 @@
 // stage 1 drew. Press F5, the program runs under delve, it stops on your
 // breakpoint, the editor opens that file and paints ▶ on the line.
 //
-// Stepping is NOT here — that is stage 3. What is here is start, continue,
-// pause, stop, and knowing where you are.
+// What is here is the SESSION: starting it, continuing it, stopping it, knowing
+// where it is, and painting that. What you do once it has stopped — stepping,
+// the call stack, goroutines, variables, the console — is stage 3 and lives in
+// debugview.go, which owns no session state and reaches the screen only through
+// fetchStack → debugStoppedEvent → handleDebugStopped below.
 //
 // # Everything crosses the goroutine boundary as a posted event
 //
@@ -59,6 +62,11 @@ const debugRequestTimeout = 20 * time.Second
 // is a program we do not control and it may print in a loop.
 const maxDebugOutput = 200
 
+// maxDebugFrames caps how deep a stack trace is fetched. A runaway recursion
+// has a stack of whatever depth the runtime allowed, and the picker is for
+// navigating, not for reading a core dump.
+const maxDebugFrames = 64
+
 // boundBreakpoint is one breakpoint as the adapter actually bound it, kept so
 // the gutter can tell the truth about where execution will really stop.
 //
@@ -71,6 +79,21 @@ type boundBreakpoint struct {
 	Bound     int // where the adapter will actually stop; == Requested when unmoved
 	Verified  bool
 	Message   string
+}
+
+// debugFrame is one stack frame in BUFFER coordinates.
+//
+// 🔴 Line is 0-based, converted on the way in by bufLineFromAdapter — this type
+// exists so that a frame crossing into the view layer cannot still be carrying
+// the adapter's 1-based number. internal/dap's StackFrame is the 1-based shape
+// and stops at this file's boundary, which is the rule protocol.go's package
+// comment states and the reason there are exactly two places the arithmetic
+// appears.
+type debugFrame struct {
+	ID   int    // the adapter's frame id — what scopes() takes, NOT a thread id
+	Name string // the function name, for the picker and the status bar
+	Path string // absolute; "" when the adapter has no source for this frame
+	Line int    // 0-based buffer line
 }
 
 // debugSession is one live debug session.
@@ -95,8 +118,65 @@ type debugSession struct {
 	// breakpoints. Read by the gutter overlay.
 	bound map[string][]boundBreakpoint
 
+	// frames is the stopped thread's stack, innermost first, and curFrame is
+	// the one the user is looking at. Fetched once per stop by fetchStack, so
+	// opening the call stack picker costs no adapter round trip.
+	frames   []debugFrame
+	curFrame int
+
+	// varCache holds variable pages already fetched during THIS stop, keyed by
+	// the adapter's variablesReference.
+	//
+	// 🔴 PERISHABLE, and this is the most dangerous state in the debugger. A
+	// variablesReference is a handle the adapter allocates for one stop; once
+	// the program runs again it may reuse the number for something else or
+	// reject it. A cache that survived a step would therefore answer with
+	// ANOTHER FRAME'S VALUES and no error at all — plausible, wrong, and
+	// impossible for the user to detect, which is the worst failure a debugger
+	// can have. invalidateStop is called on `continued` AND on `stopped`;
+	// TestVariablesCacheDroppedOnStep is the guard.
+	varCache map[int]debugVarPage
+
 	output  []string
 	lastErr string
+}
+
+// dropVariableCache invalidates every cached variables reference, leaving the
+// frame list alone. Used when the stop is still valid but what the user is
+// looking at within it has changed — selecting another frame.
+func (s *debugSession) dropVariableCache() {
+	s.varCache = nil
+}
+
+// invalidateStop throws away everything that belonged to the stop the program
+// has just left: the variable references AND the frame ids, which are handles
+// with exactly the same lifetime.
+//
+// Called from BOTH the continued and the stopped paths, which is not redundancy
+// — a program can resume without us asking (continued) and can stop without
+// having visibly resumed (a step, which produces stopped with no continued in
+// between on some adapters). Handling only one leaves a window in which stale
+// handles are served.
+func (s *debugSession) invalidateStop() {
+	s.dropVariableCache()
+	s.frames = nil
+	s.curFrame = 0
+}
+
+// resumeFailed reports a refused resume — a continue or any of the three steps
+// — and puts the session back where it actually is. Runs on the requesting
+// goroutine.
+//
+// 🔴 The recovery matters as much as the message. Every resume marks the
+// session as running BEFORE the request goes out, because the program is about
+// to move. When the adapter REFUSES, nothing else ever puts that back: the UI
+// claims the program is running while it is still sitting on the same line —
+// no ▶, no location in the status bar, the inspectors all disabled, and F5
+// answering "a session is already running". The only way out would be Stop.
+// Re-reading the stack restores the truth through the one route that paints it.
+func (a *App) resumeFailed(client *dap.Client, thread int, what string, err error) {
+	a.post(&debugLogEvent{when: time.Now(), msg: what + ": " + err.Error()})
+	a.fetchStack(client, thread, what+" refused")
 }
 
 // debugEvent carries one adapter event onto the tcell queue.
@@ -133,6 +213,13 @@ type debugStoppedEvent struct {
 	frame    string
 	reason   string
 	threadID int
+
+	// frames is the whole stack, already converted to buffer coordinates. It
+	// travels with the stop rather than being fetched when the user asks for it
+	// so that the call-stack picker opens instantly and, more importantly, so
+	// the frame ids it hands to scopes() belong to the stop currently on screen
+	// rather than to whatever the adapter is doing by then.
+	frames []debugFrame
 }
 
 func (e *debugStoppedEvent) When() time.Time { return e.when }
@@ -232,6 +319,10 @@ func (a *App) menuStartDebug() {
 	// keeps it current.
 	bps := a.enabledBreakpoints()
 	program := filepath.Dir(tab.Path)
+
+	// A new run starts a clean console; the previous run's output belonged to a
+	// different program state and mixing the two silently is worse than losing it.
+	a.lastDebugOutput = nil
 
 	a.debug = &debugSession{adapter: adapter.Name, starting: true, bound: map[string][]boundBreakpoint{}}
 	go a.runDebugSession(adapter, program, bps)
@@ -396,36 +487,15 @@ func (a *App) menuDebugContinue() {
 	client, thread := a.debug.client, a.debug.threadID
 	a.debug.stopped = false
 	a.debug.path, a.debug.frame, a.debug.reason = "", "", ""
+	a.debug.invalidateStop()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), debugRequestTimeout)
 		defer cancel()
 		if err := client.Continue(ctx, thread); err != nil {
-			a.post(&debugLogEvent{when: time.Now(), msg: "continue: " + err.Error()})
+			a.resumeFailed(client, thread, "continue", err)
 		}
 	}()
 	a.flash("Continuing…")
-}
-
-// menuDebugPause interrupts a running program so it reports where it is.
-func (a *App) menuDebugPause() {
-	a.closeMenu()
-	if a.debug == nil || a.debug.client == nil {
-		a.flash("No debug session — F5 starts one")
-		return
-	}
-	if a.debug.stopped {
-		a.flash("The program is already stopped")
-		return
-	}
-	client, thread := a.debug.client, a.debug.threadID
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), debugRequestTimeout)
-		defer cancel()
-		if err := client.Pause(ctx, thread); err != nil {
-			a.post(&debugLogEvent{when: time.Now(), msg: "pause: " + err.Error()})
-		}
-	}()
-	a.flash("Pausing…")
 }
 
 // menuDebugStop ends the session and kills the debuggee.
@@ -439,6 +509,9 @@ func (a *App) menuDebugStop() {
 		a.flash("No debug session to stop")
 		return
 	}
+	// Keep the output, exactly as handleDAPTerminated does: a run the user
+	// ended by hand is still a run whose output they may want to read.
+	a.lastDebugOutput = a.debug.output
 	client := a.debug.client
 	a.debug = nil
 	if client != nil {
@@ -543,9 +616,12 @@ func (a *App) handleDAPEvent(e *debugEvent) {
 
 	case dap.EventContinued:
 		// The adapter resumed on its own. Clearing the marker here is what
-		// keeps ▶ from sitting under a program that is no longer there.
+		// keeps ▶ from sitting under a program that is no longer there — and
+		// dropping the variables cache is what keeps the next expansion from
+		// answering with values read before the program moved.
 		a.debug.stopped = false
 		a.debug.path, a.debug.frame, a.debug.reason = "", "", ""
+		a.debug.invalidateStop()
 
 	case dap.EventOutput:
 		a.handleDAPOutput(e.ev)
@@ -584,6 +660,13 @@ func (a *App) handleDAPEvent(e *debugEvent) {
 // it on the main loop would block the editor for the whole timeout on a wedged
 // debugger. The goroutine posts a debugStoppedEvent once it has an answer.
 func (a *App) handleDAPStopped(ev dap.Event) {
+	// 🔴 FIRST, before any early return. The program ran to get here, so every
+	// variablesReference and frame id we hold died on the way — including when
+	// the event body is unreadable or there is no client to ask. An
+	// invalidation skipped on an error path is a stale handle served on the
+	// next expand.
+	a.debug.invalidateStop()
+
 	var se dap.StoppedEvent
 	if err := decodeBody(ev.Body, &se); err != nil {
 		a.flash("Debug: could not read the stopped event")
@@ -598,31 +681,52 @@ func (a *App) handleDAPStopped(ev dap.Event) {
 	if client == nil {
 		return
 	}
-	reason := se.Reason
+	go a.fetchStack(client, thread, se.Reason)
+}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), debugRequestTimeout)
-		defer cancel()
+// fetchStack reads a stopped thread's stack and posts it as a
+// debugStoppedEvent. Runs on a goroutine — never call it inline.
+//
+// 🔴 This is the ONE route by which a new location reaches the UI, and keeping
+// it single is the whole reason stepping needed no painting code of its own.
+// The ▶ overlay, the cursor jump, the status bar and the frame list are all
+// downstream of handleDebugStopped; a step, a stop and a thread switch differ
+// only in the reason they pass. A second path that "just moved the cursor"
+// would be a second place for the coordinate conversion to be wrong, and the
+// two would disagree only in the cases nobody tests.
+func (a *App) fetchStack(client *dap.Client, thread int, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), debugRequestTimeout)
+	defer cancel()
 
-		frames, err := client.StackTrace(ctx, thread, 20)
-		if err != nil || len(frames) == 0 {
-			msg := "stopped, but the stack trace was unavailable"
-			if err != nil {
-				msg = "stopped: " + err.Error()
-			}
-			a.post(&debugLogEvent{when: time.Now(), msg: msg})
-			return
+	frames, err := client.StackTrace(ctx, thread, maxDebugFrames)
+	if err != nil || len(frames) == 0 {
+		msg := "stopped, but the stack trace was unavailable"
+		if err != nil {
+			msg = "stopped: " + err.Error()
 		}
-		top := frames[0]
-		a.post(&debugStoppedEvent{
-			when:     time.Now(),
-			path:     top.Source.Path,
-			line:     bufLineFromAdapter(top.Line), // 🔴 the one conversion
-			frame:    top.Name,
-			reason:   reason,
-			threadID: thread,
+		a.post(&debugLogEvent{when: time.Now(), msg: msg})
+		return
+	}
+
+	conv := make([]debugFrame, 0, len(frames))
+	for _, f := range frames {
+		conv = append(conv, debugFrame{
+			ID:   f.ID,
+			Name: f.Name,
+			Path: f.Source.Path,
+			Line: bufLineFromAdapter(f.Line), // 🔴 the one conversion
 		})
-	}()
+	}
+	top := conv[0]
+	a.post(&debugStoppedEvent{
+		when:     time.Now(),
+		path:     top.Path,
+		line:     top.Line,
+		frame:    top.Name,
+		reason:   reason,
+		threadID: thread,
+		frames:   conv,
+	})
 }
 
 // handleDebugStopped opens the file the program stopped in and puts the cursor
@@ -637,6 +741,8 @@ func (a *App) handleDebugStopped(e *debugStoppedEvent) {
 	a.debug.line = e.line
 	a.debug.frame = e.frame
 	a.debug.reason = e.reason
+	a.debug.frames = e.frames
+	a.debug.curFrame = 0 // a new stop always lands on the innermost frame
 	if e.threadID != 0 {
 		a.debug.threadID = e.threadID
 	}
@@ -691,6 +797,13 @@ func (a *App) handleDAPTerminated(exitCode int, haveCode bool) {
 	}
 	last := a.lastProgramOutput()
 	client := a.debug.client
+
+	// Keep the program's output alive past the session that produced it. The
+	// debug console is the only place a run's output can be READ, and a console
+	// that empties the instant the program exits is a console you can never use
+	// on a program that ran to completion — which is most of them.
+	a.lastDebugOutput = a.debug.output
+
 	a.debug = nil // clears the ▶ by construction: drawDebugGutter reads this
 	if client != nil {
 		go client.Stop()

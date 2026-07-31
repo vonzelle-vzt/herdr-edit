@@ -64,13 +64,20 @@ func leaderBindings() []leaderBinding {
 		{'y', (*App).menuRenameSymbol},
 		{'m', (*App).menuToggleBookmark},
 		{'\'', (*App).menuNextBookmark},
-		// Breakpoints (fork, Lane B stage 1) — no debug adapter behind
-		// these, just persistent edit-tracking marks. '9' mnemonic: F9,
-		// the universal toggle-breakpoint key; '5' mnemonic: F5, the
-		// universal start/resume key, repurposed here as "show me where
-		// they are" since there's no adapter yet to resume.
+		// Debugging (fork, Lane B). '9' mnemonic: F9, the universal
+		// toggle-breakpoint key. '5' mnemonic: F5, the universal
+		// start/resume key.
+		//
+		// Esc 5 opened the breakpoint list in stage 1, when that was the
+		// whole feature; stage 3 added stepping, the call stack, the
+		// goroutine list, variables and a console, and there is no leader
+		// rune left to give any of them — every lowercase letter is bound
+		// or reserved (c/x/v belong to the terminal's clipboard), Ctrl- is
+		// forbidden fork-wide, and shifted F-keys need modifyOtherKeys and
+		// are unreliable through a multiplexer. So Esc 5 is now the debug
+		// PICKER over all of them, with the breakpoint list as one row.
 		{'9', (*App).menuToggleBreakpoint},
-		{'5', (*App).menuListBreakpoints},
+		{'5', (*App).menuDebugPicker},
 		// LSP. Both requests were implemented, tested and advertised in initialize with no caller;
 		// these two keys are the entire wiring.
 		{'h', (*App).menuHover},

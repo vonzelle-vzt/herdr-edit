@@ -191,3 +191,108 @@ func TestSourceBreakpointOmitsEmptyCondition(t *testing.T) {
 		t.Fatalf("line missing from %s", raw)
 	}
 }
+
+// TestScopeAndVariableDecodeDelvesRealShapes pins the JSON delve actually
+// sends, captured from the live oracle's log rather than invented:
+//
+//	scope "Locals": ref=1000 named=0 indexed=0 expensive=false
+//	Locals.sum = 5 (int)
+//
+// 🔴 named and indexed BOTH being zero is the shape that matters. Total() must
+// answer 0 for "the adapter did not say" rather than being read as "this scope
+// is empty", because a truncation notice that names a denominator of 0 is worse
+// than one that names none.
+func TestScopeAndVariableDecodeDelvesRealShapes(t *testing.T) {
+	var body scopesBody
+	if err := json.Unmarshal([]byte(
+		`{"scopes":[{"name":"Locals","variablesReference":1000,"namedVariables":0,"indexedVariables":0,"expensive":false}]}`,
+	), &body); err != nil {
+		t.Fatalf("scopes body: %v", err)
+	}
+	if len(body.Scopes) != 1 {
+		t.Fatalf("got %d scopes", len(body.Scopes))
+	}
+	sc := body.Scopes[0]
+	if sc.Name != "Locals" || sc.VariablesReference != 1000 || sc.Expensive {
+		t.Errorf("scope = %+v", sc)
+	}
+	if sc.Total() != 0 {
+		t.Errorf("Total() = %d for a scope that reported no counts, want 0 meaning unknown", sc.Total())
+	}
+
+	var vars variablesBody
+	if err := json.Unmarshal([]byte(
+		`{"variables":[{"name":"sum","value":"5","type":"int","evaluateName":"sum","variablesReference":0},`+
+			`{"name":"cfg","value":"main.Config {Name: \"x\"}","type":"main.Config","variablesReference":1002,"namedVariables":2}]}`,
+	), &vars); err != nil {
+		t.Fatalf("variables body: %v", err)
+	}
+	if len(vars.Variables) != 2 {
+		t.Fatalf("got %d variables", len(vars.Variables))
+	}
+	leaf, expandable := vars.Variables[0], vars.Variables[1]
+	if leaf.Value != "5" || leaf.Type != "int" {
+		t.Errorf("leaf = %+v", leaf)
+	}
+	if leaf.VariablesReference != 0 {
+		t.Errorf("an int reported children: %+v", leaf)
+	}
+	if expandable.VariablesReference != 1002 || expandable.Total() != 2 {
+		t.Errorf("expandable = %+v, want ref 1002 and Total 2", expandable)
+	}
+}
+
+// TestVariablesArgsOmitAnAbsentWindow checks the paging window is expressed by
+// ABSENCE rather than by a zero.
+//
+// count:0 is a legal request for zero variables in some readings of the spec,
+// so "give me everything" and "give me nothing" must not marshal to the same
+// bytes. The difference is not something to leave to an adapter's judgement.
+func TestVariablesArgsOmitAnAbsentWindow(t *testing.T) {
+	raw, err := json.Marshal(variablesArgs{VariablesReference: 1000})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "count") || strings.Contains(string(raw), "start") {
+		t.Fatalf("an unwindowed request carried start/count: %s", raw)
+	}
+
+	raw, err = json.Marshal(variablesArgs{VariablesReference: 1000, Count: 200})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"count":200`) {
+		t.Fatalf("a windowed request lost its count: %s", raw)
+	}
+}
+
+// TestCapabilitiesReadDelvesRealAnswer pins what delve 1.27 actually reports —
+// measured, and logged by the live oracle on every run.
+//
+// 🔴 Both absences are load-bearing. No supportsTerminateRequest means
+// TerminateOrDisconnect MUST fall back to disconnect{terminateDebuggee:true} or
+// the debuggee outlives the editor; no supportsVariablePaging means start/count
+// are never sent and the caller's cap is the only bound on a million-element
+// slice.
+func TestCapabilitiesReadDelvesRealAnswer(t *testing.T) {
+	var caps Capabilities
+	if err := json.Unmarshal([]byte(
+		`{"supportsConfigurationDoneRequest":true,"supportsConditionalBreakpoints":true,`+
+			`"supportsLogPoints":true,"supportsFunctionBreakpoints":true,`+
+			`"exceptionBreakpointFilters":[{"filter":"call-stack-error","label":"Call Stack Errors","default":true}]}`,
+	), &caps); err != nil {
+		t.Fatalf("capabilities: %v", err)
+	}
+	if !caps.SupportsConfigurationDoneRequest {
+		t.Error("configurationDone support was lost; the session would hang")
+	}
+	if caps.SupportsTerminateRequest {
+		t.Error("terminate support was decoded from an answer that does not mention it")
+	}
+	if caps.SupportsVariablePaging {
+		t.Error("variable paging was decoded from an answer that does not mention it")
+	}
+	if got := caps.DefaultFilters(); len(got) != 1 || got[0] != "call-stack-error" {
+		t.Errorf("DefaultFilters = %v", got)
+	}
+}

@@ -28,6 +28,7 @@ package dap
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +55,29 @@ const breakpointMarker = "BREAKPOINT-TARGET"
 // commentMarker tags a NON-executable line, used to prove the other half of the
 // breakpoint contract: a breakpoint that cannot bind comes back unverified.
 const commentMarker = "NOT-EXECUTABLE"
+
+// stepTargetMarker tags the line a single `next` from breakpointMarker must
+// land on — the statement immediately after it.
+//
+// 🔴 Same reasoning as breakpointMarker, and it is the whole reason a marker
+// exists rather than an arithmetic assertion. "The stopped line is one greater
+// than it was" passes for a step that went nowhere and then reported a line
+// number off by one, and it passes for a fixture whose numbering happens to
+// agree with the adapter's. Asserting that the TEXT of the new line is the line
+// tagged as the step target cannot pass by coincidence.
+const stepTargetMarker = "STEP-TARGET"
+
+// localName and localValue are the local variable the variables oracle reads,
+// and what it must be worth by the time execution reaches stepTargetMarker.
+//
+// The breakpoint for that oracle sits on the step-target line ON PURPOSE: a
+// breakpoint on the assignment stops BEFORE it runs, so sum would be 0 there —
+// a value that is also what a failed read, a wrong scope and an uninitialised
+// struct all produce. 5 can only be the real answer.
+const (
+	localName  = "sum"
+	localValue = "5"
+)
 
 // stdoutSentinel is what the fixture PRINTS, and it is deliberately a string
 // that cannot occur anywhere else in the session.
@@ -113,7 +137,7 @@ import "fmt"
 // add returns the sum of a and b. ` + commentMarker + `
 func add(a, b int) int {
 	sum := a + b // ` + breakpointMarker + `
-	return sum
+	return sum // ` + stepTargetMarker + `
 }
 
 func main() {
@@ -512,3 +536,263 @@ func TestLiveDelveOutputEventCarriesProgramStdout(t *testing.T) {
 // jsonUnmarshal is a tiny indirection so unmarshalBody reads cleanly; the
 // import lives here rather than in the helper's signature.
 func jsonUnmarshal(data []byte, v interface{}) error { return json.Unmarshal(data, v) }
+
+// liveSession is a real delve, launched against the fixture and stopped on the
+// requested marker, with everything the stage-3 oracles need to interrogate it.
+type liveSession struct {
+	client *Client
+	waiter *stoppedWaiter
+	caps   Capabilities
+	file   string
+	lines  []string
+
+	// last is the most recent stopped event awaitStopped saw. Kept here rather
+	// than returned and threaded around, because the thread id it carries is
+	// needed by every request that follows a stop and losing track of it is how
+	// a request ends up aimed at goroutine 0.
+	last StoppedEvent
+}
+
+// startStoppedSession brings up a real delve, sets ONE breakpoint on the line
+// carrying marker, and returns once the program has stopped on it.
+//
+// It exists because the launch sequence has five ordered steps and three of them
+// fail as a hang rather than an error; the two stage-3 oracles below care about
+// what happens AFTER the stop, and a fourth and fifth transcription of that
+// sequence would be four and five chances to get it subtly wrong. The three
+// stage-2 oracles above keep their own copies deliberately — they are testing
+// the sequence itself, so sharing a helper with them would mean the thing under
+// test and the test harness were the same code.
+func startStoppedSession(t *testing.T, ctx context.Context, marker string) *liveSession {
+	t.Helper()
+
+	root, file, lines := dlvFixture(t)
+	targetLine := lineWithMarker(t, lines, marker)
+
+	waiter, handlers := newStoppedWaiter(t)
+	adapter, ok := AdapterFor("go")
+	if !ok {
+		t.Fatal("no adapter registered for go")
+	}
+	reg := NewRegistry(root)
+	client, err := reg.Start(ctx, adapter, handlers)
+	if err != nil {
+		t.Fatalf("starting delve: %v", err)
+	}
+	t.Cleanup(client.Stop)
+
+	caps, err := client.Initialize(ctx, adapter.AdapterID)
+	if err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	// Measured facts, recorded in the run output rather than asserted: delve
+	// 1.27 answers supportsTerminateRequest ABSENT (so TerminateOrDisconnect
+	// must fall back to disconnect{terminateDebuggee:true}) and does advertise
+	// supportsVariablePaging. Both are read by production code, so seeing what
+	// a real adapter actually says is the point of this file.
+	t.Logf("delve capabilities: terminate=%v variablePaging=%v variableType(request)=%v configurationDone=%v",
+		caps.SupportsTerminateRequest, caps.SupportsVariablePaging,
+		initializeArgsForClient(adapter.AdapterID).SupportsVariableType,
+		caps.SupportsConfigurationDoneRequest)
+
+	cfg := map[string]interface{}{}
+	for k, v := range adapter.Launch {
+		cfg[k] = v
+	}
+	cfg["program"] = root
+	cfg["output"] = filepath.Join(root, "debug_bin")
+	if _, err := client.Launch(cfg); err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	if err := client.WaitEvent(ctx, EventInitialized); err != nil {
+		t.Fatalf("never saw the initialized event: %v (adapter stderr: %v)", err, client.LastStderr())
+	}
+	bps, err := client.SetBreakpoints(ctx, Source{Path: file}, []SourceBreakpoint{{Line: targetLine}})
+	if err != nil {
+		t.Fatalf("setBreakpoints: %v", err)
+	}
+	if len(bps) != 1 || !bps[0].Verified {
+		t.Fatalf("delve would not bind a breakpoint on %q (line %d): %+v", marker, targetLine, bps)
+	}
+	if err := client.SetExceptionBreakpoints(ctx, caps.DefaultFilters()); err != nil {
+		t.Fatalf("setExceptionBreakpoints: %v", err)
+	}
+	if err := client.ConfigurationDone(ctx); err != nil {
+		t.Fatalf("configurationDone: %v", err)
+	}
+
+	s := &liveSession{client: client, waiter: waiter, caps: caps, file: file, lines: lines}
+	stopped := s.awaitStopped(t, "the initial breakpoint")
+	if stopped.Reason != "breakpoint" {
+		t.Fatalf("first stop had reason %q, want breakpoint: %+v", stopped.Reason, stopped)
+	}
+	s.assertStoppedOn(t, ctx, stopped, marker)
+	return s
+}
+
+// awaitStopped blocks for the next stopped event, failing with what the adapter
+// did say when none arrives.
+func (s *liveSession) awaitStopped(t *testing.T, what string) StoppedEvent {
+	t.Helper()
+	select {
+	case ev := <-s.waiter.stopped:
+		s.last = ev
+		return ev
+	case <-time.After(liveTimeout):
+		t.Fatalf("no stopped event for %s. events seen: %v\nadapter stderr: %v",
+			what, s.waiter.col.names(), s.client.LastStderr())
+	}
+	return StoppedEvent{}
+}
+
+// topFrame reads the innermost frame of a stopped thread.
+func (s *liveSession) topFrame(t *testing.T, ctx context.Context, ev StoppedEvent) StackFrame {
+	t.Helper()
+	frames, err := s.client.StackTrace(ctx, ev.ThreadID, 20)
+	if err != nil {
+		t.Fatalf("stackTrace: %v", err)
+	}
+	if len(frames) == 0 {
+		t.Fatal("stackTrace returned no frames for a stopped thread")
+	}
+	return frames[0]
+}
+
+// assertStoppedOn checks execution is halted on the line carrying marker,
+// identified by that line's TEXT.
+//
+// 🔴 By text, never by number. The whole 1-based/0-based boundary this package
+// declares in initialize is invisible to an assertion that compares the
+// adapter's line against a number computed from the same fixture — both sides
+// would be wrong together. Reading the source line the adapter names and
+// checking the marker is IN it is an assertion that cannot agree with a bug.
+func (s *liveSession) assertStoppedOn(t *testing.T, ctx context.Context, ev StoppedEvent, marker string) StackFrame {
+	t.Helper()
+	top := s.topFrame(t, ctx, ev)
+	if top.Line < 1 || top.Line > len(s.lines) {
+		t.Fatalf("stopped on line %d, outside the fixture's %d lines", top.Line, len(s.lines))
+	}
+	text := s.lines[top.Line-1]
+	if !strings.Contains(text, marker) {
+		t.Fatalf("stopped on line %d whose text is %q — that is not the line marked %q.\n"+
+			"the marked line is %d: %q",
+			top.Line, strings.TrimSpace(text), marker,
+			lineWithMarker(t, s.lines, marker), strings.TrimSpace(s.lines[lineWithMarker(t, s.lines, marker)-1]))
+	}
+	return top
+}
+
+// TestLiveDelveStepOverAdvancesOneLine is the definition of done for stage 3's
+// stepping half: a real program, stopped on a real breakpoint, moves to the
+// NEXT EXECUTABLE STATEMENT when `next` is sent — and reports it as a `stopped`
+// event rather than in the step response.
+//
+// 🔴 The new location is identified by the TEXT of the line, not by its number.
+// A fixture whose numbers already agree with the adapter's proves nothing about
+// the conversion at either end, and "line+1" is satisfied by a step that never
+// happened next to an off-by-one. See assertStoppedOn.
+func TestLiveDelveStepOverAdvancesOneLine(t *testing.T) {
+	dlv := requireDlv(t)
+	t.Logf("using %s", dlv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
+	defer cancel()
+
+	s := startStoppedSession(t, ctx, breakpointMarker)
+
+	// The two markers must genuinely be different lines, or the oracle proves
+	// nothing about advancing at all.
+	from := lineWithMarker(t, s.lines, breakpointMarker)
+	to := lineWithMarker(t, s.lines, stepTargetMarker)
+	if from == to {
+		t.Fatalf("the breakpoint and step markers are both on line %d; a step could not be observed", from)
+	}
+
+	// 🔴 next() returns as soon as delve ACCEPTS the request. Reading the stack
+	// here would report where we already were.
+	if err := s.client.Next(ctx, s.last.ThreadID); err != nil {
+		t.Fatalf("next: %v", err)
+	}
+
+	stopped := s.awaitStopped(t, "the step")
+	if stopped.Reason != "step" {
+		t.Errorf("stopped after next with reason %q, want %q", stopped.Reason, "step")
+	}
+	top := s.assertStoppedOn(t, ctx, stopped, stepTargetMarker)
+	t.Logf("next: %q -> %q (delve lines %d -> %d, frame %s)",
+		strings.TrimSpace(s.lines[from-1]), strings.TrimSpace(s.lines[to-1]), from, top.Line, top.Name)
+
+	if filepath.Clean(top.Source.Path) != filepath.Clean(s.file) {
+		t.Errorf("stepped into %q, want to stay in %q", top.Source.Path, s.file)
+	}
+}
+
+// TestLiveDelveVariablesReadsALocal is the oracle that proves the whole
+// inspection CHAIN rather than its transport: stackTrace gives a frame id,
+// scopes turns that into a variables reference, and variables turns that into a
+// value the program actually computed.
+//
+// 🔴 Every link here is one where a wrong id decodes cleanly into the right
+// SHAPE. Passing a thread id where a frame id belongs, or a frame id where a
+// variablesReference belongs, produces variables — just somebody else's. Only
+// asserting a value the program computed (sum == 5, which requires the
+// assignment to have RUN) can tell the difference, which is why the breakpoint
+// for this oracle is on the line after the assignment rather than on it.
+func TestLiveDelveVariablesReadsALocal(t *testing.T) {
+	requireDlv(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
+	defer cancel()
+
+	s := startStoppedSession(t, ctx, stepTargetMarker)
+	top := s.topFrame(t, ctx, s.last)
+	t.Logf("stopped in frame %d (%s) at %s:%d", top.ID, top.Name, filepath.Base(top.Source.Path), top.Line)
+
+	scopes, err := s.client.Scopes(ctx, top.ID)
+	if err != nil {
+		t.Fatalf("scopes(frame %d): %v", top.ID, err)
+	}
+	if len(scopes) == 0 {
+		t.Fatal("a stopped frame reported no scopes at all")
+	}
+	for _, sc := range scopes {
+		t.Logf("scope %q: ref=%d named=%d indexed=%d expensive=%v",
+			sc.Name, sc.VariablesReference, sc.NamedVariables, sc.IndexedVariables, sc.Expensive)
+	}
+
+	// Walk every non-expensive scope looking for the local. Which scope a Go
+	// local lands in is delve's business, not ours, so hardcoding "Locals" would
+	// make this oracle a test of delve's naming rather than of our chain.
+	var found *Variable
+	var seen []string
+	for _, sc := range scopes {
+		if sc.Expensive || sc.VariablesReference == 0 {
+			continue
+		}
+		vars, err := s.client.Variables(ctx, sc.VariablesReference, 0, 200)
+		if err != nil {
+			t.Fatalf("variables(scope %q, ref %d): %v", sc.Name, sc.VariablesReference, err)
+		}
+		for i := range vars {
+			seen = append(seen, fmt.Sprintf("%s.%s=%s", sc.Name, vars[i].Name, vars[i].Value))
+			if vars[i].Name == localName {
+				found = &vars[i]
+			}
+		}
+	}
+	if found == nil {
+		t.Fatalf("no variable named %q in any scope of the stopped frame; saw %v", localName, seen)
+	}
+	t.Logf("variables: %v", seen)
+
+	if found.Value != localValue {
+		t.Fatalf("%s = %q, want %q — the assignment on the previous line had not run, "+
+			"or these are another frame's variables", localName, found.Value, localValue)
+	}
+	if found.Type == "" {
+		t.Errorf("%s came back with no type; supportsVariableType is declared at initialize", localName)
+	}
+	if found.VariablesReference != 0 {
+		t.Errorf("%s is an int and reported children (ref %d)", localName, found.VariablesReference)
+	}
+}

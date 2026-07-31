@@ -535,12 +535,23 @@ func TestDebugKeysAreReachable(t *testing.T) {
 		t.Error("F6 produced no feedback at all")
 	}
 
-	// The reserved stepping keys say so instead of appearing broken.
-	for _, k := range []tcell.Key{tcell.KeyF10, tcell.KeyF11, tcell.KeyF12} {
+	// The three stepping keys each reach their OWN action (stage 3). Asserting
+	// only "something was flashed" would pass with all three wired to the same
+	// method, which is exactly the mistake a shared switch arm invites — so
+	// each refusal names the action it came from.
+	a.debug = nil
+	for _, tc := range []struct {
+		key  tcell.Key
+		want string
+	}{
+		{tcell.KeyF10, "Step over"},
+		{tcell.KeyF11, "Step into"},
+		{tcell.KeyF12, "Step out"},
+	} {
 		a.statusMsg = ""
-		a.handleKey(tcell.NewEventKey(k, 0, tcell.ModNone))
-		if !strings.Contains(a.statusMsg, "next stage") {
-			t.Errorf("key %v said %q, want the reserved-for-stepping note", k, a.statusMsg)
+		a.handleKey(tcell.NewEventKey(tc.key, 0, tcell.ModNone))
+		if !strings.Contains(a.statusMsg, tc.want) {
+			t.Errorf("key %v said %q, want a message naming %q", tc.key, a.statusMsg, tc.want)
 		}
 	}
 }
@@ -887,4 +898,235 @@ func TestDebugLiveEndToEndStopsAndPaints(t *testing.T) {
 		t.Error("the stopped marker survived the program running to completion")
 	}
 	t.Logf("F5 again → ran to completion, marker cleared, status: %q", a.statusMsg)
+}
+
+// TestVariablesCacheDroppedOnStep is the guard for the most dangerous state in
+// the debugger.
+//
+// 🔴 A variablesReference is a HANDLE the adapter allocates for one stop. Once
+// the program runs again the adapter may reuse that number for something else
+// or reject it — so a cache that survived a step would answer with ANOTHER
+// FRAME'S VALUES and no error at all. Plausible and wrong, which is worse than
+// broken: nothing on screen would tell the user the numbers belong to the line
+// they were on before.
+//
+// Both invalidation paths are driven, because they are genuinely different
+// events. `continued` is the adapter resuming; `stopped` is the program landing
+// somewhere new — and a step produces the second with no guarantee of the
+// first. Handling only one leaves a window in which stale references are served.
+func TestVariablesCacheDroppedOnStep(t *testing.T) {
+	populate := func(a *App, path string) {
+		t.Helper()
+		a.debug = &debugSession{
+			adapter: "delve", running: true, stopped: true, threadID: 1,
+			bound: map[string][]boundBreakpoint{},
+		}
+		a.handleDebugStopped(&debugStoppedEvent{
+			when: time.Now(), path: path, line: 5, frame: "main.add", reason: "breakpoint", threadID: 1,
+			frames: []debugFrame{{ID: 1000, Name: "main.add", Path: path, Line: 5}},
+		})
+		// Through the REAL write path, not by poking the map: a cache written
+		// somewhere this test does not know about would not be dropped either.
+		a.handleDebugVars(&debugVarsEvent{
+			when: time.Now(), title: "Variables — main.add", ref: 1000,
+			page: debugVarPage{vars: []debugVar{{Name: "sum", Value: "5", Type: "int"}}},
+		})
+		a.closePalette()
+		if len(a.debug.varCache) != 1 {
+			t.Fatalf("precondition: varCache holds %d entries, want the one just fetched", len(a.debug.varCache))
+		}
+		if len(a.debug.frames) != 1 {
+			t.Fatalf("precondition: frames = %v", a.debug.frames)
+		}
+	}
+
+	assertNothingStale := func(a *App, after string) {
+		t.Helper()
+		if len(a.debug.varCache) != 0 {
+			t.Errorf("after %s the variables cache still holds %d reference(s): %v — "+
+				"the next expansion would show another frame's values with no error",
+				after, len(a.debug.varCache), a.debug.varCache)
+		}
+		if len(a.debug.frames) != 0 {
+			t.Errorf("after %s the frame list survived: %v — its frame ids are dead handles too",
+				after, a.debug.frames)
+		}
+		if a.debug.curFrame != 0 {
+			t.Errorf("after %s curFrame is %d, indexing a frame list that no longer exists", after, a.debug.curFrame)
+		}
+	}
+
+	// --- the adapter resumed on its own -----------------------------------
+	a, path := debugFixture(t)
+	populate(a, path)
+	a.handleDAPEvent(&debugEvent{when: time.Now(), ev: dap.Event{Type: dap.TypeEvent, Event: dap.EventContinued}})
+	assertNothingStale(a, "a continued event")
+
+	// --- the program landed somewhere new ---------------------------------
+	a, path = debugFixture(t)
+	populate(a, path)
+	body, _ := json.Marshal(dap.StoppedEvent{Reason: "step", ThreadID: 1})
+	a.handleDAPEvent(&debugEvent{when: time.Now(), ev: dap.Event{
+		Type: dap.TypeEvent, Event: dap.EventStopped, Body: body,
+	}})
+	assertNothingStale(a, "a stopped event")
+
+	// --- and an UNREADABLE stopped event, which returns early --------------
+	// The program still ran to produce it, so the drop must happen before any
+	// error path bails out.
+	a, path = debugFixture(t)
+	populate(a, path)
+	a.handleDAPEvent(&debugEvent{when: time.Now(), ev: dap.Event{
+		Type: dap.TypeEvent, Event: dap.EventStopped, Body: json.RawMessage(`{"threadId":"not a number"}`),
+	}})
+	assertNothingStale(a, "an unreadable stopped event")
+
+	// --- a step command clears it before the request even goes out ---------
+	a, path = debugFixture(t)
+	populate(a, path)
+	a.debug.client = fakeAdapterClient(t)
+	a.menuDebugStepOver()
+	assertNothingStale(a, "issuing a step")
+}
+
+// TestStoppingRecordsTheWholeStack pins that the frames travel WITH the stop.
+// Fetching them later would mean the call stack picker could describe a moment
+// other than the one the ▶ is painted for.
+func TestStoppingRecordsTheWholeStack(t *testing.T) {
+	a, path := debugFixture(t)
+	a.debug = &debugSession{adapter: "delve", running: true, bound: map[string][]boundBreakpoint{}}
+	a.handleDebugStopped(&debugStoppedEvent{
+		when: time.Now(), path: path, line: 5, frame: "main.add", reason: "breakpoint", threadID: 1,
+		frames: []debugFrame{
+			{ID: 1000, Name: "main.add", Path: path, Line: 5},
+			{ID: 1001, Name: "main.main", Path: path, Line: 10},
+		},
+	})
+	if len(a.debug.frames) != 2 {
+		t.Fatalf("frames = %v, want both", a.debug.frames)
+	}
+	if a.debug.curFrame != 0 {
+		t.Errorf("curFrame = %d, want the innermost frame on a fresh stop", a.debug.curFrame)
+	}
+	f, ok := a.currentFrame()
+	if !ok || f.ID != 1000 {
+		t.Errorf("currentFrame = %+v ok=%v, want the innermost", f, ok)
+	}
+}
+
+// TestDebugLiveSteppingAndVariables is the definition of done for Lane B stage
+// 3, driven through the REAL editor against a REAL delve:
+//
+//	F5 stops on the breakpoint → F10 advances one line → the variables
+//	picker reads the local the program just computed.
+//
+// 🔴 Why this exists on top of internal/dap's live oracles and the simulated app
+// tests above. Those prove the protocol client can step and read variables, and
+// that the pickers render what they are handed. Neither proves the WIRING:
+// that F10 reaches menuDebugStepOver rather than the old "reserved" flash, that
+// the stopped event a step produces travels back through fetchStack and repaints
+// the ▶, that the frame id handed to scopes() belongs to the frame on screen, or
+// that the value shown is the one the program computed. Every one of those is a
+// place this stage could be complete and still not work — and this fork has
+// shipped exactly that failure three times.
+//
+// The step's destination is checked by the TEXT of the line, never its number.
+func TestDebugLiveSteppingAndVariables(t *testing.T) {
+	requireDlvForApp(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module appfixture\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "main.go")
+	src := "package main\n\nimport \"fmt\"\n\nfunc add(a, b int) int {\n\tsum := a + b\n\treturn sum\n}\n\nfunc main() {\n\tfmt.Println(add(2, 3))\n}\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newTestApp(t, dir)
+	a.openFile(path)
+	t.Cleanup(a.stopDebugSession)
+
+	const bpLine = 5 // `sum := a + b`, verified by text below
+	if got := a.activeTabPtr().LineText(bpLine); !strings.Contains(got, "sum := a + b") {
+		t.Fatalf("fixture line %d is %q", bpLine, got)
+	}
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: bpLine, Col: 0}, false)
+	a.handleKey(tcell.NewEventKey(tcell.KeyF9, 0, tcell.ModNone))
+	a.syncBreakpoints()
+
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+	if !pumpEvents(t, a, 180*time.Second, func() bool {
+		return a.debug != nil && a.debug.stopped && len(a.debug.frames) > 0
+	}) {
+		t.Fatalf("the program never stopped on the breakpoint; last status %q", a.statusMsg)
+	}
+	t.Logf("F5 → %s", a.debugStatus())
+
+	// --- F10 steps over ---------------------------------------------------
+	a.handleKey(tcell.NewEventKey(tcell.KeyF10, 0, tcell.ModNone))
+	if !pumpEvents(t, a, 60*time.Second, func() bool {
+		return a.debug != nil && a.debug.stopped && a.debug.line != bpLine
+	}) {
+		t.Fatalf("F10 did not move execution; still at %s (status %q)", a.debugStatus(), a.statusMsg)
+	}
+	a.draw()
+
+	stoppedText := a.activeTabPtr().LineText(a.debug.line)
+	if !strings.Contains(stoppedText, "return sum") {
+		t.Fatalf("after F10 the program is on line %d whose text is %q, want the next statement `return sum`",
+			a.debug.line+1, stoppedText)
+	}
+	if got := gutterRuneAt(t, a, a.debug.line); got != '▶' {
+		t.Errorf("the ▶ did not follow the step: gutter on the new line is %q", got)
+	}
+	if got := gutterRuneAt(t, a, bpLine); got == '▶' {
+		t.Error("the ▶ is still painted on the line the program has left")
+	}
+	if got := a.activeTabPtr().Cursor.Line; got != a.debug.line {
+		t.Errorf("the cursor is on line %d, not the stopped line %d", got, a.debug.line)
+	}
+	t.Logf("F10 → %s · %q", a.debugStatus(), strings.TrimSpace(stoppedText))
+
+	// --- the call stack names where we are --------------------------------
+	a.menuDebugStack()
+	if !a.paletteOpen {
+		t.Fatalf("the call stack picker did not open; status %q", a.statusMsg)
+	}
+	stack := paletteLabels(a)
+	if len(stack) < 2 {
+		t.Errorf("call stack has %d frames, want main.add and its caller: %v", len(stack), stack)
+	}
+	if !strings.Contains(stack[0], "main.add") {
+		t.Errorf("innermost frame = %q, want main.add", stack[0])
+	}
+	t.Logf("call stack: %v", stack)
+	a.closePalette()
+
+	// --- variables read the local the program just computed ----------------
+	// 🔴 The assertion is on the VALUE. `sum` exists at all only because the
+	// assignment ran, and it is 5 only if these are this frame's variables.
+	a.menuDebugVariables()
+	if !pumpEvents(t, a, 60*time.Second, func() bool { return a.paletteOpen }) {
+		t.Fatalf("the variables picker never opened; status %q", a.statusMsg)
+	}
+	vars := paletteLabels(a)
+	t.Logf("variables: %v", vars)
+	found := false
+	for _, v := range vars {
+		if v == "sum = 5" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no row reading %q in the variables picker: %v", "sum = 5", vars)
+	}
+	a.closePalette()
+
+	// --- and the console holds what the program printed --------------------
+	a.menuDebugStop()
+	if a.debug != nil {
+		t.Fatal("Stop left the session in place")
+	}
 }

@@ -281,22 +281,23 @@ func builtinMenuGroups() [][]menuItemDef {
 		{
 			{shortcut: "Esc t", action: (*App).menuToggleSidebar, enabled: alwaysTrue, labelFor: (*App).sidebarToggleLabel, visible: (*App).hasTree},
 		},
-		// Debug (fork, Lane B stages 1 and 2) — edit-tracking breakpoint marks,
-		// plus a real adapter that runs the program and stops on them. Export
-		// still renders `break file:line` for driving dlv/pdb/gdb by hand.
+		// Debug (fork, Lane B stages 1-3) — edit-tracking breakpoint marks, a
+		// real adapter that runs the program and stops on them, and everything
+		// you do once it has stopped. Export still renders `break file:line`
+		// for driving dlv/pdb/gdb by hand.
 		//
-		// The F5/Stop rows lead the group because they are the actions a user
-		// reaches for during a session, and because the menu is the guaranteed
-		// path to them on a terminal that swallows function keys.
-		{
-			{shortcut: "F5", action: (*App).menuDebugStartOrContinue, enabled: (*App).canStartOrContinueDebug, labelFor: (*App).debugStartLabel},
-			{label: "Stop debugging", action: (*App).menuDebugStop, enabled: (*App).hasDebugSession},
-			{label: "Toggle breakpoint", shortcut: "Esc 9 / F9", action: (*App).menuToggleBreakpoint, enabled: (*App).hasBreakpointableTab},
-			{label: "Toggle breakpoint enabled", action: (*App).menuToggleBreakpointEnabled, enabled: (*App).hasBreakpointableTab},
-			{label: "List breakpoints", shortcut: "Esc 5", action: (*App).menuListBreakpoints, enabled: (*App).hasBreakpoints},
-			{label: "Clear breakpoints", action: (*App).menuClearBreakpoints, enabled: (*App).hasBreakpoints},
-			{label: "Export breakpoints (dlv)", action: (*App).menuExportBreakpoints, enabled: (*App).hasBreakpoints},
-		},
+		// 🔴 The rows themselves live in debugMenuGroup() (debugview.go) rather
+		// than inline here, because they have TWO consumers: this menu and the
+		// Esc 5 debug picker. A second hand-written copy in the picker would be
+		// a second thing to forget, and the symptom would be an action that
+		// exists on one surface and not the other.
+		//
+		// The picker's own row is appended here rather than being inside the
+		// group, so the picker cannot list itself.
+		append(debugMenuGroup(), menuItemDef{
+			label: "Debug actions", shortcut: "Esc 5",
+			action: (*App).menuDebugPicker, enabled: alwaysTrue,
+		}),
 		// Quit
 		{
 			{label: "Quit editor", shortcut: "Esc q", action: (*App).menuQuit, enabled: alwaysTrue},
@@ -626,11 +627,11 @@ type App struct {
 	bookmarks     []bookmark
 	bookmarkIndex int
 
-	// Breakpoints (fork, Lane B stage 1) — Esc 9 toggles, Esc 5 lists. NO
-	// debug adapter behind this: an edit-tracking, exportable mark, kept
-	// current by syncBreakpoints (see breakpoints.go) from the same polled
-	// call site as active/openRequest below. bpStore is nil-safe and swallows
-	// its own failures, matching state.Publisher's contract.
+	// Breakpoints (fork, Lane B stage 1) — Esc 9 toggles, the Esc 5 debug
+	// picker lists. NO debug adapter behind this: an edit-tracking, exportable
+	// mark, kept current by syncBreakpoints (see breakpoints.go) from the same
+	// polled call site as active/openRequest below. bpStore is nil-safe and
+	// swallows its own failures, matching state.Publisher's contract.
 	breakpoints []Breakpoint
 	bpStore     *state.BreakpointStore
 
@@ -641,6 +642,11 @@ type App struct {
 	// that never debugs pays nothing. See debug.go.
 	debug  *debugSession
 	dapReg *dap.Registry
+
+	// lastDebugOutput survives the session that produced it (fork, Lane B stage
+	// 3), so the debug console can be read AFTER the program exits — which is
+	// when you most want it. Cleared when the next run starts. See debugview.go.
+	lastDebugOutput []string
 
 	finderOpen     bool
 	finderQuery    []rune
@@ -1032,6 +1038,10 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleDebugStopped(e)
 	case *debugLogEvent:
 		a.flash(e.msg)
+	case *debugVarsEvent:
+		a.handleDebugVars(e)
+	case *debugThreadsEvent:
+		a.handleDebugThreads(e)
 	case *completionEvent:
 		a.handleCompletion(e)
 	case *referencesEvent:
@@ -1464,7 +1474,7 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 		return
 	}
 
-	// Debug keys (fork, Lane B stage 2), same placement and for the same
+	// Debug keys (fork, Lane B stages 2 and 3), same placement and for the same
 	// reasons as F8 above: after every modal guard, so an open prompt still
 	// owns the keyboard, and before the Esc block, since an F-key is not
 	// KeyRune and could never reach the leader table anyway.
@@ -1484,11 +1494,14 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 	case tcell.KeyF9:
 		a.menuToggleBreakpoint()
 		return
-	case tcell.KeyF10, tcell.KeyF11, tcell.KeyF12:
-		// Reserved for stepping in stage 3. Bound to an explanation rather
-		// than left unhandled, so pressing the key a debugger user reaches
-		// for first says what it will do instead of appearing broken.
-		a.flash("Stepping arrives in the next stage — F5 continues, F6 pauses")
+	case tcell.KeyF10:
+		a.menuDebugStepOver()
+		return
+	case tcell.KeyF11:
+		a.menuDebugStepIn()
+		return
+	case tcell.KeyF12:
+		a.menuDebugStepOut()
 		return
 	}
 

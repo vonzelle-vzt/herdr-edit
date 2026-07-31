@@ -710,6 +710,274 @@ func TestShortSocketPathFitsTheAFUnixLimit(t *testing.T) {
 	t.Logf("t.TempDir() socket path would be %d bytes: %s", len(tooLong), tooLong)
 }
 
+// TestSteppingRequestsAreSpelledCorrectly pins the three step commands' wire
+// spelling and their argument.
+//
+// 🔴 The names are camelCase and the protocol has no tolerance for a miss:
+// "stepin" or "step_in" comes back as an unknown-command error, and the app
+// surfaces that on a status line the user has probably stopped reading. Worse,
+// each of them takes a threadId and NOT a frameId, and an adapter handed a
+// frame id where a thread id belongs steps some other goroutine.
+func TestSteppingRequestsAreSpelledCorrectly(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+
+	for _, tc := range []struct {
+		command string
+		call    func(context.Context) error
+	}{
+		{"next", func(ctx context.Context) error { return c.Next(ctx, 17) }},
+		{"stepIn", func(ctx context.Context) error { return c.StepIn(ctx, 17) }},
+		{"stepOut", func(ctx context.Context) error { return c.StepOut(ctx, 17) }},
+		{"pause", func(ctx context.Context) error { return c.Pause(ctx, 17) }},
+	} {
+		done := make(chan error, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+		go func() { done <- tc.call(ctx) }()
+
+		req := f.readRequest()
+		if req.Command != tc.command {
+			t.Errorf("request command = %q, want %q", req.Command, tc.command)
+		}
+		args, _ := json.Marshal(req.Arguments)
+		var got threadArgs
+		if err := json.Unmarshal(args, &got); err != nil {
+			t.Fatalf("%s arguments: %v (raw %s)", tc.command, err, args)
+		}
+		if got.ThreadID != 17 {
+			t.Errorf("%s carried threadId %d, want 17 (raw %s)", tc.command, got.ThreadID, args)
+		}
+		f.respond(req, struct{}{})
+		if err := <-done; err != nil {
+			t.Errorf("%s: %v", tc.command, err)
+		}
+		cancel()
+	}
+}
+
+// TestScopesAndVariablesCarryTheRightHandles pins that scopes takes a frameId
+// and variables takes a variablesReference — two integers that are freely
+// interchangeable as far as the wire is concerned, and whose confusion produces
+// a plausible wrong answer rather than an error.
+func TestScopesAndVariablesCarryTheRightHandles(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	type result struct {
+		scopes []Scope
+		vars   []Variable
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sc, err := c.Scopes(ctx, 1004)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		v, err := c.Variables(ctx, sc[0].VariablesReference, 0, 200)
+		done <- result{scopes: sc, vars: v, err: err}
+	}()
+
+	req := f.readRequest()
+	if req.Command != "scopes" {
+		t.Fatalf("first request = %q, want scopes", req.Command)
+	}
+	raw, _ := json.Marshal(req.Arguments)
+	if !contains(string(raw), `"frameId":1004`) {
+		t.Errorf("scopes arguments = %s, want frameId 1004", raw)
+	}
+	f.respond(req, scopesBody{Scopes: []Scope{{Name: "Locals", VariablesReference: 1000}}})
+
+	req = f.readRequest()
+	if req.Command != "variables" {
+		t.Fatalf("second request = %q, want variables", req.Command)
+	}
+	raw, _ = json.Marshal(req.Arguments)
+	if !contains(string(raw), `"variablesReference":1000`) {
+		t.Errorf("variables arguments = %s, want the SCOPE's reference 1000, not the frame id", raw)
+	}
+	f.respond(req, variablesBody{Variables: []Variable{{Name: "sum", Value: "5", Type: "int"}}})
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("chain: %v", res.err)
+	}
+	if len(res.vars) != 1 || res.vars[0].Name != "sum" || res.vars[0].Value != "5" {
+		t.Errorf("variables = %+v", res.vars)
+	}
+}
+
+// TestVariablePagingIsOnlySentWhenTheAdapterSupportsIt is the gate's oracle,
+// driven from BOTH sides.
+//
+// 🔴 Sending start/count to an adapter without supportsVariablePaging is not a
+// harmless extra: it IGNORES them rather than refusing, so the client would
+// believe it had bounded an answer it had not — and delve is exactly that
+// adapter (measured: it omits the capability). A test that only checked the
+// supported case would leave the dangerous half unmeasured.
+func TestVariablePagingIsOnlySentWhenTheAdapterSupportsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		paging  bool
+		wantKey bool
+	}{
+		{"adapter without paging (delve)", false, false},
+		{"adapter with paging", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, f := newFakePair(t, Handlers{})
+			defer stopFake(c, f)
+
+			c.mu.Lock()
+			c.caps = Capabilities{SupportsVariablePaging: tc.paging}
+			c.mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, err := c.Variables(ctx, 1000, 0, 200)
+				done <- err
+			}()
+
+			req := f.readRequest()
+			raw, _ := json.Marshal(req.Arguments)
+			if got := contains(string(raw), `"count":200`); got != tc.wantKey {
+				t.Errorf("arguments %s carried count=%v, want %v", raw, got, tc.wantKey)
+			}
+			f.respond(req, variablesBody{})
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestStopFallsBackToDisconnectWithoutTerminateSupport is the guard for the
+// measured delve behaviour: supportsTerminateRequest is ABSENT from its
+// capabilities, so a stop wired straight to `terminate` would come back as an
+// unknown command — the editor would drop the session, the debugged process
+// would keep running, and nothing on screen would say so.
+func TestStopFallsBackToDisconnectWithoutTerminateSupport(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+
+	// No capabilities at all: exactly what delve reports for this one.
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.TerminateOrDisconnect(ctx) }()
+
+	req := f.readRequest()
+	if req.Command != "disconnect" {
+		t.Fatalf("request = %q, want disconnect — terminate is not supported here", req.Command)
+	}
+	raw, _ := json.Marshal(req.Arguments)
+	if !contains(string(raw), `"terminateDebuggee":true`) {
+		t.Errorf("disconnect arguments = %s, want terminateDebuggee true or the debuggee outlives us", raw)
+	}
+	f.respond(req, struct{}{})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	stopFake(c, f)
+}
+
+// TestTerminateIsUsedWhenAdvertised covers the other branch, and it is why
+// isShutdownCommand exempts terminate as well as disconnect.
+//
+// 🔴 Stop marks the client closed BEFORE asking it to end the debuggee. With
+// only disconnect exempt from that guard, terminate would be refused by our own
+// code, silently fall through to disconnect, and appear to work — leaving the
+// polite path permanently unreachable while still looking tested.
+func TestTerminateIsUsedWhenAdvertised(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+
+	c.mu.Lock()
+	c.caps = Capabilities{SupportsTerminateRequest: true}
+	c.closed = true // as Stop leaves it
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.TerminateOrDisconnect(ctx) }()
+
+	req := f.readRequest()
+	if req.Command != "terminate" {
+		t.Fatalf("request = %q, want terminate for an adapter that advertises it", req.Command)
+	}
+	f.respond(req, struct{}{})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	stopFake(c, f)
+}
+
+// TestTerminateRefusalStillKillsTheDebuggee pins the fall-through: an adapter
+// may advertise terminate and still refuse a particular one, and "we asked
+// nicely and it said no" must not be the end of the story when a live process
+// is at stake.
+func TestTerminateRefusalStillKillsTheDebuggee(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+
+	c.mu.Lock()
+	c.caps = Capabilities{SupportsTerminateRequest: true}
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.TerminateOrDisconnect(ctx) }()
+
+	req := f.readRequest()
+	if req.Command != "terminate" {
+		t.Fatalf("first request = %q, want terminate", req.Command)
+	}
+	f.seq++
+	f.write(Response{
+		Seq: f.seq, Type: TypeResponse, RequestSeq: req.Seq,
+		Success: false, Command: "terminate", Message: "not right now",
+	})
+
+	req = f.readRequest()
+	if req.Command != "disconnect" {
+		t.Fatalf("after a refused terminate the request was %q, want disconnect", req.Command)
+	}
+	f.respond(req, struct{}{})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	stopFake(c, f)
+}
+
+// TestInitializeClaimsOnlyWhatWeHonour pins the capability declaration.
+//
+// Claiming supportsRunInTerminalRequest would make an adapter send US a request
+// it then blocks on, and nothing here answers a reverse request. The other two
+// are claimed because stage 3 genuinely reads them — and NOT claiming
+// supportsVariableType would entitle an adapter to omit the type attribute, so
+// the variables picker would show no types and look like the adapter did not
+// know them.
+func TestInitializeClaimsOnlyWhatWeHonour(t *testing.T) {
+	args := initializeArgsForClient("go")
+	if !args.SupportsVariableType {
+		t.Error("supportsVariableType is not claimed, but the variables picker reads Variable.Type")
+	}
+	if !args.SupportsVariablePaging {
+		t.Error("supportsVariablePaging is not claimed, but Variables sends start/count")
+	}
+	if args.SupportsRunInTerminalRequest {
+		t.Error("supportsRunInTerminalRequest is claimed; nothing here answers a reverse request")
+	}
+	if !args.LinesStartAt1 || !args.ColumnsStartAt1 {
+		t.Error("the 1-based declaration this package's whole coordinate contract rests on is missing")
+	}
+}
+
 // contains is a tiny substring helper so assertions read as prose.
 func contains(hay, needle string) bool {
 	for i := 0; i+len(needle) <= len(hay); i++ {

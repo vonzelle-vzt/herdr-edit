@@ -104,6 +104,9 @@ internal/app/searchpanel.go   Esc F -> internal/search -> a jumpable synthetic t
 internal/app/problems.go      Diagnostics list + next/prev problem (Esc ; . , and F8)
 internal/app/dochighlight.go  Tint other occurrences of the symbol under the cursor
 internal/app/breakpoints.go   Breakpoint model, persistence, dlv/pdb/gdb export
+internal/dap/                 DAP client — a deliberate SIBLING of internal/lsp, not shared
+internal/app/debug.go         Debug session, DAP events, stopped marker overlay, status
+internal/app/debugview.go     Stepping, call stack, threads, variables, debug console
 internal/app/lspstatus.go     Which language servers are running, in the status bar
 ```
 

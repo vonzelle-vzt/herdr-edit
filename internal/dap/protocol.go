@@ -124,8 +124,25 @@ type Capabilities struct {
 	// SupportsTerminateRequest is ABSENT from delve's answer, so Disconnect
 	// falls back to disconnect{terminateDebuggee:true}. Reading this before
 	// choosing how to shut down is the difference between killing the debuggee
-	// and leaking it.
+	// and leaking it. TerminateOrDisconnect is the one place that decides.
 	SupportsTerminateRequest bool `json:"supportsTerminateRequest"`
+
+	// SupportsVariablePaging decides whether a variables request may carry
+	// start/count.
+	//
+	// 🔴 MEASURED: delve 1.27 answers this ABSENT, exactly like
+	// supportsTerminateRequest — the live oracle logs
+	// `variablePaging=false`. So against the one adapter this fork ships,
+	// start/count are NEVER sent and the request always returns the entire
+	// collection. That makes the CALLER's cap the only thing standing between a
+	// []byte of a million elements and a million decoded, allocated picker rows;
+	// it is load-bearing, not a belt-and-braces second line of defence. See
+	// maxDebugVariables in internal/app.
+	//
+	// Sending the window anyway would be worse than useless: an adapter without
+	// paging support IGNORES start/count silently rather than refusing, so the
+	// client would believe it had bounded an answer it had not.
+	SupportsVariablePaging bool `json:"supportsVariablePaging"`
 
 	ExceptionBreakpointFilters []ExceptionBreakpointFilter `json:"exceptionBreakpointFilters"`
 }
@@ -228,10 +245,20 @@ type initializeArgs struct {
 	ColumnsStartAt1 bool   `json:"columnsStartAt1"`
 	PathFormat      string `json:"pathFormat"`
 
-	// We do not implement variable paging, run-in-terminal, or progress
-	// reporting, so we do not claim them. supportsRunInTerminalRequest in
-	// particular makes an adapter send us a request it then BLOCKS on.
+	// What we claim here is exactly what we honour, and no more.
+	//
+	// SupportsVariableType and SupportsVariablePaging became true in stage 3,
+	// when a variables picker arrived that reads Variable.Type and sends
+	// start/count. Claiming a capability we ignore invites traffic we then drop
+	// on the floor; NOT claiming one we do use is the mirror mistake, and it is
+	// the quieter of the two — an adapter is entitled to omit the `type`
+	// attribute from a client that never said it could read one, so the picker
+	// would simply show no types and look like the adapter did not know them.
+	//
+	// supportsRunInTerminalRequest stays false: it makes an adapter send US a
+	// request it then BLOCKS on, and nothing here answers a reverse request.
 	SupportsVariableType         bool `json:"supportsVariableType"`
+	SupportsVariablePaging       bool `json:"supportsVariablePaging"`
 	SupportsRunInTerminalRequest bool `json:"supportsRunInTerminalRequest"`
 }
 
@@ -321,6 +348,85 @@ type stackTraceArgs struct {
 type stackTraceBody struct {
 	StackFrames []StackFrame `json:"stackFrames"`
 	TotalFrames int          `json:"totalFrames,omitempty"`
+}
+
+// Scope is one named group of variables belonging to a stack frame —
+// "Arguments", "Locals", "Globals" for delve.
+//
+// 🔴 VariablesReference is a HANDLE, not an identifier: it is allocated by the
+// adapter for one stop and is valid only until the program runs again. See
+// Client.Variables for what that costs a caller who caches it.
+//
+// Expensive means "do not fetch this without being asked". Delve marks Globals
+// expensive because a package's globals can be enormous, and a client that
+// eagerly walked every scope on every stop would turn each step into that fetch.
+type Scope struct {
+	Name               string `json:"name"`
+	VariablesReference int    `json:"variablesReference"`
+	NamedVariables     int    `json:"namedVariables,omitempty"`
+	IndexedVariables   int    `json:"indexedVariables,omitempty"`
+	Expensive          bool   `json:"expensive"`
+}
+
+// Total is how many variables the adapter says this scope holds, or 0 when it
+// did not say. Used to report an honest "showing the first N of M" rather than
+// silently capping.
+func (s Scope) Total() int { return s.NamedVariables + s.IndexedVariables }
+
+// Variable is one variable, argument or field.
+//
+// Value is already rendered by the adapter — it is display text, not something
+// to parse. A non-zero VariablesReference means the value has children (a
+// struct, slice, map or pointer) and can be expanded by asking for that
+// reference; zero means it is a leaf.
+type Variable struct {
+	Name               string `json:"name"`
+	Value              string `json:"value"`
+	Type               string `json:"type,omitempty"`
+	EvaluateName       string `json:"evaluateName,omitempty"`
+	VariablesReference int    `json:"variablesReference"`
+	NamedVariables     int    `json:"namedVariables,omitempty"`
+	IndexedVariables   int    `json:"indexedVariables,omitempty"`
+}
+
+// Total is how many children the adapter says this variable has, or 0 when it
+// did not say — the same contract as Scope.Total.
+func (v Variable) Total() int { return v.NamedVariables + v.IndexedVariables }
+
+// scopesArgs asks for one frame's scopes.
+type scopesArgs struct {
+	FrameID int `json:"frameId"`
+}
+
+// scopesBody is the answer.
+type scopesBody struct {
+	Scopes []Scope `json:"scopes"`
+}
+
+// variablesArgs asks for the contents of one variables reference.
+//
+// Start and Count carry omitempty so that "no window" is expressed by their
+// absence rather than by a zero the adapter would have to interpret — count:0
+// is a legal request for zero variables in some readings of the spec, and the
+// difference between "give me everything" and "give me nothing" is not
+// something to leave to an adapter's interpretation.
+type variablesArgs struct {
+	VariablesReference int    `json:"variablesReference"`
+	Filter             string `json:"filter,omitempty"`
+	Start              int    `json:"start,omitempty"`
+	Count              int    `json:"count,omitempty"`
+}
+
+// variablesBody is the answer.
+type variablesBody struct {
+	Variables []Variable `json:"variables"`
+}
+
+// terminateArgs asks the debuggee to end politely. Only ever sent to an adapter
+// that advertised supportsTerminateRequest — delve does not. See
+// Client.TerminateOrDisconnect.
+type terminateArgs struct {
+	Restart bool `json:"restart"`
 }
 
 // Thread is one goroutine.
