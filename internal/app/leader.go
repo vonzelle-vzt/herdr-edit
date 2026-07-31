@@ -68,6 +68,12 @@ func leaderBindings() []leaderBinding {
 		{'h', (*App).menuHover},
 		{'d', (*App).menuGoToDefinition},
 		{'z', (*App).menuToggleWrap},
+		// Problems list + next/prev, the VS Code F8 muscle memory. F8 /
+		// Shift+F8 are wired directly in handleKey (not KeyRune, so they
+		// can't go through this table) — these three are the primary path.
+		{';', (*App).menuProblems},
+		{'.', (*App).menuNextProblem},
+		{',', (*App).menuPrevProblem},
 	}
 }
 

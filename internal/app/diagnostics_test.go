@@ -181,7 +181,7 @@ func TestOverlayUnderlinesTheRightCells(t *testing.T) {
 
 	tab := a.activeTabPtr()
 	ex, ey, _, _ := a.editorRect()
-	gut := tab.GutterWidth()
+	gut := tab.GutterWidth() + 1 // contentStart — see ScreenPos's doc comment
 	cells, w, _ := scr.GetContents()
 
 	underlined := func(col int) bool {
@@ -264,7 +264,7 @@ func TestInlineMessageRendersAfterLine(t *testing.T) {
 	// The message must start a couple of columns after the line's own text,
 	// not glued onto it.
 	tab := a.activeTabPtr()
-	gut := tab.GutterWidth()
+	gut := tab.GutterWidth() + 1 // contentStart — see ScreenPos's doc comment
 	lineEnd := ex + gut + tab.LineRuneLen(2)
 	msgStart := strings.Index(row, "undefined: oops")
 	if msgStart < lineEnd-ex+inlineMessageGap {

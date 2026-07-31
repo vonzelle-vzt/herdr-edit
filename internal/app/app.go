@@ -246,6 +246,9 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Find references", shortcut: "Esc j", action: (*App).menuFindReferences, enabled: (*App).hasFileTab},
 			{label: "Rename symbol", shortcut: "Esc y", action: (*App).menuRenameSymbol, enabled: (*App).hasFileTab},
 			{label: "Language server status", action: (*App).menuLSPStatus, enabled: alwaysTrue},
+			{label: "Problems", shortcut: "Esc ;", action: (*App).menuProblems, enabled: (*App).hasProblems},
+			{label: "Next problem", shortcut: "Esc .", action: (*App).menuNextProblem, enabled: (*App).hasProblems},
+			{label: "Previous problem", shortcut: "Esc ,", action: (*App).menuPrevProblem, enabled: (*App).hasProblems},
 			{label: "Toggle bookmark", shortcut: "Esc m", action: (*App).menuToggleBookmark, enabled: (*App).hasFileTab},
 			{label: "Next bookmark", shortcut: "Esc '", action: (*App).menuNextBookmark, enabled: (*App).hasBookmarks},
 			{label: "Clear bookmarks", action: (*App).menuClearBookmarks, enabled: (*App).hasBookmarks},
@@ -578,6 +581,19 @@ type App struct {
 	blameEnabled  bool
 	blameCache    map[blameKey]string
 	blameInflight map[blameKey]bool
+
+	// Document highlight (fork) — ambient tint of every visible occurrence
+	// of the identifier under the cursor, no key of its own. Cached against
+	// (path, sym, ScrollY, height, lineCount) because draw() repaints on
+	// every event including bare mouse motion, and an uncached scan on each
+	// of those would be a stall the user reads as the editor hanging. See
+	// dochighlight.go.
+	docHighlightPath      string
+	docHighlightSym       string
+	docHighlightScrollY   int
+	docHighlightHeight    int
+	docHighlightLineCount int
+	docHighlightMatches   []editor.Match
 
 	// Highest open-request sequence already honoured. See consumeOpenRequest.
 	lastOpenSeq int64
@@ -1374,6 +1390,21 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 	}
 	if a.finderOpen {
 		a.handleFinderKey(ev)
+		return
+	}
+
+	// F8 / Shift+F8 — the VS Code muscle memory for next/prev problem. A
+	// bonus path only: Esc . / Esc , (leader.go) and the command palette
+	// fully cover this feature on their own. Placed here, after every modal
+	// guard above, so an open prompt/confirm/form/etc. still owns the
+	// keyboard; and it isn't KeyRune, so it can never be swallowed by the
+	// Esc-leader dispatch below.
+	if ev.Key() == tcell.KeyF8 {
+		if ev.Modifiers()&tcell.ModShift != 0 {
+			a.menuPrevProblem()
+		} else {
+			a.menuNextProblem()
+		}
 		return
 	}
 
@@ -2729,6 +2760,10 @@ func (a *App) draw() {
 	if tab := a.activeTabPtr(); tab != nil {
 		ex, ey, ew, eh := a.editorRect()
 		tab.Render(a.screen, a.theme, ex, ey, ew, eh)
+		// Document highlight draws BEFORE diagnostics: a squiggle under an actual
+		// mistake must always win the eye over a tint that's just saying "this word
+		// again".
+		a.drawDocumentHighlights()
 		// After Render, so the underline sits on top of the syntax colours rather than being
 		// overwritten by them.
 		a.drawDiagnostics()

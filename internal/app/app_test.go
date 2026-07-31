@@ -1822,18 +1822,23 @@ func TestDrawStatusBar_OmitsBranchWhenEmpty(t *testing.T) {
 // zero custom actions the modal still has seven built-in groups and the
 // height matches the expected layout total. Catches accidental
 // off-by-one regressions when someone tweaks the layout helper.
+//
+// Counts bumped by the Lane A stage 3 "Problems" / "Next problem" /
+// "Previous problem" rows added to the Search group (38 -> 41 items,
+// modalHeight 48 -> 51, and every divider from the Search group onward
+// shifts down by 3).
 func TestMenuLayout_NoCustomActions(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
 	a.customActions = nil
 	items, dividers, h := a.menuLayout()
 
-	if h != 48 {
-		t.Errorf("modalHeight = %d, want 48", h)
+	if h != 51 {
+		t.Errorf("modalHeight = %d, want 51", h)
 	}
-	if got := len(items); got != 38 {
-		t.Errorf("item count = %d, want 38 built-ins", got)
+	if got := len(items); got != 41 {
+		t.Errorf("item count = %d, want 41 built-ins", got)
 	}
-	wantDiv := []int{2, 6, 10, 30, 38, 43, 45}
+	wantDiv := []int{2, 6, 10, 33, 41, 46, 48}
 	if len(dividers) != len(wantDiv) {
 		t.Fatalf("dividers = %v, want %v", dividers, wantDiv)
 	}
@@ -1994,8 +1999,8 @@ func TestMenuLayout_WithCustomActions(t *testing.T) {
 	}
 	items, _, h := a.menuLayout()
 
-	if h != 51 { // 48 + 2 items + 1 divider
-		t.Errorf("modalHeight = %d, want 51", h)
+	if h != 54 { // 51 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
+		t.Errorf("modalHeight = %d, want 54", h)
 	}
 	// Custom actions should be the second-to-last and third-to-last
 	// rows, with Quit as the final row.
