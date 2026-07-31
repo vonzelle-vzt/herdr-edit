@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -142,8 +143,70 @@ func (m *Manager) resolve(s Server) []string {
 		if p, err := exec.LookPath(argv[0]); err == nil {
 			return append([]string{p}, argv[1:]...)
 		}
+		if p := lookInToolDirs(argv[0]); p != "" {
+			return append([]string{p}, argv[1:]...)
+		}
 	}
 	return nil
+}
+
+// lookInToolDirs searches the directories developer tools actually install
+// into, for the case where PATH does not contain them.
+//
+// 🔴 This is not belt-and-braces; without it this editor finds almost no
+// language server at all in its primary environment. herdr's server is started
+// by launchd, so it execs a plugin pane with PATH=/usr/bin:/bin:/usr/sbin:/sbin
+// — measured on a live pane, not assumed. exec.LookPath therefore cannot see
+// /opt/homebrew/bin, ~/.local/bin, ~/go/bin, ~/.cargo/bin or any npm prefix, and
+// clangd (which happens to live in /usr/bin) was the ONLY one of the nine
+// servers in DefaultServers that resolved. Diagnostics, hover, completion and
+// go-to-definition were all silently absent for every other language, which
+// looks like "this editor has no LSP" rather than like a PATH problem.
+//
+// The sibling package hit the same trap in bash and answered it the same way
+// (libexec/debug's find_bin, and the installer's which()). Node is included
+// because an npm -g install lands in the active nvm node's bin directory, which
+// is never on a plugin pane's PATH — so recommending `npm i -g
+// typescript-language-server` without searching there would install a server
+// this editor still could not find.
+func lookInToolDirs(name string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	dirs := []string{"/opt/homebrew/bin", "/usr/local/bin"}
+	if home != "" {
+		dirs = append(dirs,
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, "go", "bin"),
+			filepath.Join(home, ".cargo", "bin"),
+			filepath.Join(home, ".bun", "bin"),
+		)
+	}
+	if gobin := os.Getenv("GOBIN"); gobin != "" {
+		dirs = append(dirs, gobin)
+	}
+	if gopath := os.Getenv("GOPATH"); gopath != "" {
+		dirs = append(dirs, filepath.Join(gopath, "bin"))
+	}
+	// Every installed node version, newest last so it wins: an npm -g install
+	// targets whichever node is active, and we cannot know which that was.
+	if home != "" {
+		if versions, err := filepath.Glob(filepath.Join(home, ".nvm", "versions", "node", "*", "bin")); err == nil {
+			sort.Strings(versions)
+			dirs = append(dirs, versions...)
+		}
+	}
+	found := ""
+	for _, d := range dirs {
+		p := filepath.Join(d, name)
+		fi, err := os.Stat(p)
+		if err != nil || fi.IsDir() || fi.Mode()&0o111 == 0 {
+			continue
+		}
+		found = p // keep going: later entries (newer node) deliberately win
+	}
+	return found
 }
 
 // Available reports which configured servers are actually installed. Used by

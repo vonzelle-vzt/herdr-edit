@@ -9,6 +9,9 @@ package lsp
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -91,5 +94,42 @@ func TestManager_WorkspaceSymbolNoRunningServersIsEmpty(t *testing.T) {
 	}
 	if len(syms) != 0 {
 		t.Errorf("got %d symbols with nothing running, want 0", len(syms))
+	}
+}
+
+// TestResolveFindsServersOutsidePATH pins the regression that made this
+// editor's headline feature invisible in the environment it was built for. A
+// herdr plugin pane is exec'd by a launchd-started server, so it runs with
+// PATH=/usr/bin:/bin:/usr/sbin:/sbin — measured on a live pane. exec.LookPath
+// therefore cannot see ~/go/bin, ~/.cargo/bin, /opt/homebrew/bin or any npm
+// prefix, and clangd was the only one of the nine DefaultServers entries that
+// resolved. Diagnostics were absent for every other language with nothing on
+// screen to explain it.
+func TestResolveFindsServersOutsidePATH(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory")
+	}
+	// A binary that exists in a tool dir but NOT on the minimal PATH.
+	probe := filepath.Join(home, "go", "bin", "gopls")
+	if fi, err := os.Stat(probe); err != nil || fi.IsDir() {
+		t.Skip("gopls is not installed in ~/go/bin; nothing to prove here")
+	}
+	t.Setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+
+	if _, err := exec.LookPath("gopls"); err == nil {
+		t.Fatal("precondition failed: gopls is on the minimal PATH, so this test proves nothing")
+	}
+	m := &Manager{root: t.TempDir()}
+	s, ok := serverFor("go")
+	if !ok {
+		t.Fatal("no server configured for go")
+	}
+	got := m.resolve(s)
+	if got == nil {
+		t.Fatal("resolve found no gopls under the minimal PATH — every LSP feature is dark in a herdr pane")
+	}
+	if got[0] != probe {
+		t.Fatalf("resolve returned %q, want %q", got[0], probe)
 	}
 }
