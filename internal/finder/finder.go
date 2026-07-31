@@ -136,6 +136,27 @@ func (f *Finder) Stats() (State, int, bool) {
 	return f.state, len(f.paths), f.viaGit
 }
 
+// Paths returns a snapshot copy of the cached index — every project-relative
+// path currently known, in the same sorted order BuildIndex produced. Search
+// only ever hands back a scored, capped subset; a whole-workspace scan (see
+// internal/search) needs the raw list instead, so this exists as its own
+// accessor rather than making callers abuse Search("", maxIndexEntries).
+//
+// Returns a copy, not the internal slice, so a caller mutating or holding the
+// result can never race the build goroutine's next f.paths assignment. Nil
+// (rather than a zero-length non-nil slice) before the first successful
+// build, matching Search's own "nothing to show yet" contract.
+func (f *Finder) Paths() []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.paths == nil {
+		return nil
+	}
+	out := make([]string, len(f.paths))
+	copy(out, f.paths)
+	return out
+}
+
 // Result is one scored hit returned by Search. Path is project-
 // relative; MatchedIndexes is the list of rune positions inside
 // Path that matched the query (used by the renderer to highlight

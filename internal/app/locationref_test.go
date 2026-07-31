@@ -101,3 +101,35 @@ func TestStaleDiffSourceDoesNotHijackANonDiffTab(t *testing.T) {
 		t.Fatalf("stale diffSource hijacked the jump: got tab %+v, want a jump to %s", got, referenced)
 	}
 }
+
+// TestLocationRefAtAcceptsATrailingMatchedText pins the property the search
+// results tab depends on: a row that carries the matched text after the
+// location must still parse back to that location, so one row can be both the
+// jump target and its own context. Without this, a results list costs two
+// lines per hit, which halves how many fit in the narrow pane this editor
+// targets. The negative case matters just as much — a line of ordinary code
+// must never be mistaken for a location.
+func TestLocationRefAtAcceptsATrailingMatchedText(t *testing.T) {
+	for _, row := range []string{
+		"internal/app/find.go:89:19: func (a *App) findBarLayout(bx, bw int) findBarLayout {",
+		"internal/app/find.go:89:19",
+		"  internal/app/find.go:89:19: x := 1",
+	} {
+		p, l, c, ok := locationRefAt(row)
+		if !ok {
+			t.Fatalf("locationRefAt(%q) returned ok=false; the row is not jumpable", row)
+		}
+		if p != "internal/app/find.go" || l != 89 || c != 19 {
+			t.Fatalf("locationRefAt(%q) = %q,%d,%d, want internal/app/find.go,89,19", row, p, l, c)
+		}
+	}
+	for _, row := range []string{
+		"for i := 0; i < 10; i++ {",
+		"search: findBar",
+		"",
+	} {
+		if _, _, _, ok := locationRefAt(row); ok {
+			t.Fatalf("locationRefAt(%q) parsed ordinary text as a location", row)
+		}
+	}
+}

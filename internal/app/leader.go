@@ -48,6 +48,7 @@ func leaderBindings() []leaderBinding {
 		{'t', (*App).menuToggleSidebar},
 		{'/', (*App).menuToggleLineComment},
 		{'f', (*App).openFind},
+		{'F', (*App).menuSearchInFiles},
 		{'p', (*App).openFinder},
 		{'g', (*App).menuGoToLine},
 		{'a', (*App).menuSelectAll},

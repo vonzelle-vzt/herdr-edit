@@ -46,13 +46,33 @@ func locationRefAt(row string) (path string, line, col int, ok bool) {
 	if row == "" {
 		return "", 0, 0, false
 	}
-	p, l, c := state.SplitLocation(row)
-	if p == row {
-		// Nothing numeric was trimmed off the end — this line named no
-		// location, whatever else it contains.
-		return "", 0, 0, false
+	if p, l, c, ok := splitLocationStrict(row); ok {
+		return p, l, c, true
 	}
-	if p == "" {
+	// A row may carry the matched text after the location, the way a grep or a
+	// search-results list prints it: "path:line:col: some code". SplitLocation
+	// only strips trailing numeric segments, so the trailing text makes the
+	// last segment non-numeric and the whole parse bails. Retry on the part
+	// before the first ": " — the location prefix never contains a space, so
+	// that separator is unambiguous, and this is what lets one row carry both
+	// the jump target and its context instead of needing two.
+	if i := strings.Index(row, ": "); i > 0 {
+		if p, l, c, ok := splitLocationStrict(row[:i]); ok {
+			return p, l, c, true
+		}
+	}
+	return "", 0, 0, false
+}
+
+// splitLocationStrict is locationRefAt's inner test: it accepts a reference
+// only when SplitLocation actually stripped a numeric suffix. SplitLocation
+// always "succeeds" — it defaults line/col to 1 on ordinary prose — so an
+// unchanged path is what distinguishes a real location row from a line of
+// code or a list header, and returning false is what stops the caller from
+// jumping somewhere arbitrary.
+func splitLocationStrict(s string) (path string, line, col int, ok bool) {
+	p, l, c := state.SplitLocation(s)
+	if p == "" || p == s {
 		return "", 0, 0, false
 	}
 	return p, l, c, true

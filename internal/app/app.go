@@ -238,6 +238,7 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Find in file", shortcut: "Esc f", action: (*App).menuFind, enabled: (*App).hasFindable},
 			{label: "Replace in file", action: (*App).menuReplace, enabled: (*App).hasFindable},
 			{label: "Find file in project", shortcut: "Esc p", action: (*App).menuFindFile, enabled: (*App).hasFinder},
+			{label: "Search in workspace", shortcut: "Esc F", action: (*App).menuSearchInFiles, enabled: (*App).hasSearch},
 			{label: "Run a command", shortcut: "Esc k", action: (*App).menuCommandPalette, enabled: alwaysTrue},
 			{label: "Complete at cursor", shortcut: "Esc space", action: (*App).menuComplete, enabled: (*App).hasFindable},
 			{label: "Go to symbol (outline)", shortcut: "Esc i", action: (*App).menuOutline, enabled: (*App).hasLSPFile},
@@ -986,6 +987,8 @@ func (a *App) handleEvent(ev tcell.Event) {
 		if a.finderOpen {
 			a.refreshFinderResults()
 		}
+	case *searchResultsEvent:
+		a.handleSearchResults(e)
 	}
 }
 
