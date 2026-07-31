@@ -236,7 +236,21 @@ func TestGeneratedDataMatchesTheSource(t *testing.T) {
 	goBin := goToolPath(t)
 	out := filepath.Join(t.TempDir(), "data.go")
 
-	cmd := exec.Command(goBin, "run", "./gen", "-out", out)
+	// 🔴 BUILD the generator, then run the binary. `go run` does NOT propagate the
+	// child's exit code — it reports 1 whatever the program returned — so the
+	// noSourceExit sentinel was unreachable through it and this test FAILED on CI
+	// instead of skipping, in an environment with no VS Code to regenerate from.
+	// TestSkipSentinelMatchesTheGenerator did not catch it: it proved the constant
+	// agreed with the generator, not that the exit code ever reached the caller.
+	bin := filepath.Join(t.TempDir(), "langconfgen")
+	build := exec.Command(goBin, "build", "-o", bin, "./gen")
+	var buildErr bytes.Buffer
+	build.Stderr = &buildErr
+	if err := build.Run(); err != nil {
+		t.Fatalf("building ./gen failed: %v\n%s", err, buildErr.String())
+	}
+
+	cmd := exec.Command(bin, "-out", out)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err := cmd.Run()
@@ -244,7 +258,7 @@ func TestGeneratedDataMatchesTheSource(t *testing.T) {
 		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == noSourceExit {
 			t.Skipf("SKIPPING DRIFT CHECK: no VS Code installation to regenerate from — %s", stderr.String())
 		}
-		t.Fatalf("go run ./gen failed: %v\n%s", err, stderr.String())
+		t.Fatalf("running the generator failed: %v\n%s", err, stderr.String())
 	}
 
 	fresh, err := os.ReadFile(out)
