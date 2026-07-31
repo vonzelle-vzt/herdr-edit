@@ -242,6 +242,7 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Run a command", shortcut: "Esc k", action: (*App).menuCommandPalette, enabled: alwaysTrue},
 			{label: "Complete at cursor", shortcut: "Esc space", action: (*App).menuComplete, enabled: (*App).hasFindable},
 			{label: "Go to symbol (outline)", shortcut: "Esc i", action: (*App).menuOutline, enabled: (*App).hasLSPFile},
+			{label: "Go to symbol in workspace", shortcut: "Esc I", action: (*App).menuWorkspaceSymbol, enabled: alwaysTrue},
 			{label: "Fix at cursor", shortcut: "Esc l", action: (*App).menuCodeActions, enabled: (*App).hasLSPFile},
 			{label: "Find references", shortcut: "Esc j", action: (*App).menuFindReferences, enabled: (*App).hasFileTab},
 			{label: "Rename symbol", shortcut: "Esc y", action: (*App).menuRenameSymbol, enabled: (*App).hasFileTab},
@@ -984,6 +985,8 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleReferences(e)
 	case *symbolsEvent:
 		a.handleSymbols(e)
+	case *workspaceSymbolsEvent:
+		a.handleWorkspaceSymbols(e)
 	case *codeActionsEvent:
 		a.handleCodeActions(e)
 	case *renameEvent:

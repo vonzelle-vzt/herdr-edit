@@ -489,7 +489,14 @@ func symbols(raw json.RawMessage) []Symbol {
 			Name     string `json:"name"`
 			Kind     int    `json:"kind"`
 			Location struct {
-				Range Range `json:"range"`
+				URI string `json:"uri"`
+				// json.RawMessage, not Range: LSP 3.17 allows a WorkspaceSymbol
+				// location of bare {uri}, with no "range" at all. Decoding
+				// straight into Range would silently give it the zero value —
+				// indistinguishable from a real line 0, and displaying that as
+				// "line 1" is the exact documentSymbol shape bug this file
+				// already guards against, just against a different field.
+				Range json.RawMessage `json:"range"`
 			} `json:"location"`
 		}
 		if err := json.Unmarshal(raw, &flat); err != nil {
@@ -499,7 +506,18 @@ func symbols(raw json.RawMessage) []Symbol {
 			if it.Name == "" {
 				continue
 			}
-			out = append(out, Symbol{Name: it.Name, Kind: it.Kind, Line: it.Location.Range.Start.Line})
+			sym := Symbol{Name: it.Name, Kind: it.Kind, URI: it.Location.URI}
+			if len(it.Location.Range) == 0 || string(it.Location.Range) == "null" {
+				sym.LineUnknown = true
+			} else {
+				var rng Range
+				if err := json.Unmarshal(it.Location.Range, &rng); err == nil {
+					sym.Line = rng.Start.Line
+				} else {
+					sym.LineUnknown = true
+				}
+			}
+			out = append(out, sym)
 		}
 		return out
 	}

@@ -117,6 +117,26 @@ func runFakeServer(mode string) {
 				}},
 			})
 
+		case "workspace/symbol":
+			if mode == "workspace-symbol-error" {
+				write(map[string]interface{}{
+					"jsonrpc": "2.0", "id": req.ID,
+					"error": map[string]interface{}{"code": -32601, "message": "boom"},
+				})
+				continue
+			}
+			write(map[string]interface{}{
+				"jsonrpc": "2.0", "id": req.ID,
+				"result": []map[string]interface{}{{
+					"name": "FakeHandler",
+					"kind": 12,
+					"location": map[string]interface{}{
+						"uri":   "file:///proj/handler.ts",
+						"range": map[string]interface{}{"start": map[string]int{"line": 3, "character": 0}, "end": map[string]int{"line": 3, "character": 11}},
+					},
+				}},
+			})
+
 		case "shutdown":
 			write(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": nil})
 		case "exit":
@@ -217,6 +237,31 @@ func TestHoverAndDefinitionRoundTrip(t *testing.T) {
 	}
 	if p := PathFromURI(locs[0].URI); p != "/defined/here.ts" {
 		t.Fatalf("definition path = %q", p)
+	}
+}
+
+// TestClient_WorkspaceSymbol exercises the request/response path for
+// workspace/symbol, which — unlike documentSymbol — is a project-wide search
+// with no file argument at all.
+func TestClient_WorkspaceSymbol(t *testing.T) {
+	argv := withHelper(t, "ok")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := Start(ctx, "fake", argv, URI(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+
+	syms, err := c.WorkspaceSymbol(ctx, "Handler")
+	if err != nil {
+		t.Fatalf("WorkspaceSymbol: %v", err)
+	}
+	if len(syms) != 1 {
+		t.Fatalf("got %d symbols, want 1", len(syms))
+	}
+	if syms[0].Name != "FakeHandler" || syms[0].URI != "file:///proj/handler.ts" || syms[0].Line != 3 {
+		t.Errorf("symbol = %+v", syms[0])
 	}
 }
 

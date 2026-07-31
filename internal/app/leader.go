@@ -58,6 +58,7 @@ func leaderBindings() []leaderBinding {
 		{'o', (*App).menuOpenChanges},
 		{'e', (*App).menuGoToLocation},
 		{'i', (*App).menuOutline},
+		{'I', (*App).menuWorkspaceSymbol},
 		{'l', (*App).menuCodeActions},
 		{'j', (*App).menuFindReferences},
 		{'y', (*App).menuRenameSymbol},

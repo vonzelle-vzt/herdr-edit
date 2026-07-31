@@ -205,6 +205,48 @@ func TestLive_DocumentSymbol(t *testing.T) {
 	}
 }
 
+// TestLive_WorkspaceSymbol is the strongest oracle for the workspace-wide
+// go-to-symbol feature: a decoder test only proves symbols() handles JSON we
+// wrote ourselves, not that gopls actually answers workspace/symbol, that our
+// request is spelled the way it expects, or that the capability we advertise
+// in initialize is the one that makes it answer at all. Asserts a known
+// symbol from the fixture module comes back with a non-empty URI, which is
+// the field documentSymbol never sets and this request exists specifically to
+// populate.
+func TestLive_WorkspaceSymbol(t *testing.T) {
+	root, file := goplsFixture(t)
+	m, _ := openManager(t, root, file)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	syms, err := m.WorkspaceSymbol(ctx, "Greeter")
+	if err != nil {
+		t.Fatalf("workspaceSymbol: %v", err)
+	}
+	if len(syms) == 0 {
+		t.Fatal("workspaceSymbol returned nothing for a symbol that exists in the fixture module")
+	}
+	found := false
+	for _, s := range syms {
+		if s.Name == "Greeter" {
+			found = true
+			if s.URI == "" {
+				t.Errorf("Greeter came back with an empty URI: %+v", s)
+			}
+			if got := PathFromURI(s.URI); got != file {
+				t.Errorf("Greeter's URI resolved to %q, want %q", got, file)
+			}
+		}
+	}
+	if !found {
+		var names []string
+		for _, s := range syms {
+			names = append(names, s.Name)
+		}
+		t.Fatalf("workspaceSymbol did not return Greeter; got %v", names)
+	}
+}
+
 // TestLive_Rename proves the edits come back in a shape we can apply.
 func TestLive_Rename(t *testing.T) {
 	root, file := goplsFixture(t)

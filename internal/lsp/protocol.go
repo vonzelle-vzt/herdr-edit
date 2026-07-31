@@ -211,14 +211,27 @@ type codeActionParams struct {
 	Context      codeActionContext      `json:"context"`
 }
 
-// Symbol is one entry from documentSymbol, already flattened out of whatever
-// nesting the server used.
+// Symbol is one entry from documentSymbol or workspace/symbol, already
+// flattened out of whatever nesting or wire shape the server used.
 type Symbol struct {
 	Name   string
 	Detail string
 	Kind   int
 	Line   int // zero-based, in the file the request named
-	Depth  int // nesting level, for indenting the outline
+	Depth  int // nesting level, for indenting the outline; always 0 for workspace/symbol
+
+	// URI names the file the symbol lives in. documentSymbol never sets it —
+	// the caller already knows which file it asked about — so it is the zero
+	// value there. workspace/symbol has no such caller-known file, so this is
+	// how a picker over its results knows what to open.
+	URI string
+
+	// LineUnknown is true when a workspace/symbol result's location carried no
+	// range at all (LSP 3.17 permits a bare {uri} location for a
+	// WorkspaceSymbol). Line is then meaningless — reporting the zero value
+	// as if it were line 1 would be the documentSymbol shape bug in a new
+	// costume, so callers must check this before trusting Line.
+	LineUnknown bool
 }
 
 // CodeAction is one offered fix or refactor. Edits is nil when the server chose
