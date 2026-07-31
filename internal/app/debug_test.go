@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -689,26 +690,71 @@ func TestStopDebugSessionIsSafeWithoutOne(t *testing.T) {
 	}
 }
 
-// TestDebugGutterSkipsWrappedTabs documents the known stage-2 limitation
-// explicitly rather than leaving it to be discovered: mapping a buffer line to
-// a wrapped screen row needs internal/editor's unexported segment arithmetic,
-// so the overlay stands down on a wrapped tab instead of painting on the wrong
-// row. The cursor and the status bar still report the location.
-func TestDebugGutterSkipsWrappedTabs(t *testing.T) {
+// TestDebugGutterPaintsOnWrappedTabs pins the fix for a real gap: the debug
+// overlay used to stand down entirely on a wrapped tab, because `line - ScrollY`
+// is off by the number of continuation rows above the line and painting at the
+// wrong row is worse than not painting. A wrapped tab therefore showed no
+// stopped arrow at all, and only the status bar said where execution had
+// stopped. Tab.GutterRowFor now answers for both geometries.
+//
+// 🔴 The expected row is DERIVED FROM RENDERED OUTPUT, not recomputed: the tab
+// is drawn once with no debug session to find which row actually carries the
+// line, then drawn again with one to assert the arrow landed there. Asserting
+// against a second copy of the wrap arithmetic would pass whenever the helper
+// and the test were wrong together — the exact failure that let ScreenPos ship
+// off-by-one twice under three green tests.
+func TestDebugGutterPaintsOnWrappedTabs(t *testing.T) {
 	a, path := debugFixture(t)
+	tab := a.activeTabPtr()
+
+	// Lines long enough that wrapping actually produces continuation rows; without
+	// them a wrapped tab and an unwrapped one agree and the test proves nothing.
+	long := strings.Repeat("xy ", 40)
+	for i := 0; i < 3; i++ {
+		tab.Buffer.Lines[i] = "// " + long
+	}
+	tab.Wrap = true
+	tab.StyleStale = true
+
+	const target = 5 // zero-based; the "sum := a + b" line
+
+	// Pass 1: no debug session, so nothing overlays the gutter. Find the row that
+	// actually carries this line by looking for its rendered line number.
+	a.draw()
+	a.screen.Show()
+	scr := a.screen.(tcell.SimulationScreen)
+	wantRow := -1
+	for y := 0; y < a.height; y++ {
+		if strings.Contains(screenLine(scr, y), fmtLineNo(target+1)+" ") {
+			wantRow = y
+			break
+		}
+	}
+	if wantRow < 0 {
+		t.Fatalf("fixture never rendered line %d on a wrapped tab", target+1)
+	}
+
+	// Pass 2: stopped on that line. The arrow must land on the row pass 1 found.
 	a.debug = &debugSession{adapter: "delve", running: true, bound: map[string][]boundBreakpoint{}}
-	a.handleDebugStopped(&debugStoppedEvent{when: time.Now(), path: path, line: 5, reason: "breakpoint"})
+	a.handleDebugStopped(&debugStoppedEvent{when: time.Now(), path: path, line: target, reason: "breakpoint"})
+	tab.Wrap = true
+	a.draw()
+	a.screen.Show()
 
-	a.activeTabPtr().Wrap = true
-	a.draw() // must not panic or paint at a mis-mapped row
-
-	if a.activeTabPtr().Cursor.Line != 5 {
-		t.Error("the cursor no longer reports the stopped line on a wrapped tab")
+	ex, _, _, _ := a.editorRect()
+	got, _, _, _ := scr.GetContent(ex, wantRow)
+	if got != '▶' {
+		t.Fatalf("wrapped tab: gutter cell at the line's own row %d is %q, want %q",
+			wantRow, string(got), "▶")
 	}
 	if !strings.Contains(a.debugStatus(), "main.go:6") {
 		t.Errorf("status %q lost the location on a wrapped tab", a.debugStatus())
 	}
 }
+
+// fmtLineNo renders a line number the way the gutter does, so the test can find
+// the row by reading the screen rather than by recomputing wrap geometry.
+func fmtLineNo(n int) string { return strconv.Itoa(n) }
 
 // requireDlvForApp is the anti-skip gate for the app-level live oracle, matching
 // internal/dap/live_dlv_test.go: skip when delve is absent so a fresh clone

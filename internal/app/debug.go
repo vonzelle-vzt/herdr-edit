@@ -784,17 +784,25 @@ func (a *App) drawDebugGutter() {
 		return
 	}
 	tab := a.activeTabPtr()
-	if tab == nil || tab.IsImage() || tab.Synthetic || tab.Wrap || tab.Path == "" {
+	if tab == nil || tab.IsImage() || tab.Synthetic || tab.Path == "" {
 		return
 	}
-	ex, ey, _, eh := a.editorRect()
+	ex, ey, ew, eh := a.editorRect()
 
 	// The gutter marker is painted at the editor rect's leftmost column, which
 	// is where Tab.Render puts it (tab.go: scr.SetContent(x, cy, markerR, …)).
+	//
+	// Tab.GutterRowFor resolves the row for BOTH geometries. This used to bail
+	// out on tab.Wrap entirely, because `line - ScrollY` is off by the number of
+	// continuation rows above the line and painting in the wrong place is worse
+	// than not painting — so a wrapped tab showed no breakpoint dots and no
+	// stopped arrow, with only the status bar saying where execution had
+	// stopped. Skipping was the right call while the arithmetic lived here; the
+	// fix was to ask the geometry that owns wrapping.
 	paint := func(line int, glyph rune, color tcell.Color) {
-		row := line - tab.ScrollY
-		if row < 0 || row >= eh {
-			return // scrolled out of view
+		row, ok := tab.GutterRowFor(line, ew, eh)
+		if !ok {
+			return // scrolled out of view, or not a line in this buffer
 		}
 		_, _, existing, _ := a.screen.GetContent(ex, ey+row)
 		bg, _, _ := existing.Decompose()

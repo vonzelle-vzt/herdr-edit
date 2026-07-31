@@ -83,3 +83,40 @@ func (t *Tab) LineText(line int) string {
 	}
 	return t.Buffer.Lines[line]
 }
+
+// GutterRowFor reports the screen row, relative to the top of the editor rect,
+// at which line's gutter cell is drawn — for BOTH geometries. visible is false
+// when the line is scrolled out of view or out of the buffer.
+//
+// Overlays that mark a whole LINE (a breakpoint dot, the debugger's stopped
+// arrow) need only a row, not a column, so ScreenPos is the wrong tool: it
+// resolves a column too and returns invisible whenever that column is scrolled
+// off, which for a gutter glyph is not a reason to skip painting.
+//
+// 🔴 The wrapped branch is a DISPATCH to wrap.go, not wrapping threaded through
+// this file. One buffer line occupies several rows when Tab.Wrap is on, so
+// `line - ScrollY` is simply a different quantity there — it was wrong by the
+// number of continuation rows above it, which is why the debug gutter used to
+// refuse to paint on a wrapped tab at all rather than paint in the wrong place.
+// The row returned is the line's FIRST segment: the one renderWrapped puts the
+// line number on, and continuation rows draw ↪ instead.
+func (t *Tab) GutterRowFor(line, viewW, viewH int) (row int, visible bool) {
+	if line < 0 || line >= t.Buffer.LineCount() {
+		return 0, false
+	}
+	if !t.Wrap {
+		row = line - t.ScrollY
+	} else {
+		// Same arithmetic renderWrapped uses (gw + 1 for the separator column),
+		// because a marker that disagrees with the renderer lands on the wrong row.
+		contentW := viewW - t.GutterWidth() - 1
+		if contentW < 1 {
+			contentW = 1
+		}
+		row = t.wrapVisualRows(t.ScrollY, t.ScrollSub, line, 0, contentW)
+	}
+	if row < 0 || row >= viewH {
+		return 0, false
+	}
+	return row, true
+}
