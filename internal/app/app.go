@@ -244,6 +244,7 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Fix at cursor", shortcut: "Esc l", action: (*App).menuCodeActions, enabled: (*App).hasLSPFile},
 			{label: "Find references", shortcut: "Esc j", action: (*App).menuFindReferences, enabled: (*App).hasFileTab},
 			{label: "Rename symbol", shortcut: "Esc y", action: (*App).menuRenameSymbol, enabled: (*App).hasFileTab},
+			{label: "Language server status", action: (*App).menuLSPStatus, enabled: alwaysTrue},
 			{label: "Toggle bookmark", shortcut: "Esc m", action: (*App).menuToggleBookmark, enabled: (*App).hasFileTab},
 			{label: "Next bookmark", shortcut: "Esc '", action: (*App).menuNextBookmark, enabled: (*App).hasBookmarks},
 			{label: "Clear bookmarks", action: (*App).menuClearBookmarks, enabled: (*App).hasBookmarks},
@@ -2932,6 +2933,21 @@ func (a *App) drawStatusBar() {
 		if rw < sw {
 			drawAt(a.screen, sx+sw-rw, sy, right, style)
 			rightWidth = rw
+		}
+	}
+
+	// LSP status tag, drawn next to the left of the branch. The status bar
+	// is shared with the git branch and the diagnostics summary, so this
+	// clips against whatever rightWidth the branch already claimed rather
+	// than ever overlapping it.
+	if tag := a.lspStatusText(); tag != "" {
+		avail := sw - rightWidth
+		if avail >= 3 { // room for at least " x "
+			trimmed := trimRunes(tag, avail-2)
+			right := " " + trimmed + " "
+			rw := len([]rune(right))
+			drawAt(a.screen, sx+sw-rightWidth-rw, sy, right, style)
+			rightWidth += rw
 		}
 	}
 

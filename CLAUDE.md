@@ -209,8 +209,8 @@ replaced by "Window too small".
 The tree **fits its content, and narrows before it hides**. Three helpers own
 this and nothing else may duplicate their arithmetic:
 
-- `autoSidebarWidth()` — what the tree *wants*: `Tree.NaturalWidth()+1` (the +1
-  is the splitter column), floored at `defaultSidebarWidth` so a short-named
+- `autoSidebarWidth()` — what the tree *wants*: `Tree.FitWidth(autoSidebarPercentile)+1`
+  (`app.go:1140`; the +1 is the splitter column), floored at `defaultSidebarWidth` so a short-named
   project still looks normal, and capped at `maxAutoSidebarNum/Den` (2/5) of the
   pane so a deep tree with long names cannot push the editor out. This is what
   makes the sidebar **grow** as well as shrink — it previously only ever clamped

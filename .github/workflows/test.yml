@@ -59,6 +59,25 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # internal/lsp/live_gopls_test.go drives all eight LSP requests against a REAL gopls and
+      # t.Skip()s when it is absent. That skip is the whole problem: the file exists because this
+      # fork shipped "complete, tested" LSP features that no user could reach three separate times,
+      # and until now gopls was installed neither here nor on any dev machine — so the one oracle
+      # written to catch that class of bug had never actually executed anywhere. A skipped test is
+      # indistinguishable from a passing one in the summary, which is exactly how it stayed unnoticed.
+      #
+      # $(go env GOPATH)/bin must go on PATH explicitly: `go install` does not put it there, and
+      # exec.LookPath("gopls") failing is a SKIP, not a failure — so getting this wrong would
+      # silently restore the status quo while looking green.
+      - name: Install gopls (for the live LSP oracle)
+        run: |
+          go install golang.org/x/tools/gopls@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify gopls is reachable
+        run: |
+          command -v gopls || { echo "gopls not on PATH — the live LSP oracle would silently skip" >&2; exit 1; }
+
       - name: Test
         run: go test -race -coverprofile=coverage.out ./...
 
