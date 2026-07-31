@@ -103,10 +103,24 @@ internal/app/locationref.go   Parse+jump "path:line:col" from any generated list
 internal/app/searchpanel.go   Esc F -> internal/search -> a jumpable synthetic tab
 internal/app/problems.go      Diagnostics list + next/prev problem (Esc ; . , and F8)
 internal/app/dochighlight.go  Tint other occurrences of the symbol under the cursor
-internal/app/breakpoints.go   Breakpoint model, persistence, dlv/pdb/gdb export
-internal/dap/                 DAP client — a deliberate SIBLING of internal/lsp, not shared
+internal/app/breakpoints.go   Breakpoints: conditions, logpoints, persistence, dlv/pdb/gdb export
+internal/dap/                 DAP client (delve over a socket, debugpy over stdio) — a deliberate
+                              SIBLING of internal/lsp's transport, not a shared abstraction
 internal/app/debug.go         Debug session, DAP events, stopped marker overlay, status
-internal/app/debugview.go     Stepping, call stack, threads, variables, debug console
+internal/app/debugview.go     Stepping, call stack, threads, variables, evaluate, debug console
+internal/toolpath/            Where developer tools ACTUALLY live when PATH cannot be trusted
+```
+
+🔴 **`internal/toolpath` is the one utility-shaped package here, and it earns it.**
+A herdr pane runs with `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (launchd), so `exec.LookPath` sees none
+of `/opt/homebrew/bin`, `~/.local/bin`, `~/go/bin`, `~/.cargo/bin` or any npm prefix. Both
+`internal/lsp` and `internal/dap` need this, and they must **agree** — one finding `gopls` while the
+other cannot find `dlv` in the same directory is worse than either being wrong, because nothing on
+screen would explain it. That is CLAUDE.md's own "share when two copies must AGREE" rule, and
+importing `internal/lsp` from `internal/dap` would be a nonsense dependency direction.
+`TestOnlyOnePlaceKnowsWhereToolsLive` fails if a third copy appears.
+
+```
 internal/app/lspstatus.go     Which language servers are running, in the status bar
 ```
 

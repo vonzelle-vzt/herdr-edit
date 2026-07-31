@@ -21,6 +21,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	"github.com/cloudmanic/spice-edit/internal/dap"
+	"github.com/cloudmanic/spice-edit/internal/editor"
 )
 
 // fakeAdapterClient returns a REAL dap.Client attached to a pipe nothing ever
@@ -893,4 +894,259 @@ func (f *fakeReplier) answerStackTrace(path string, line int, name string) {
 			"totalFrames": 1,
 		},
 	})
+}
+
+// -----------------------------------------------------------------------------
+// Lane B stage 4 — evaluate
+// -----------------------------------------------------------------------------
+
+// TestEvaluateAsksInTheSelectedFrameWhenStopped pins the pair that decides
+// WHICH scope the answer comes from.
+//
+// 🔴 While stopped, evaluate must go out with context "watch" AND the id of the
+// frame the user has selected — stage 3's curFrame, so that evaluating after
+// picking frame #1 in the call stack answers about frame #1. While running there
+// is no frame, so the context is "repl" and no frameId is sent at all. Both
+// adapters accept the wrong pairing and answer it from another scope with no
+// error, which makes this a bug that renders as a plausible value. The assertion
+// is on the recorded traffic for that reason.
+func TestEvaluateAsksInTheSelectedFrameWhenStopped(t *testing.T) {
+	a, path := debugFixture(t)
+	client, fake := newRecordingAdapter(t)
+	a.debug = &debugSession{
+		adapter: "fake", running: true, stopped: true, threadID: 1,
+		client: client, bound: map[string][]boundBreakpoint{},
+	}
+	a.handleDebugStopped(&debugStoppedEvent{
+		when: time.Now(), path: path, line: 5, frame: "main.add", reason: "breakpoint", threadID: 1,
+		frames: []debugFrame{
+			{ID: 1000, Name: "main.add", Path: path, Line: 5},
+			{ID: 1001, Name: "main.main", Path: path, Line: 10},
+		},
+	})
+
+	// Cursor on `sum` in `sum := a + b`.
+	tab := a.activeTabPtr()
+	col := strings.Index(tab.LineText(5), "sum") + 1
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: col}, false)
+
+	a.menuDebugEvaluate()
+	if !pumpEvents(t, a, 5*time.Second, func() bool { return len(evaluateCalls(fake)) > 0 }) {
+		t.Fatalf("evaluate never reached the adapter; requests %+v", fake.requests())
+	}
+	got := evaluateCalls(fake)[0]
+	if got.Args["expression"] != "sum" {
+		t.Errorf("expression = %v, want the word under the cursor (sum)", got.Args["expression"])
+	}
+	if got.Args["context"] != "watch" {
+		t.Errorf("context = %v, want watch while stopped", got.Args["context"])
+	}
+	if f, ok := got.Args["frameId"].(float64); !ok || int(f) != 1000 {
+		t.Errorf("frameId = %v, want the innermost frame 1000", got.Args["frameId"])
+	}
+
+	// Select the OUTER frame; the next evaluate must follow it.
+	a.selectFrame(1)
+	a.closePalette()
+	tab = a.activeTabPtr()
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: col}, false)
+	a.menuDebugEvaluate()
+	if !pumpEvents(t, a, 5*time.Second, func() bool { return len(evaluateCalls(fake)) > 1 }) {
+		t.Fatalf("the second evaluate never arrived; requests %+v", fake.requests())
+	}
+	got = evaluateCalls(fake)[1]
+	if f, ok := got.Args["frameId"].(float64); !ok || int(f) != 1001 {
+		t.Errorf("frameId = %v after selecting frame #1, want 1001 — the answer would be "+
+			"from the frame the user is no longer looking at", got.Args["frameId"])
+	}
+}
+
+// TestEvaluateUsesReplWithNoFrameWhileRunning is the other half of the pair: a
+// running program has no frame to evaluate in, so frameId must be ABSENT rather
+// than zero — `"frameId": 0` is a question about frame zero.
+func TestEvaluateUsesReplWithNoFrameWhileRunning(t *testing.T) {
+	a, _ := debugFixture(t)
+	client, fake := newRecordingAdapter(t)
+	a.debug = &debugSession{
+		adapter: "fake", running: true, client: client, bound: map[string][]boundBreakpoint{},
+	}
+	tab := a.activeTabPtr()
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: strings.Index(tab.LineText(5), "sum") + 1}, false)
+
+	a.menuDebugEvaluate()
+	if !pumpEvents(t, a, 5*time.Second, func() bool { return len(evaluateCalls(fake)) > 0 }) {
+		t.Fatalf("evaluate never reached the adapter; requests %+v", fake.requests())
+	}
+	got := evaluateCalls(fake)[0]
+	if got.Args["context"] != "repl" {
+		t.Errorf("context = %v, want repl with no stop", got.Args["context"])
+	}
+	if _, present := got.Args["frameId"]; present {
+		t.Errorf("frameId = %v is on the wire with no frame to evaluate in", got.Args["frameId"])
+	}
+}
+
+// evaluateCalls filters the recorded traffic down to evaluate requests.
+func evaluateCalls(f *recordingAdapter) []recordedRequest {
+	var out []recordedRequest
+	for _, r := range f.requests() {
+		if r.Command == "evaluate" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestExpressionAtCursorPrefersTheSelection pins what gets evaluated.
+//
+// The selection wins because it is the only way to ask about anything that is
+// not a bare identifier — `a + b`, `p.Name`, `xs[i+1]` — and a debugger that
+// could only evaluate single words would be useless on the expression you are
+// actually looking at. A word is the fallback so the common case needs no
+// selecting at all.
+func TestExpressionAtCursorPrefersTheSelection(t *testing.T) {
+	a, _ := debugFixture(t)
+	tab := a.activeTabPtr()
+
+	line := tab.LineText(5) // "\tsum := a + b"
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: strings.Index(line, "sum") + 1}, false)
+	if got := a.expressionAtCursor(); got != "sum" {
+		t.Errorf("expressionAtCursor = %q, want the word under the cursor", got)
+	}
+
+	// Select `a + b`.
+	start := strings.Index(line, "a + b")
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: start}, false)
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: start + len("a + b")}, true)
+	if !tab.HasSelection() {
+		t.Fatal("the fixture selection did not take")
+	}
+	if got := a.expressionAtCursor(); got != "a + b" {
+		t.Errorf("expressionAtCursor = %q, want the selected expression", got)
+	}
+
+	// Whitespace with nothing selected has nothing to ask about.
+	tab.MoveCursorTo(editor.Position{Line: 3, Col: 0}, false)
+	if got := a.expressionAtCursor(); got != "" {
+		t.Errorf("expressionAtCursor on a blank line = %q, want empty", got)
+	}
+}
+
+// TestEvaluateResultReachesTheStatusLine covers the honest-one-line treatment
+// hover already gets: there is no popup surface in this editor, so a status
+// flash is the feature rather than a reason to withhold it.
+func TestEvaluateResultReachesTheStatusLine(t *testing.T) {
+	a, _ := stoppedFixture(t)
+
+	a.handleDebugEval(&debugEvalEvent{when: time.Now(), expr: "sum",
+		res: dap.EvaluateResult{Result: "5", Type: "int"}})
+	if !strings.Contains(a.statusMsg, "sum = 5") {
+		t.Errorf("status = %q, want the expression and its value", a.statusMsg)
+	}
+	if !strings.Contains(a.statusMsg, "int") {
+		t.Errorf("status = %q, want the type when the adapter reported one", a.statusMsg)
+	}
+
+	// A multi-line struct value is flattened, exactly as a picker row is: the
+	// tail of it would otherwise be drawn over whatever is beside the status bar.
+	a.handleDebugEval(&debugEvalEvent{when: time.Now(), expr: "p",
+		res: dap.EvaluateResult{Result: "main.Point {\n\tX: 1,\n\tY: 2,\n}"}})
+	if strings.Contains(a.statusMsg, "\n") {
+		t.Errorf("status = %q still contains a newline", a.statusMsg)
+	}
+
+	// 🔴 A refusal is reported verbatim. "could not find symbol value for xs" is
+	// the adapter saying the expression is out of scope HERE, which is the only
+	// thing that tells the user what to type instead.
+	a.handleDebugEval(&debugEvalEvent{when: time.Now(), expr: "xs",
+		err: "fake: evaluate: could not find symbol value for xs"})
+	if !strings.Contains(a.statusMsg, "could not find symbol value") {
+		t.Errorf("status = %q, want the adapter's own explanation", a.statusMsg)
+	}
+}
+
+// TestEvaluateRefusesWithoutASession checks the guard reports rather than doing
+// nothing, and names what is missing.
+func TestEvaluateRefusesWithoutASession(t *testing.T) {
+	a, _ := debugFixture(t)
+	a.debug = nil
+	a.menuDebugEvaluate()
+	if !strings.Contains(a.statusMsg, "Evaluate") || !strings.Contains(a.statusMsg, "F5") {
+		t.Errorf("status = %q, want a refusal naming the action and how to fix it", a.statusMsg)
+	}
+
+	// A session with nothing under the cursor refuses differently, so the two
+	// are distinguishable.
+	a, _ = stoppedFixture(t)
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: 3, Col: 0}, false)
+	a.menuDebugEvaluate()
+	if !strings.Contains(a.statusMsg, "Nothing to evaluate") {
+		t.Errorf("status = %q, want the empty-expression refusal", a.statusMsg)
+	}
+}
+
+// TestDebugMenuRowsExistForEveryStage4Action is the call-site oracle for this
+// stage: every new action has to be reachable from the ≡ menu AND from the Esc 5
+// picker, because both surfaces are generated from debugMenuGroup and a feature
+// with no caller is this fork's most-repeated failure.
+func TestDebugMenuRowsExistForEveryStage4Action(t *testing.T) {
+	a, _ := stoppedFixture(t)
+	// A breakpoint under the cursor, so the condition rows are enabled.
+	a.activeTabPtr().SetMark(5, editor.Mark{Kind: editor.MarkBreakpoint, Enabled: true, VerifiedLine: -1})
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: 5, Col: 0}, false)
+
+	want := []string{
+		"Evaluate at cursor",
+		"Set breakpoint condition",
+		"Set logpoint message",
+		"Clear condition / log message",
+	}
+
+	items, _, _ := a.menuLayout()
+	labels := make(map[string]menuItemDef, len(items))
+	for _, it := range items {
+		label := it.label
+		if it.labelFor != nil {
+			label = it.labelFor(a)
+		}
+		labels[label] = it
+	}
+	for _, label := range want {
+		it, ok := labels[label]
+		if !ok {
+			t.Errorf("no %q row in the action menu", label)
+			continue
+		}
+		if it.action == nil {
+			t.Errorf("the %q row has no action", label)
+		}
+		if !it.enabled(a) {
+			t.Errorf("%q is disabled with a breakpoint under the cursor in a stopped session", label)
+		}
+	}
+
+	// The Esc 5 picker is generated from the same list, so it must offer them too.
+	a.menuDebugPicker()
+	if !a.paletteOpen {
+		t.Fatal("the debug picker did not open")
+	}
+	rows := paletteLabels(a)
+	for _, label := range want {
+		found := false
+		for _, r := range rows {
+			if r == label {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no %q row in the Esc 5 picker; rows are %v", label, rows)
+		}
+	}
+	a.closePalette()
+
+	// And the condition rows switch off when there is no breakpoint to put one on.
+	a.activeTabPtr().ClearMark(5)
+	if labels["Set breakpoint condition"].enabled(a) {
+		t.Error("Set breakpoint condition is enabled with no breakpoint under the cursor")
+	}
 }

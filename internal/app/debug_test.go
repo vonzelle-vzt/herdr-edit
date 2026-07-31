@@ -8,13 +8,18 @@
 package app
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1128,5 +1133,639 @@ func TestDebugLiveSteppingAndVariables(t *testing.T) {
 	a.menuDebugStop()
 	if a.debug != nil {
 		t.Fatal("Stop left the session in place")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Lane B stage 4 — conditional breakpoints, logpoints, evaluate
+// -----------------------------------------------------------------------------
+
+// recordingAdapter is a fake debug adapter on the far end of a real dap.Client,
+// which RECORDS every request the app puts on the wire and answers the ones the
+// app waits for.
+//
+// 🔴 It exists because asserting on the flash alone is not an oracle for a
+// capability gate. "The editor said delve cannot do log points" passes just as
+// happily for an implementation that says so AND sends the field anyway — which
+// is the bug, since the adapter then drops it silently and the breakpoint fires
+// every time. Only the recorded traffic can tell the two apart.
+type recordingAdapter struct {
+	t    *testing.T
+	conn net.Conn
+	r    *bufio.Reader
+
+	mu   sync.Mutex
+	reqs []recordedRequest
+}
+
+// recordedRequest is one request as it actually appeared on the wire, decoded
+// only as far as a map so a MISSING key is distinguishable from a zero value.
+type recordedRequest struct {
+	Command string
+	Args    map[string]interface{}
+}
+
+// newRecordingAdapter wires an App-facing dap.Client to a fake that records
+// everything and serves the handful of requests this stage issues.
+func newRecordingAdapter(t *testing.T) (*dap.Client, *recordingAdapter) {
+	t.Helper()
+	ours, theirs := net.Pipe()
+	f := &recordingAdapter{t: t, conn: theirs, r: bufio.NewReader(theirs)}
+	client := dap.StartConn("fake", ours, dap.Handlers{})
+	t.Cleanup(func() {
+		_ = theirs.Close()
+		_ = ours.Close()
+	})
+	go f.serve()
+	return client, f
+}
+
+// serve answers requests until the pipe closes.
+func (f *recordingAdapter) serve() {
+	for {
+		_ = f.conn.SetDeadline(time.Now().Add(30 * time.Second))
+		body, err := readFramed(f.r)
+		if err != nil {
+			return
+		}
+		var req dap.Request
+		if json.Unmarshal(body, &req) != nil {
+			return
+		}
+		rec := recordedRequest{Command: req.Command, Args: map[string]interface{}{}}
+		if raw, err := json.Marshal(req.Arguments); err == nil {
+			_ = json.Unmarshal(raw, &rec.Args)
+		}
+		f.mu.Lock()
+		f.reqs = append(f.reqs, rec)
+		f.mu.Unlock()
+
+		var respBody interface{} = struct{}{}
+		if req.Command == "setBreakpoints" {
+			respBody = map[string]interface{}{"breakpoints": verifiedAnswers(rec.Args)}
+		}
+		raw, err := json.Marshal(respBody)
+		if err != nil {
+			return
+		}
+		out, err := json.Marshal(dap.Response{
+			Type: dap.TypeResponse, RequestSeq: req.Seq, Success: true,
+			Command: req.Command, Body: raw,
+		})
+		if err != nil {
+			return
+		}
+		if _, err := fmt.Fprintf(f.conn, "Content-Length: %d\r\n\r\n", len(out)); err != nil {
+			return
+		}
+		if _, err := f.conn.Write(out); err != nil {
+			return
+		}
+	}
+}
+
+// verifiedAnswers builds a positionally-matched, all-verified answer to a
+// setBreakpoints request, echoing back the line that was asked for.
+func verifiedAnswers(args map[string]interface{}) []map[string]interface{} {
+	list, _ := args["breakpoints"].([]interface{})
+	out := make([]map[string]interface{}, 0, len(list))
+	for _, item := range list {
+		bp, _ := item.(map[string]interface{})
+		line, _ := bp["line"].(float64)
+		out = append(out, map[string]interface{}{"verified": true, "line": int(line)})
+	}
+	return out
+}
+
+// readFramed reads one Content-Length framed message. A local copy because the
+// framing helper in internal/dap is unexported — and the framing is exactly what
+// this fake is here to observe, so borrowing the implementation under test would
+// make the oracle agree with a bug.
+func readFramed(r *bufio.Reader) ([]byte, error) {
+	length := -1
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		if idx := strings.IndexByte(line, ':'); idx > 0 &&
+			strings.EqualFold(strings.TrimSpace(line[:idx]), "content-length") {
+			n, err := strconv.Atoi(strings.TrimSpace(line[idx+1:]))
+			if err != nil {
+				return nil, err
+			}
+			length = n
+		}
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("message without Content-Length")
+	}
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// requests returns a snapshot of everything the app has sent.
+func (f *recordingAdapter) requests() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedRequest(nil), f.reqs...)
+}
+
+// setBreakpointCalls returns just the setBreakpoints traffic.
+func (f *recordingAdapter) setBreakpointCalls() []recordedRequest {
+	var out []recordedRequest
+	for _, r := range f.requests() {
+		if r.Command == "setBreakpoints" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// wireBreakpoints pulls the breakpoint list out of a recorded setBreakpoints.
+func wireBreakpoints(r recordedRequest) []map[string]interface{} {
+	list, _ := r.Args["breakpoints"].([]interface{})
+	out := make([]map[string]interface{}, 0, len(list))
+	for _, item := range list {
+		bp, _ := item.(map[string]interface{})
+		out = append(out, bp)
+	}
+	return out
+}
+
+// conditionalDebugFixture opens a Go file with breakpoints on two lines and a
+// live session against a recording adapter with the given capabilities.
+func conditionalDebugFixture(t *testing.T, caps dap.Capabilities) (*App, string, *recordingAdapter) {
+	t.Helper()
+	a, path := debugFixture(t)
+	client, fake := newRecordingAdapter(t)
+
+	tab := a.activeTabPtr()
+	for _, line := range []int{5, 6} {
+		tab.SetMark(line, editor.Mark{Kind: editor.MarkBreakpoint, Enabled: true, VerifiedLine: -1})
+	}
+	a.syncBreakpoints()
+	if len(a.breakpoints) != 2 {
+		t.Fatalf("fixture has %d breakpoints, want 2", len(a.breakpoints))
+	}
+
+	a.debug = &debugSession{
+		adapter: "fake", running: true, client: client, caps: caps,
+		bound: map[string][]boundBreakpoint{
+			path: {{Requested: 5, Bound: 5, Verified: true}, {Requested: 6, Bound: 6, Verified: true}},
+		},
+	}
+	return a, path, fake
+}
+
+// TestConditionRefusedWhenAdapterCannot is the capability gate, asserted on the
+// WIRE and not only on the status line.
+//
+// 🔴 An adapter that never advertised supportsConditionalBreakpoints does not
+// refuse a condition — it IGNORES the field. The breakpoint is accepted,
+// reported verified, and then fires on every iteration of the loop the condition
+// was written for, and nothing on screen distinguishes that from a condition
+// that is merely wrong. So the message alone proves nothing: an implementation
+// that flashes and sends it anyway passes a flash-only assertion while shipping
+// exactly the bug. Both halves are checked here, in both directions.
+func TestConditionRefusedWhenAdapterCannot(t *testing.T) {
+	// --- the adapter cannot: refuse before anything reaches the wire --------
+	a, _, fake := conditionalDebugFixture(t, dap.Capabilities{})
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: 5, Col: 0}, false)
+
+	a.menuSetCondition()
+
+	if a.promptOpen {
+		t.Error("the condition prompt opened against an adapter that cannot honour one; " +
+			"the user would type an expression we already know will be discarded")
+	}
+	if !strings.Contains(a.statusMsg, "fake") ||
+		!strings.Contains(a.statusMsg, "conditional breakpoints") {
+		t.Errorf("status = %q, want a message naming the ADAPTER and the capability", a.statusMsg)
+	}
+	if got := fake.setBreakpointCalls(); len(got) != 0 {
+		t.Fatalf("a refused condition still produced setBreakpoints traffic: %+v", got)
+	}
+
+	a.menuSetLogpoint()
+	if a.promptOpen {
+		t.Error("the logpoint prompt opened against an adapter with no supportsLogPoints")
+	}
+	if !strings.Contains(a.statusMsg, "log points") {
+		t.Errorf("status = %q, want a message naming log points", a.statusMsg)
+	}
+
+	// --- and the START path strips rather than sends -----------------------
+	// A condition typed with no session running reaches an adapter that cannot
+	// honour it through pushBreakpoints, which must drop the field and say so.
+	client, fake2 := newRecordingAdapter(t)
+	_ = client
+	groups := map[string][]Breakpoint{
+		"/repo/main.go": {
+			{Path: "/repo/main.go", Line: 5, Enabled: true, Condition: "i == 3"},
+			{Path: "/repo/main.go", Line: 6, Enabled: true, LogMessage: "here"},
+		},
+	}
+	ctx, cancel := contextWithTimeout(2 * time.Second)
+	defer cancel()
+	_, notes := pushBreakpoints(ctx, client, dap.Capabilities{}, "fake", groups)
+
+	calls := fake2.setBreakpointCalls()
+	if len(calls) != 1 {
+		t.Fatalf("got %d setBreakpoints calls, want 1", len(calls))
+	}
+	for _, bp := range wireBreakpoints(calls[0]) {
+		if _, present := bp["condition"]; present {
+			t.Errorf("breakpoint %v carries a condition an adapter without the capability "+
+				"would silently drop, making it fire every time", bp)
+		}
+		if _, present := bp["logMessage"]; present {
+			t.Errorf("breakpoint %v carries a logMessage the adapter cannot honour", bp)
+		}
+	}
+	joined := strings.Join(notes, " · ")
+	if !strings.Contains(joined, "conditional breakpoints") || !strings.Contains(joined, "log points") {
+		t.Errorf("notes = %q, want both refusals reported", joined)
+	}
+
+	// --- the positive control ----------------------------------------------
+	// With the capability present the SAME call must put the field on the wire.
+	// Without this half, an implementation that never sends a condition at all
+	// would pass everything above.
+	client3, fake3 := newRecordingAdapter(t)
+	_, notes = pushBreakpoints(ctx, client3, dap.Capabilities{
+		SupportsConditionalBreakpoints: true, SupportsLogPoints: true,
+	}, "fake", groups)
+	if len(notes) != 0 {
+		t.Errorf("notes = %v for an adapter that supports both", notes)
+	}
+	calls = fake3.setBreakpointCalls()
+	if len(calls) != 1 {
+		t.Fatalf("got %d setBreakpoints calls, want 1", len(calls))
+	}
+	sawCondition, sawLog := false, false
+	for _, bp := range wireBreakpoints(calls[0]) {
+		if bp["condition"] == "i == 3" {
+			sawCondition = true
+		}
+		if bp["logMessage"] == "here" {
+			sawLog = true
+		}
+	}
+	if !sawCondition || !sawLog {
+		t.Fatalf("a capable adapter did not receive the fields: %+v", wireBreakpoints(calls[0]))
+	}
+}
+
+// contextWithTimeout is a tiny helper so the tests above read without repeating
+// the context boilerplate four times.
+func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), d)
+}
+
+// TestSetBreakpointsResendsTheWholeFile pins the whole-file rule at the moment
+// it is easiest to get wrong: editing ONE breakpoint's condition.
+//
+// 🔴 setBreakpoints has no incremental form — every call REPLACES the complete
+// set for that source. So the natural implementation of "the user changed this
+// breakpoint, send it" clears every OTHER breakpoint in the file, and the
+// symptom is breakpoints that stop working after you refine one of them, with
+// nothing on screen to say they were deleted.
+//
+// RED against sending only the edited breakpoint: the request then carries one
+// entry instead of two.
+func TestSetBreakpointsResendsTheWholeFile(t *testing.T) {
+	a, path, fake := conditionalDebugFixture(t, dap.Capabilities{
+		SupportsConditionalBreakpoints: true, SupportsLogPoints: true,
+	})
+
+	// Put a condition on the breakpoint at line 5, the way a user does.
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: 5, Col: 0}, false)
+	a.menuSetCondition()
+	if !a.promptOpen {
+		t.Fatalf("the condition prompt did not open; status %q", a.statusMsg)
+	}
+	a.promptValue = []rune("i == 3")
+	a.promptCursor = len(a.promptValue)
+	a.promptSubmit()
+
+	if !pumpEvents(t, a, 10*time.Second, func() bool { return len(fake.setBreakpointCalls()) > 0 }) {
+		t.Fatalf("editing a condition never reached the adapter; requests: %+v", fake.requests())
+	}
+
+	calls := fake.setBreakpointCalls()
+	last := calls[len(calls)-1]
+	if got := last.Args["source"].(map[string]interface{})["path"]; got != path {
+		t.Errorf("setBreakpoints source = %v, want %s", got, path)
+	}
+
+	bps := wireBreakpoints(last)
+	if len(bps) != 2 {
+		t.Fatalf("setBreakpoints carried %d breakpoint(s) after editing one of two: %+v — "+
+			"the call REPLACES the file's set, so the other one has just been deleted",
+			len(bps), bps)
+	}
+
+	// Adapter lines are 1-based; buffer lines 5 and 6 are lines 6 and 7.
+	byLine := map[int]map[string]interface{}{}
+	for _, bp := range bps {
+		line, _ := bp["line"].(float64)
+		byLine[int(line)] = bp
+	}
+	if byLine[6] == nil || byLine[7] == nil {
+		t.Fatalf("the request carries lines %v, want the 1-based 6 and 7", byLine)
+	}
+	if byLine[6]["condition"] != "i == 3" {
+		t.Errorf("the edited breakpoint carries condition %v, want %q", byLine[6]["condition"], "i == 3")
+	}
+	if _, present := byLine[7]["condition"]; present {
+		t.Errorf("the UNedited breakpoint acquired a condition: %v", byLine[7])
+	}
+
+	// The mark itself kept the condition, so it persists and is exported.
+	if m, ok := a.activeTabPtr().MarkAt(5); !ok || m.Condition != "i == 3" {
+		t.Errorf("mark at line 5 = %+v, want the condition stored on it", m)
+	}
+}
+
+// TestRemovingTheLastBreakpointClearsTheFileOnTheAdapter is the other half of
+// whole-file, and the one an implementation that only iterates the CURRENT
+// breakpoints cannot satisfy.
+//
+// 🔴 Deleting the last breakpoint in a file means that file no longer appears in
+// the breakpoint list at all — so a resend that walks the list touches every
+// file EXCEPT the one that changed, and the adapter stays armed on a breakpoint
+// the editor no longer shows. A breakpoint you cannot delete.
+func TestRemovingTheLastBreakpointClearsTheFileOnTheAdapter(t *testing.T) {
+	a, path, fake := conditionalDebugFixture(t, dap.Capabilities{SupportsConditionalBreakpoints: true})
+
+	tab := a.activeTabPtr()
+	tab.ClearMark(5)
+	tab.ClearMark(6)
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: 0}, false)
+	a.afterBreakpointEdit()
+
+	if !pumpEvents(t, a, 10*time.Second, func() bool { return len(fake.setBreakpointCalls()) > 0 }) {
+		t.Fatalf("emptying a file never reached the adapter; requests: %+v", fake.requests())
+	}
+	last := fake.setBreakpointCalls()[0]
+	if got := last.Args["source"].(map[string]interface{})["path"]; got != path {
+		t.Errorf("cleared the wrong source: %v", got)
+	}
+	if bps := wireBreakpoints(last); len(bps) != 0 {
+		t.Fatalf("setBreakpoints carried %d breakpoint(s) for a file with none left: %+v", len(bps), bps)
+	}
+}
+
+// requireDebugpyForApp ends the test when no debugpy can be resolved, and turns
+// that skip into a failure under HERDR_REQUIRE_DAP=1 — the same anti-skip gate
+// requireDlvForApp uses, because a skipped end-to-end oracle reads as a pass.
+func requireDebugpyForApp(t *testing.T, root string) {
+	t.Helper()
+	if cmd := dap.LocateDebugpy(root); cmd != nil {
+		t.Logf("debugpy resolved from %s: %v", cmd.Origin, cmd.Argv)
+		return
+	}
+	msg := "no debugpy could be resolved — `pip install debugpy`, or install the " +
+		"MIT-licensed ms-python.debugpy VS Code extension"
+	if os.Getenv("HERDR_REQUIRE_DAP") == "1" {
+		t.Fatalf("HERDR_REQUIRE_DAP=1 but the live app oracle could not run: %s", msg)
+	}
+	t.Skip(msg)
+}
+
+// TestDebugLiveConditionalBreakpointThroughTheEditor is the definition of done
+// for this stage at the UI layer, against a REAL delve:
+//
+//	F9 sets a breakpoint in a loop → the condition menu row puts `i == 3` on it
+//	→ F5 runs → the program stops ONCE → Evaluate answers 3.
+//
+// 🔴 Why this exists on top of internal/dap's live oracle. That one proves the
+// protocol client can send a condition. It does not prove that the menu row
+// reaches menuSetCondition, that the prompt's value lands on the Mark, that
+// syncBreakpoints carries it into the authoritative list, that enabledBreakpoints
+// hands it to the launch path, or that Evaluate is aimed at the frame on screen.
+// Every one of those is a place this stage could be complete and unreachable —
+// which is the failure this fork has now shipped three times.
+func TestDebugLiveConditionalBreakpointThroughTheEditor(t *testing.T) {
+	requireDlvForApp(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module appfixture\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "main.go")
+	src := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ttotal := 0\n\tfor i := 0; i < 10; i++ {\n\t\ttotal += i\n\t}\n\tfmt.Println(total)\n}\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newTestApp(t, dir)
+	a.openFile(path)
+	t.Cleanup(a.stopDebugSession)
+
+	// Buffer line 7 is `total += i`, the loop body. Checked by TEXT.
+	const loopLine = 7
+	if got := a.activeTabPtr().LineText(loopLine); !strings.Contains(got, "total += i") {
+		t.Fatalf("fixture line %d is %q, not the loop body", loopLine, got)
+	}
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: loopLine, Col: 0}, false)
+	a.handleKey(tcell.NewEventKey(tcell.KeyF9, 0, tcell.ModNone))
+
+	// The condition goes on through the real UI: the menu action, then the
+	// prompt modal, then Enter.
+	a.menuSetCondition()
+	if !a.promptOpen {
+		t.Fatalf("the condition prompt did not open; status %q", a.statusMsg)
+	}
+	a.promptValue = []rune("i == 3")
+	a.promptCursor = len(a.promptValue)
+	a.promptSubmit()
+	a.syncBreakpoints()
+	if len(a.breakpoints) != 1 || a.breakpoints[0].Condition != "i == 3" {
+		t.Fatalf("breakpoints = %+v, want one carrying the condition", a.breakpoints)
+	}
+
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+	if !pumpEvents(t, a, 180*time.Second, func() bool {
+		return a.debug != nil && a.debug.stopped && len(a.debug.frames) > 0
+	}) {
+		t.Fatalf("the program never stopped on the conditional breakpoint; status %q", a.statusMsg)
+	}
+	if got := a.debug.line; got != loopLine {
+		t.Errorf("stopped on 0-based line %d, want the loop body %d", got, loopLine)
+	}
+	t.Logf("F5 → %s", a.debugStatus())
+
+	// 🔴 The value, through the real Evaluate action, with the cursor on `i`.
+	tab := a.activeTabPtr()
+	col := strings.Index(tab.LineText(loopLine), "i")
+	tab.MoveCursorTo(editor.Position{Line: loopLine, Col: col}, false)
+	a.menuDebugEvaluate()
+	if !pumpEvents(t, a, 30*time.Second, func() bool { return strings.Contains(a.statusMsg, "i = ") }) {
+		t.Fatalf("Evaluate never answered; status %q", a.statusMsg)
+	}
+	if !strings.Contains(a.statusMsg, "i = 3") {
+		t.Fatalf("Evaluate said %q, want `i = 3` — the condition was not honoured, or the "+
+			"expression was evaluated in the wrong frame", a.statusMsg)
+	}
+	t.Logf("Evaluate → %q", a.statusMsg)
+
+	// And continuing runs to completion: a dropped condition would stop nine
+	// more times, so the session would still be alive here.
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+	if !pumpEvents(t, a, 60*time.Second, func() bool { return a.debug == nil }) {
+		t.Fatalf("after continue the program stopped again; the condition fired more than "+
+			"once. session %+v, status %q", a.debug, a.statusMsg)
+	}
+	t.Logf("F5 again → ran to completion: %q", a.statusMsg)
+}
+
+// TestDebugLiveDebugpyEndToEnd is the second adapter driven through the REAL
+// editor: open a .py file, F9, F5, stop on the line.
+//
+// 🔴 This is where the delve-shaped assumptions in the APP layer would show up,
+// and the dap package's own debugpy oracle cannot see any of them: whether
+// hasDebuggableTab answers for Python at all, whether menuStartDebug sends the
+// FILE rather than its directory as `program`, and whether the stdio transport
+// survives the trip through Registry.Start. A green internal/dap suite and a
+// green internal/app suite would both have been consistent with F5 doing nothing
+// on a .py file.
+func TestDebugLiveDebugpyEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	requireDebugpyForApp(t, dir)
+
+	path := filepath.Join(dir, "fixture.py")
+	src := "def add(a, b):\n    total = a + b\n    return total\n\n\nprint(add(2, 3))\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newTestApp(t, dir)
+	a.openFile(path)
+	t.Cleanup(a.stopDebugSession)
+
+	if !a.hasDebuggableTab() {
+		t.Fatal("hasDebuggableTab is false for a .py file; F5 would refuse before starting")
+	}
+
+	// Buffer line 1 is `    total = a + b`. Checked by TEXT.
+	const bpLine = 1
+	if got := a.activeTabPtr().LineText(bpLine); !strings.Contains(got, "total = a + b") {
+		t.Fatalf("fixture line %d is %q", bpLine, got)
+	}
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: bpLine, Col: 0}, false)
+	a.handleKey(tcell.NewEventKey(tcell.KeyF9, 0, tcell.ModNone))
+	a.syncBreakpoints()
+
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+	if a.debug == nil {
+		t.Fatalf("F5 did not start a session on a Python file; status %q", a.statusMsg)
+	}
+	if a.debug.adapter != "debugpy" {
+		t.Fatalf("F5 started %q for a .py file", a.debug.adapter)
+	}
+
+	if !pumpEvents(t, a, 120*time.Second, func() bool {
+		return a.debug != nil && a.debug.stopped && a.debug.path != ""
+	}) {
+		state := "no session"
+		if a.debug != nil {
+			state = fmt.Sprintf("starting=%v running=%v stopped=%v", a.debug.starting, a.debug.running, a.debug.stopped)
+		}
+		t.Fatalf("the program never stopped on the breakpoint (%s). last status: %q", state, a.statusMsg)
+	}
+	a.draw()
+
+	if got := a.activeTabPtr().LineText(a.debug.line); !strings.Contains(got, "total = a + b") {
+		t.Errorf("stopped on a line whose text is %q, not the marked line", got)
+	}
+	if got := gutterRuneAt(t, a, bpLine); got != '▶' {
+		t.Errorf("the gutter on the stopped line is %q, want '▶'", got)
+	}
+	if !strings.Contains(a.debugStatus(), "fixture.py:2") {
+		t.Errorf("status %q does not report the 1-based stopped location", a.debugStatus())
+	}
+	t.Logf("F5 on Python → %s · gutter shows ▶", a.debugStatus())
+
+	// Evaluate in the stopped frame answers about THIS call.
+	tab := a.activeTabPtr()
+	tab.MoveCursorTo(editor.Position{Line: bpLine, Col: strings.Index(tab.LineText(bpLine), "a + b")}, false)
+	a.menuDebugEvaluate()
+	if !pumpEvents(t, a, 30*time.Second, func() bool { return strings.Contains(a.statusMsg, "a = ") }) {
+		t.Fatalf("Evaluate never answered on debugpy; status %q", a.statusMsg)
+	}
+	if !strings.Contains(a.statusMsg, "a = 2") {
+		t.Errorf("Evaluate said %q, want `a = 2`", a.statusMsg)
+	}
+	t.Logf("Evaluate on debugpy → %q", a.statusMsg)
+
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+	if !pumpEvents(t, a, 60*time.Second, func() bool { return a.debug == nil }) {
+		t.Fatalf("F5 did not resume the Python program to completion; session still %+v", a.debug)
+	}
+	t.Logf("F5 again → ran to completion: %q", a.statusMsg)
+}
+
+// TestConditionEditedWhileStartingStillReachesTheAdapter closes the window
+// between F5 and the adapter answering.
+//
+// 🔴 menuStartDebug snapshots the breakpoint list on the main goroutine and
+// sends it from a background one, and bringing an adapter up takes SECONDS —
+// it compiles the program. A condition typed inside that window lands on the
+// Mark, finds no client to push to, and would then never be sent at all: absent
+// for the whole session, on the one breakpoint the user went out of their way
+// to refine, with nothing on screen to say so.
+//
+// The same window must not produce a FALSE refusal either: capabilities do not
+// exist until initialize is answered, and a zero Capabilities reads as "supports
+// nothing", so a gate that did not exempt `starting` would tell the user their
+// debugger cannot do conditions when it can.
+func TestConditionEditedWhileStartingStillReachesTheAdapter(t *testing.T) {
+	a, path := debugFixture(t)
+	tab := a.activeTabPtr()
+	tab.SetMark(5, editor.Mark{Kind: editor.MarkBreakpoint, Enabled: true, VerifiedLine: -1})
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: 0}, false)
+	a.syncBreakpoints()
+
+	// The state menuStartDebug leaves behind: no client yet.
+	a.debug = &debugSession{adapter: "delve", starting: true, bound: map[string][]boundBreakpoint{}}
+
+	a.menuSetCondition()
+	if !a.promptOpen {
+		t.Fatalf("the condition prompt was refused while the adapter was starting; status %q", a.statusMsg)
+	}
+	a.promptValue = []rune("i == 3")
+	a.promptCursor = len(a.promptValue)
+	a.promptSubmit()
+
+	if !a.debug.breakpointsDirty {
+		t.Fatal("an edit during startup was not recorded; it would never reach the adapter")
+	}
+
+	// Now the adapter finishes coming up.
+	client, fake := newRecordingAdapter(t)
+	a.handleDebugStarted(&debugStartedEvent{
+		when: time.Now(), client: client, adapter: "delve",
+		caps:  dap.Capabilities{SupportsConditionalBreakpoints: true},
+		bound: map[string][]boundBreakpoint{path: {{Requested: 5, Bound: 5, Verified: true}}},
+	})
+
+	if !pumpEvents(t, a, 10*time.Second, func() bool { return len(fake.setBreakpointCalls()) > 0 }) {
+		t.Fatalf("the condition typed during startup never reached the adapter; requests %+v", fake.requests())
+	}
+	bps := wireBreakpoints(fake.setBreakpointCalls()[0])
+	if len(bps) != 1 || bps[0]["condition"] != "i == 3" {
+		t.Fatalf("the resent breakpoints are %+v, want the condition typed during startup", bps)
+	}
+	if a.debug.breakpointsDirty {
+		t.Error("the dirty flag survived the resend; every later start would re-push for nothing")
 	}
 }

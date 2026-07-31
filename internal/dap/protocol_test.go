@@ -296,3 +296,53 @@ func TestCapabilitiesReadDelvesRealAnswer(t *testing.T) {
 		t.Errorf("DefaultFilters = %v", got)
 	}
 }
+
+// TestSourceBreakpointOmitsEmptyConditionAndLogMessage pins the wire shape of
+// the two fields this stage made real.
+//
+// 🔴 Both carry omitempty, and it is not tidiness. An adapter reads an
+// empty-string condition as a CONDITION — one that never evaluates true — so a
+// breakpoint sent with `"condition": ""` silently never fires, which is
+// indistinguishable from a breakpoint the adapter refused to bind. Same for
+// logMessage: an empty one turns a breakpoint into a logpoint that prints
+// nothing and, crucially, no longer stops.
+func TestSourceBreakpointOmitsEmptyConditionAndLogMessage(t *testing.T) {
+	raw, err := json.Marshal(SourceBreakpoint{Line: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+	for _, key := range []string{"condition", "logMessage", "hitCondition", "column"} {
+		if strings.Contains(got, key) {
+			t.Errorf("a plain breakpoint marshalled as %s and carries %q", got, key)
+		}
+	}
+	if !strings.Contains(got, `"line":12`) {
+		t.Errorf("marshalled as %s, want the line", got)
+	}
+
+	raw, err = json.Marshal(SourceBreakpoint{Line: 12, Condition: "i == 3", LogMessage: "i is {i}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = string(raw)
+	if !strings.Contains(got, `"condition":"i == 3"`) {
+		t.Errorf("marshalled as %s, want the condition on the wire", got)
+	}
+	if !strings.Contains(got, `"logMessage":"i is {i}"`) {
+		t.Errorf("marshalled as %s, want the log message on the wire", got)
+	}
+}
+
+// TestEvaluateContextsAreTheProtocolSpellings guards the two constants against a
+// rename or a typo, which would be invisible: an adapter given an unknown
+// context does not refuse, it falls back to its own default and answers from
+// whatever scope that implies.
+func TestEvaluateContextsAreTheProtocolSpellings(t *testing.T) {
+	if EvalContextWatch != "watch" {
+		t.Errorf("EvalContextWatch = %q, want watch", EvalContextWatch)
+	}
+	if EvalContextRepl != "repl" {
+		t.Errorf("EvalContextRepl = %q, want repl", EvalContextRepl)
+	}
+}

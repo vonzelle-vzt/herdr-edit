@@ -142,7 +142,193 @@ func StartConn(name string, rw io.ReadWriteCloser, h Handlers) *Client {
 	return c
 }
 
-// StartCommand spawns an adapter and connects to it.
+// Transport is how a client reaches an adapter's protocol stream.
+//
+// 🔴 There are exactly two and neither is a superset of the other. `dlv dap` has
+// NO stdio mode at all — it is a socket server — while debugpy's adapter speaks
+// the protocol over its own stdin/stdout and only listens on a port when told
+// to. An abstraction that assumed either shape would have had to be unpicked the
+// moment a second adapter arrived, which is precisely why Client was built
+// around an io.ReadWriteCloser: BELOW this one dispatch the two transports are
+// the same code — same framing, same read loop, same Stop.
+type Transport int
+
+const (
+	// TransportSocket makes US listen and the adapter dial IN. See
+	// startSocketCommand for why that direction and not the other.
+	TransportSocket Transport = iota
+
+	// TransportStdio speaks the protocol over the adapter's own stdin/stdout.
+	// The debuggee's output must NOT come back the same way — see
+	// startStdioCommand.
+	TransportStdio
+)
+
+// Command is one adapter resolved down to something that can be executed: what
+// to run, with what extra environment, over which transport, and where it was
+// found.
+//
+// It is a struct rather than a bare argv because the second adapter needed all
+// four. Threading them as parameters would have put the "how do I reach this
+// particular tool" knowledge into client.go, which is the one place in this
+// package that must stay adapter-agnostic.
+type Command struct {
+	// Argv is the command line, already resolved to an absolute binary.
+	Argv []string
+
+	// Env holds extra KEY=VALUE entries APPENDED to the inherited environment.
+	//
+	// It exists because the MIT VS Code copy of debugpy is a library directory
+	// rather than an installed distribution, so PYTHONPATH is the only thing
+	// that makes `python -m debugpy.adapter` resolve to it. That is data about
+	// one adapter, and it belongs in the registry rather than in a branch here.
+	Env []string
+
+	// Transport is how the protocol stream is reached.
+	Transport Transport
+
+	// Origin says WHERE this was found — a virtualenv, a VS Code extension
+	// directory, PATH. Surfaced to the user, because "debugpy started" is a
+	// materially different statement depending on which debugpy it was, and a
+	// silently-preferred global install is how a project's pinned version gets
+	// bypassed with nothing on screen to say so.
+	Origin string
+}
+
+// StartCommand spawns an adapter and connects to it over its own transport.
+//
+// dir is the working directory for the adapter, normally the project root.
+func StartCommand(ctx context.Context, name string, spec Command, dir string, h Handlers) (*Client, error) {
+	if len(spec.Argv) == 0 {
+		return nil, fmt.Errorf("%s: no command configured", name)
+	}
+	if spec.Transport == TransportStdio {
+		return startStdioCommand(name, spec, dir, h)
+	}
+	return startSocketCommand(ctx, name, spec, dir, h)
+}
+
+// newAdapterCmd builds the exec.Cmd both transports spawn, with the stderr ring
+// attached and any extra environment folded in.
+//
+// 🔴 cmd.Env is left NIL when there is nothing to add, rather than being set to
+// os.Environ(). The two are equivalent today, but an explicit copy is a snapshot
+// taken at spawn time and a nil is "inherit", and only one of those keeps
+// working if this ever moves off the main goroutine.
+func newAdapterCmd(spec Command, dir string, ring *lineRing) *exec.Cmd {
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
+	cmd.Dir = dir
+	if len(spec.Env) > 0 {
+		cmd.Env = append(os.Environ(), spec.Env...)
+	}
+	cmd.Stderr = ring
+	return cmd
+}
+
+// startStdioCommand spawns an adapter that speaks the protocol over its own
+// stdin/stdout — debugpy's shape.
+//
+// 🔴 There is no accept to wait for here, so unlike the socket path an adapter
+// that dies on startup (`No module named debugpy`) cannot be reported from this
+// function. It surfaces one step later instead: the read loop hits EOF,
+// handleDisconnect logs the retained stderr, and the in-flight initialize is
+// failed rather than left hanging. That is why callers append LastStderr() to an
+// initialize failure — without it the user is told "connection lost" for
+// something whose actual reason the adapter printed.
+//
+// 🔴 The debuggee must never be handed this stdout: it IS the protocol stream,
+// so a debugged program's print would be framed as garbage and desynchronise the
+// session permanently. Adapters forward it as `output` events instead when asked
+// to (debugpy's console:internalConsole, delve's outputMode:remote), which is a
+// registry-level launch key rather than anything this function can enforce.
+func startStdioCommand(name string, spec Command, dir string, h Handlers) (*Client, error) {
+	ring := &lineRing{max: maxStderrLines}
+	cmd := newAdapterCmd(spec, dir, ring)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("%s: stdin: %w", name, err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, fmt.Errorf("%s: stdout: %w", name, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	conn := &stdioConn{in: stdin, out: stdout}
+	c := &Client{
+		name:       name,
+		cmd:        cmd,
+		exited:     exited,
+		stderr:     ring,
+		conn:       conn,
+		r:          bufio.NewReaderSize(conn, 64*1024),
+		handlers:   h,
+		pending:    make(map[int]chan Response),
+		seenEvents: make(map[string]bool),
+		waiters:    make(map[string][]chan struct{}),
+	}
+	go c.readLoop()
+	return c, nil
+}
+
+// stdioConn presents a child process's stdin/stdout pipes as the single
+// io.ReadWriteCloser Client is built around, so the stdio adapter reuses the
+// socket adapter's read loop, framing and shutdown verbatim.
+type stdioConn struct {
+	in  io.WriteCloser
+	out io.ReadCloser
+
+	once sync.Once
+	err  error
+}
+
+// Read pulls from the adapter's stdout.
+func (s *stdioConn) Read(p []byte) (int, error) { return s.out.Read(p) }
+
+// Write pushes to the adapter's stdin.
+func (s *stdioConn) Write(p []byte) (int, error) { return s.in.Write(p) }
+
+// Close shuts both pipes, which is what makes an adapter blocked on reading its
+// stdin see EOF and exit. Idempotent because Stop closes the connection and the
+// process teardown may race with the read loop noticing.
+func (s *stdioConn) Close() error {
+	s.once.Do(func() {
+		if err := s.in.Close(); err != nil {
+			s.err = err
+		}
+		if err := s.out.Close(); err != nil && s.err == nil {
+			s.err = err
+		}
+	})
+	return s.err
+}
+
+// SetWriteDeadline forwards a deadline to the underlying pipe when it has one.
+//
+// 🔴 This is what keeps writeTimeout's guarantee on the stdio transport. Without
+// it a wedged adapter — alive but no longer reading its stdin — blocks a write
+// forever while holding the client mutex, and the symptom is the EDITOR HANGING
+// ON QUIT rather than anything to do with debugging. os.Pipe descriptors are
+// pollable, so this really does bound the write; the type assertion is there
+// because exec.Cmd's pipes are wrapped, not because it is expected to fail.
+func (s *stdioConn) SetWriteDeadline(t time.Time) error {
+	if d, ok := s.in.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return d.SetWriteDeadline(t)
+	}
+	return nil
+}
+
+// startSocketCommand spawns an adapter and waits for it to dial back in.
 //
 // 🔴 We LISTEN and let the adapter dial IN (delve's --client-addr), rather than
 // letting it listen and polling for its socket to appear. `dlv dap` has no stdio
@@ -152,12 +338,8 @@ func StartConn(name string, rw io.ReadWriteCloser, h Handlers) *Client {
 // try to connect too early. The alternative (spawn, then poll for "DAP server
 // listening at" on stdout, then dial) fails as "the adapter never started",
 // which is indistinguishable from the adapter not being installed.
-//
-// dir is the working directory for the adapter, normally the project root.
-func StartCommand(ctx context.Context, name string, argv []string, dir string, h Handlers) (*Client, error) {
-	if len(argv) == 0 {
-		return nil, fmt.Errorf("%s: no command configured", name)
-	}
+func startSocketCommand(ctx context.Context, name string, spec Command, dir string, h Handlers) (*Client, error) {
+	argv := spec.Argv
 
 	sock, err := shortSocketPath()
 	if err != nil {
@@ -173,9 +355,7 @@ func StartCommand(ctx context.Context, name string, argv []string, dir string, h
 	for i, a := range argv {
 		resolved[i] = strings.ReplaceAll(a, SocketPlaceholder, sock)
 	}
-
-	cmd := exec.Command(resolved[0], resolved[1:]...)
-	cmd.Dir = dir
+	spec.Argv = resolved
 
 	// 🔴 The debuggee must never inherit OUR stdio. `dlv dap` hands the program
 	// it launches the adapter's own descriptors, so giving the adapter
@@ -189,9 +369,9 @@ func StartCommand(ctx context.Context, name string, argv []string, dir string, h
 	// — exactly the ones that explain a death — cannot be lost to Wait closing a
 	// pipe out from under a reader.
 	ring := &lineRing{max: maxStderrLines}
+	cmd := newAdapterCmd(spec, dir, ring)
 	cmd.Stdout = io.Discard // dlv's own startup chatter; nothing acts on it
-	cmd.Stderr = ring
-	cmd.Stdin = nil // /dev/null, not our terminal
+	cmd.Stdin = nil         // /dev/null, not our terminal
 
 	if err := cmd.Start(); err != nil {
 		ln.Close()
@@ -641,6 +821,33 @@ func (c *Client) Variables(ctx context.Context, ref, start, count int) ([]Variab
 		}
 	}
 	return body.Variables, nil
+}
+
+// Evaluate asks the adapter what an expression is worth.
+//
+// 🔴 frameID and evalContext travel together and getting the pair wrong is a
+// bug that RENDERS. With EvalContextWatch and a frame id the expression is
+// evaluated in that frame, which is the only way "what is `i` here" can mean
+// the `i` the user is looking at; with EvalContextRepl and no frame it is
+// evaluated globally. Passing a frame id with repl, or watch with none, is
+// something both delve and debugpy accept and answer — from another scope,
+// with no error to say so. Pass 0 for frameID when there is no stop.
+func (c *Client) Evaluate(ctx context.Context, expr string, frameID int, evalContext string) (EvaluateResult, error) {
+	raw, err := c.call(ctx, "evaluate", evaluateArgs{
+		Expression: expr,
+		FrameID:    frameID,
+		Context:    evalContext,
+	})
+	if err != nil {
+		return EvaluateResult{}, err
+	}
+	var body EvaluateResult
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return EvaluateResult{}, err
+		}
+	}
+	return body, nil
 }
 
 // Terminate asks the adapter to end the debuggee politely, giving it a chance

@@ -5,9 +5,17 @@
 // Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
-// debug.go is Lane B stage 2: a real debug adapter behind the breakpoint marks
-// stage 1 drew. Press F5, the program runs under delve, it stops on your
-// breakpoint, the editor opens that file and paints ▶ on the line.
+// debug.go is the debug SESSION: a real adapter behind the breakpoint marks
+// breakpoints.go draws. Press F5, the program runs under delve (Go) or debugpy
+// (Python), it stops on your breakpoint, the editor opens that file and paints ▶
+// on the line.
+//
+// 🔴 It is also the one layer that knows what the adapter can DO. An adapter
+// without supportsConditionalBreakpoints does not refuse a condition — it drops
+// the field — so the breakpoint then fires every single time and the user
+// concludes conditions are broken. sourceBreakpointsFor is where that is caught,
+// because this is the only layer holding both the capabilities and a status line
+// to complain on.
 //
 // What is here is the SESSION: starting it, continuing it, stopping it, knowing
 // where it is, and painting that. What you do once it has stopped — stepping,
@@ -101,6 +109,16 @@ type debugSession struct {
 	client  *dap.Client
 	adapter string
 
+	// caps is what THIS adapter said it could do at initialize, refreshed if it
+	// revises itself with a `capabilities` event.
+	//
+	// 🔴 Kept on the session rather than read from client.Caps() at each use so
+	// that a session's capabilities and its client cannot disagree — and, more
+	// importantly, so the refusal path is reachable in a test without a live
+	// adapter that lacks the capability. A gate whose refusing branch can only
+	// be exercised by installing a different debugger is a gate nobody runs.
+	caps dap.Capabilities
+
 	// starting is true between F5 and the adapter finishing configuration.
 	// Distinct from running so a second F5 in that window says "starting…"
 	// rather than launching a second debugger.
@@ -117,6 +135,17 @@ type debugSession struct {
 	// bound maps an absolute path to what the adapter did with that file's
 	// breakpoints. Read by the gutter overlay.
 	bound map[string][]boundBreakpoint
+
+	// breakpointsDirty records a breakpoint edit made while the session was
+	// still coming up.
+	//
+	// 🔴 The start path SNAPSHOTS the breakpoint list on the main goroutine at
+	// F5 and sends it from a background one, and bringing an adapter up takes
+	// seconds — 7.4 of them cold, because it compiles the program. A condition
+	// typed inside that window would land on the Mark, find no client to push
+	// to, and then never be sent at all: silently absent for the whole session,
+	// on the one breakpoint the user went out of their way to refine.
+	breakpointsDirty bool
 
 	// frames is the stopped thread's stack, innermost first, and curFrame is
 	// the one the user is looking at. Fetched once per stop by fetchStack, so
@@ -193,11 +222,39 @@ type debugStartedEvent struct {
 	when    time.Time
 	client  *dap.Client
 	adapter string
+	caps    dap.Capabilities
 	bound   map[string][]boundBreakpoint
+	notes   []string
 	err     error
 }
 
 func (e *debugStartedEvent) When() time.Time { return e.when }
+
+// debugRebindEvent carries the result of re-sending breakpoints to an adapter
+// that is ALREADY running — what happens when a condition or a log message is
+// edited mid-session.
+//
+// It is a separate event from debugStartedEvent because it must not touch the
+// starting/running flags: the session is already up, and folding this into the
+// start path would have a breakpoint edit report "delve running" over the top of
+// a program that is currently stopped somewhere.
+type debugRebindEvent struct {
+	when  time.Time
+	bound map[string][]boundBreakpoint
+	notes []string
+}
+
+func (e *debugRebindEvent) When() time.Time { return e.when }
+
+// debugEvalEvent carries an evaluate answer back to the main loop.
+type debugEvalEvent struct {
+	when time.Time
+	expr string
+	res  dap.EvaluateResult
+	err  string
+}
+
+func (e *debugEvalEvent) When() time.Time { return e.when }
 
 // debugStoppedEvent says where the program stopped, in BUFFER coordinates.
 //
@@ -302,7 +359,7 @@ func (a *App) menuStartDebug() {
 	}
 	tab := a.activeTabPtr()
 	if !a.hasDebuggableTab() {
-		a.flash("Nothing here to debug — open a Go file first")
+		a.flash("Nothing here to debug — open a Go or Python file first")
 		return
 	}
 	adapter, ok := dap.AdapterFor(lsp.LanguageID(tab.Path))
@@ -318,7 +375,16 @@ func (a *App) menuStartDebug() {
 	// a.breakpoints from the background one would race the poll in Run that
 	// keeps it current.
 	bps := a.enabledBreakpoints()
-	program := filepath.Dir(tab.Path)
+
+	// 🔴 What `program` names is per-adapter. Delve's debug mode builds a Go
+	// PACKAGE, so it has to be the enclosing directory; debugpy runs a SCRIPT, so
+	// it has to be the file. Hardcoding the directory — which is what stage 2 did,
+	// correctly, for the only adapter that existed — makes debugpy try to execute
+	// a directory.
+	program := tab.Path
+	if adapter.ProgramIsDir {
+		program = filepath.Dir(tab.Path)
+	}
 
 	// A new run starts a clean console; the previous run's output belonged to a
 	// different program state and mixing the two silently is worse than losing it.
@@ -382,8 +448,15 @@ func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpo
 
 	caps, err := client.Initialize(ctx, adapter.AdapterID)
 	if err != nil {
+		// 🔴 The adapter's own stderr is appended here, and it is the whole
+		// message on the stdio transport. A socket adapter that dies on startup
+		// fails inside StartCommand, which already explains itself; a stdio one
+		// cannot — there is no accept to fail — so the first thing to notice is
+		// this request coming back "connection lost". Without the stderr the user
+		// is told the connection dropped for something whose actual reason
+		// (`No module named debugpy`) the adapter printed a moment earlier.
 		client.Stop()
-		fail(err)
+		fail(withAdapterStderr(err, client))
 		return
 	}
 
@@ -400,32 +473,11 @@ func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpo
 
 	if err := client.WaitEvent(ctx, dap.EventInitialized); err != nil {
 		client.Stop()
-		fail(fmt.Errorf("%w (adapter said: %s)", err, strings.Join(client.LastStderr(), " | ")))
+		fail(withAdapterStderr(err, client))
 		return
 	}
 
-	bound := make(map[string][]boundBreakpoint)
-	for path, list := range groupBreakpointsByPath(bps) {
-		// 🔴 Whole-file, always: setBreakpoints REPLACES the set for a source,
-		// so each file's complete list goes in one call.
-		sbps := make([]dap.SourceBreakpoint, len(list))
-		for i, b := range list {
-			sbps[i] = dap.SourceBreakpoint{
-				Line:       adapterLineFromBuf(b.Line),
-				Condition:  b.Condition,
-				LogMessage: b.LogMessage,
-			}
-		}
-		answers, err := client.SetBreakpoints(ctx, dap.Source{Path: path, Name: filepath.Base(path)}, sbps)
-		if err != nil {
-			// A file the adapter will not accept is not fatal to the session —
-			// the others may still bind, and stopping here would throw away a
-			// working debug run over one bad path.
-			a.post(&debugLogEvent{when: time.Now(), msg: "breakpoints in " + filepath.Base(path) + ": " + err.Error()})
-			continue
-		}
-		bound[path] = boundFromAnswers(list, answers)
-	}
+	bound, notes := pushBreakpoints(ctx, client, caps, adapter.Name, groupBreakpointsByPath(bps))
 
 	if err := client.SetExceptionBreakpoints(ctx, caps.DefaultFilters()); err != nil {
 		a.post(&debugLogEvent{when: time.Now(), msg: "exception breakpoints: " + err.Error()})
@@ -436,7 +488,117 @@ func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpo
 		return
 	}
 
-	a.post(&debugStartedEvent{when: time.Now(), client: client, adapter: adapter.Name, bound: bound})
+	a.post(&debugStartedEvent{
+		when: time.Now(), client: client, adapter: adapter.Name,
+		caps: caps, bound: bound, notes: notes,
+	})
+}
+
+// pushBreakpoints sends each file's COMPLETE breakpoint set and reports what the
+// adapter made of it, along with anything the user needs told.
+//
+// 🔴 It takes a map keyed by path rather than a flat list, and a path mapped to
+// an EMPTY list is meaningful: it clears that file. setBreakpoints has no
+// incremental form, so re-sending only the files that still have breakpoints
+// would leave the adapter armed on a file the user just emptied — a breakpoint
+// that "cannot be deleted", which is indistinguishable from the delete key not
+// working. resendBreakpoints is the caller that relies on it.
+//
+// A file the adapter refuses is not fatal: the others may still bind, and
+// abandoning the run over one bad path throws away a working debug session.
+func pushBreakpoints(ctx context.Context, client *dap.Client, caps dap.Capabilities, adapter string,
+	groups map[string][]Breakpoint) (map[string][]boundBreakpoint, []string) {
+
+	bound := make(map[string][]boundBreakpoint, len(groups))
+	var notes []string
+	droppedConditions, droppedLogpoints := 0, 0
+
+	for path, list := range groups {
+		sbps, nCond, nLog := sourceBreakpointsFor(caps, list)
+		droppedConditions += nCond
+		droppedLogpoints += nLog
+
+		answers, err := client.SetBreakpoints(ctx, dap.Source{Path: path, Name: filepath.Base(path)}, sbps)
+		if err != nil {
+			notes = append(notes, "breakpoints in "+filepath.Base(path)+": "+err.Error())
+			continue
+		}
+		bound[path] = boundFromAnswers(list, answers)
+	}
+	// Counted across every file and reported ONCE. Per-file messages would say
+	// the same sentence three times for a project with breakpoints in three
+	// files, and the status bar shows one line.
+	notes = append(capabilityRefusals(adapter, droppedConditions, droppedLogpoints), notes...)
+	return bound, notes
+}
+
+// sourceBreakpointsFor converts one file's complete breakpoint list into wire
+// breakpoints, DROPPING any field this adapter cannot honour and counting each
+// drop. Returns the wire list, the number of conditions dropped, and the number
+// of log messages dropped.
+//
+// 🔴 Dropping rather than sending is the whole point, and the failure it
+// prevents is silent in both directions. An adapter that never advertised
+// supportsConditionalBreakpoints does not REFUSE a condition — it ignores the
+// field — so the breakpoint is accepted, reported verified, and then fires on
+// every iteration of the loop the user wrote `i == 3` for. Nothing on screen
+// distinguishes that from a condition that is simply wrong, so the user
+// concludes conditions are broken. Sending nothing and saying so out loud is the
+// only honest version.
+func sourceBreakpointsFor(caps dap.Capabilities, list []Breakpoint) (out []dap.SourceBreakpoint, droppedConditions, droppedLogpoints int) {
+	// Never nil: internal/dap turns a nil into an empty array because null is
+	// rejected, but an explicit empty slice keeps "clear this file" readable
+	// here rather than two layers down.
+	out = make([]dap.SourceBreakpoint, 0, len(list))
+	for _, b := range list {
+		sb := dap.SourceBreakpoint{Line: adapterLineFromBuf(b.Line)}
+		if b.Condition != "" {
+			if caps.SupportsConditionalBreakpoints {
+				sb.Condition = b.Condition
+			} else {
+				droppedConditions++
+			}
+		}
+		if b.LogMessage != "" {
+			if caps.SupportsLogPoints {
+				sb.LogMessage = b.LogMessage
+			} else {
+				droppedLogpoints++
+			}
+		}
+		out = append(out, sb)
+	}
+	return out, droppedConditions, droppedLogpoints
+}
+
+// capabilityRefusals renders what was dropped, naming the adapter.
+//
+// The adapter's name is in the message on purpose: "conditions are not
+// supported" reads as a limitation of this editor, which is the wrong thing to
+// go and fix. "delve does not support log points" names the component that would
+// have to change.
+func capabilityRefusals(adapter string, droppedConditions, droppedLogpoints int) []string {
+	var out []string
+	if droppedConditions > 0 {
+		out = append(out, fmt.Sprintf("%s does not support conditional breakpoints — %s ignored",
+			adapter, plural(droppedConditions, "condition")))
+	}
+	if droppedLogpoints > 0 {
+		out = append(out, fmt.Sprintf("%s does not support log points — %s ignored",
+			adapter, plural(droppedLogpoints, "log message")))
+	}
+	return out
+}
+
+// withAdapterStderr attaches whatever the adapter printed to an error, because
+// "the connection was lost" is the least actionable thing a debugger can say and
+// the reason is almost always sitting in its stderr.
+func withAdapterStderr(err error, client *dap.Client) error {
+	lines := client.LastStderr()
+	if len(lines) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w (adapter said: %s)", err, strings.Join(lines, " | "))
 }
 
 // groupBreakpointsByPath buckets breakpoints per file, because setBreakpoints
@@ -447,6 +609,64 @@ func groupBreakpointsByPath(bps []Breakpoint) map[string][]Breakpoint {
 		out[b.Path] = append(out[b.Path], b)
 	}
 	return out
+}
+
+// resendBreakpoints pushes the CURRENT set to an adapter that is already
+// running, and is what makes editing a condition mid-session take effect.
+//
+// 🔴 Every file that has EVER been bound in this session is included, even when
+// it now has no breakpoints at all — see pushBreakpoints. And every file is sent
+// whole: adding a condition to one breakpoint re-sends all of that file's, or
+// the rest are cleared by the same call that was meant to refine one of them.
+//
+// A no-op with no session, so callers do not have to check.
+func (a *App) resendBreakpoints() {
+	if a.debug == nil {
+		return
+	}
+	if a.debug.client == nil {
+		// Still starting: the launch path already snapshotted the list, so this
+		// edit would otherwise never reach the adapter. handleDebugStarted picks
+		// the flag up once there is a client to push to.
+		a.debug.breakpointsDirty = true
+		return
+	}
+	// The mark changed a moment ago; a.breakpoints is only refreshed by the
+	// polled sync in Run, and sending the pre-edit list would push the very
+	// state the user just changed.
+	a.syncBreakpoints()
+
+	groups := groupBreakpointsByPath(a.enabledBreakpoints())
+	for path := range a.debug.bound {
+		if _, ok := groups[path]; !ok {
+			groups[path] = nil // whole-file clear
+		}
+	}
+
+	client, caps, adapter := a.debug.client, a.debug.caps, a.debug.adapter
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), debugRequestTimeout)
+		defer cancel()
+		bound, notes := pushBreakpoints(ctx, client, caps, adapter, groups)
+		a.post(&debugRebindEvent{when: time.Now(), bound: bound, notes: notes})
+	}()
+}
+
+// handleDebugRebind applies a mid-session breakpoint push.
+func (a *App) handleDebugRebind(e *debugRebindEvent) {
+	if a.debug == nil {
+		return // the session ended while the request was in flight
+	}
+	if a.debug.bound == nil {
+		a.debug.bound = map[string][]boundBreakpoint{}
+	}
+	for path, list := range e.bound {
+		a.debug.bound[path] = list
+	}
+	a.applyBoundBreakpoints()
+	if len(e.notes) > 0 {
+		a.flash(strings.Join(e.notes, " · "))
+	}
 }
 
 // boundFromAnswers pairs what we asked for with what the adapter did.
@@ -549,8 +769,24 @@ func (a *App) handleDebugStarted(e *debugStartedEvent) {
 	a.debug.client = e.client
 	a.debug.starting = false
 	a.debug.running = true
+	a.debug.caps = e.caps
 	a.debug.bound = e.bound
 	a.applyBoundBreakpoints()
+
+	// A breakpoint edited while the adapter was still compiling the program did
+	// not reach it — the list was snapshotted at F5. Push the current one now.
+	if a.debug.breakpointsDirty {
+		a.debug.breakpointsDirty = false
+		a.resendBreakpoints()
+	}
+
+	// A capability the adapter could not honour outranks the summary: it names
+	// something the user asked for and did not get, which the count of
+	// unverified breakpoints does not cover and would otherwise hide.
+	if len(e.notes) > 0 {
+		a.flash(strings.Join(e.notes, " · "))
+		return
+	}
 
 	unverified := 0
 	for _, list := range e.bound {
@@ -588,7 +824,7 @@ func (a *App) applyBoundBreakpoints() {
 		}
 		for _, b := range list {
 			m, exists := tab.MarkAt(b.Requested)
-			if !exists || m.Kind != editor.MarkBreakpoint {
+			if !exists || !isBreakpointKind(m.Kind) {
 				continue
 			}
 			m.Verified = b.Verified
@@ -648,9 +884,18 @@ func (a *App) handleDAPEvent(e *debugEvent) {
 			a.debug.threadID = te.ThreadID
 		}
 
-	case dap.EventCapabilities, dap.EventProcess, dap.EventInitialized:
-		// Consumed by internal/dap itself (capabilities) or by the start
-		// sequence (initialized); nothing further to do on the UI side.
+	case dap.EventCapabilities:
+		// internal/dap has already folded the revision into Caps(); this copies
+		// it onto the session so the condition/logpoint gates read the CURRENT
+		// answer. An adapter that gains supportsLogPoints mid-session and is
+		// still refused by a stale copy is a feature switched off by a cache.
+		if a.debug.client != nil {
+			a.debug.caps = a.debug.client.Caps()
+		}
+
+	case dap.EventProcess, dap.EventInitialized:
+		// Consumed by the start sequence (initialized) or purely informational
+		// (process); nothing further to do on the UI side.
 	}
 }
 

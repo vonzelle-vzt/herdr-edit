@@ -72,8 +72,8 @@ func TestResolvePrefersNodeModulesBin(t *testing.T) {
 
 	r := NewRegistry(root)
 	got := r.Resolve(Adapter{Argv: [][]string{{"some-adapter", "--flag"}}})
-	if len(got) != 2 || got[0] != local || got[1] != "--flag" {
-		t.Fatalf("Resolve = %v, want the repo-local binary plus its args", got)
+	if got == nil || len(got.Argv) != 2 || got.Argv[0] != local || got.Argv[1] != "--flag" {
+		t.Fatalf("Resolve = %+v, want the repo-local binary plus its args", got)
 	}
 }
 
@@ -82,7 +82,7 @@ func TestResolvePrefersNodeModulesBin(t *testing.T) {
 func TestResolveReturnsNilWhenNothingIsInstalled(t *testing.T) {
 	r := NewRegistry(t.TempDir())
 	if got := r.Resolve(Adapter{Argv: [][]string{{"definitely-not-a-real-binary-xyzzy"}}}); got != nil {
-		t.Fatalf("Resolve = %v, want nil for a binary that does not exist", got)
+		t.Fatalf("Resolve = %+v, want nil for a binary that does not exist", got)
 	}
 }
 
@@ -171,7 +171,7 @@ func TestLaunchFailureIsNotSticky(t *testing.T) {
 func TestStartCommandRejectsAnEmptyArgv(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if _, err := StartCommand(ctx, "empty", nil, "", Handlers{}); err == nil {
+	if _, err := StartCommand(ctx, "empty", Command{}, "", Handlers{}); err == nil {
 		t.Fatal("StartCommand accepted an empty argv")
 	}
 }
@@ -198,5 +198,261 @@ func TestNotInstalledErrorNamesTheBinary(t *testing.T) {
 	bare := &NotInstalledError{Name: "delve"}
 	if bare.Error() == "" {
 		t.Error("an error with no command rendered as empty")
+	}
+}
+
+// TestAdapterForPython pins the second row of the table, which is the whole
+// point of this stage: the abstraction has to answer for something other than Go.
+func TestAdapterForPython(t *testing.T) {
+	a, ok := AdapterFor("python")
+	if !ok {
+		t.Fatal("no adapter registered for python")
+	}
+	if a.Name != "debugpy" || a.AdapterID != "python" {
+		t.Errorf("adapter = %s/%s, want debugpy/python", a.Name, a.AdapterID)
+	}
+	if a.Transport != TransportStdio {
+		t.Errorf("debugpy transport = %v, want TransportStdio — `python -m debugpy.adapter` "+
+			"only listens on a port when given --port", a.Transport)
+	}
+	if a.ProgramIsDir {
+		t.Error("debugpy's ProgramIsDir is true; debugpy runs a FILE, not a package directory")
+	}
+	if a.Locate == nil {
+		t.Error("debugpy has no Locate hook, so Resolve would look for a `debugpy` binary on PATH")
+	}
+	if got := a.Launch["console"]; got != "internalConsole" {
+		t.Errorf("debugpy console = %v, want internalConsole — any other mode hands the "+
+			"debuggee our stdout, which on this transport IS the protocol stream", got)
+	}
+
+	// And the first row must not have moved.
+	g, _ := AdapterFor("go")
+	if g.Transport != TransportSocket || !g.ProgramIsDir {
+		t.Errorf("delve = transport %v ProgramIsDir %v, want socket/true", g.Transport, g.ProgramIsDir)
+	}
+}
+
+// writeFakeExtension builds a VS Code extension directory with the given
+// declared licence and a bundled debugpy, returning its path.
+func writeFakeExtension(t *testing.T, root, name, license string) string {
+	t.Helper()
+	dir := filepath.Join(root, name)
+	libs := filepath.Join(dir, "bundled", "libs", "debugpy")
+	if err := os.MkdirAll(libs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(libs, "__init__.py"), []byte("\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := "{\"name\":\"debugpy\"}"
+	if license != "" {
+		body = "{\"name\":\"debugpy\",\"license\":" + strconvQuote(license) + "}"
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// strconvQuote JSON-quotes a string without pulling encoding/json into the test
+// for one field.
+func strconvQuote(s string) string { return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\"" }
+
+// TestVSCodeExtensionLookupRefusesNonOSILicences is the licence gate, and it is
+// a real constraint rather than hygiene.
+//
+// 🔴 A VS Code extensions directory is full of code this MIT repo may not ship
+// against. ms-python.debugpy is MIT and fair to use; ms-python.vscode-pylance
+// declares "SEE LICENSE IN LICENSE.txt" and that licence restricts use to
+// Microsoft products. So an unrecognised licence — including a MISSING one —
+// must be DENY, not unknown-so-probably-fine: treating it as permissive defeats
+// the check in exactly the case it exists for, and the failure is silent, legal,
+// and shipped in a binary.
+//
+// The positive control is in the same test on purpose. "Nothing resolved" passes
+// for a lookup that is simply broken, so the MIT copy alongside proves the
+// refusal is about the licence and not about the search.
+func TestVSCodeExtensionLookupRefusesNonOSILicences(t *testing.T) {
+	root := t.TempDir()
+
+	denied := map[string]string{
+		"ms-python.debugpy-1.0.0-seelicense":  "SEE LICENSE IN LICENSE.txt",
+		"ms-python.debugpy-1.0.1-missing":     "", // no license field at all
+		"ms-python.debugpy-1.0.2-proprietary": "LicenseRef-Microsoft",
+	}
+	for name, lic := range denied {
+		dir := writeFakeExtension(t, root, name, lic)
+		if vscodeExtensionIsOSILicensed(dir) {
+			t.Errorf("licence %q was accepted; only OSI identifiers may be run from an "+
+				"extension directory", lic)
+		}
+		if got := findDebugpyInVSCodeExtensions([]string{root}); got != "" {
+			t.Fatalf("findDebugpyInVSCodeExtensions resolved %q out of a %q-licensed extension",
+				got, lic)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The positive control: an MIT copy in the same place IS resolved, so the
+	// three refusals above are about the licence and not about a search that
+	// never finds anything.
+	mit := writeFakeExtension(t, root, "ms-python.debugpy-2.0.0-mit", "MIT")
+	got := findDebugpyInVSCodeExtensions([]string{root})
+	want := filepath.Join(mit, "bundled", "libs")
+	if got != want {
+		t.Fatalf("findDebugpyInVSCodeExtensions = %q, want the MIT copy at %q", got, want)
+	}
+
+	// And a denied copy sitting NEXT to the MIT one must not win it, whichever
+	// way the version sort happens to order them.
+	writeFakeExtension(t, root, "ms-python.debugpy-9.9.9-seelicense", "SEE LICENSE IN LICENSE.txt")
+	if got := findDebugpyInVSCodeExtensions([]string{root}); got != want {
+		t.Fatalf("a later-versioned, non-OSI copy won: got %q, want %q", got, want)
+	}
+}
+
+// TestVSCodeExtensionLookupIgnoresOtherExtensions checks the search is by NAME
+// as well as by licence: an MIT extension that is not ms-python.debugpy must
+// never be mined for a `bundled/libs/debugpy`, or the gate becomes "scan every
+// extension for anything importable".
+func TestVSCodeExtensionLookupIgnoresOtherExtensions(t *testing.T) {
+	root := t.TempDir()
+	writeFakeExtension(t, root, "some.other-extension-1.0.0", "MIT")
+	if got := findDebugpyInVSCodeExtensions([]string{root}); got != "" {
+		t.Fatalf("resolved %q out of an unrelated extension", got)
+	}
+}
+
+// TestVSCodeExtensionLicenseReadsThePackageManifest pins where the answer comes
+// from: package.json's `license` field, not a LICENSE file's contents.
+//
+// Reading LICENSE.txt would be the obvious "be helpful" move and is exactly
+// wrong — "SEE LICENSE IN LICENSE.txt" is a manifest pointing AT a file whose
+// text this code cannot adjudicate, and a licence a program cannot name is one a
+// human has to look at.
+func TestVSCodeExtensionLicenseReadsThePackageManifest(t *testing.T) {
+	root := t.TempDir()
+	dir := writeFakeExtension(t, root, "ms-python.debugpy-1.2.3", "MIT")
+	if got := vscodeExtensionLicense(dir); got != "MIT" {
+		t.Errorf("license = %q, want MIT", got)
+	}
+	// A LICENSE.txt saying MIT does NOT rescue a manifest that does not.
+	if err := os.WriteFile(filepath.Join(dir, "LICENSE.txt"), []byte("MIT License\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"),
+		[]byte(`{"license":"SEE LICENSE IN LICENSE.txt"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if vscodeExtensionIsOSILicensed(dir) {
+		t.Error("an MIT-looking LICENSE.txt overrode a non-OSI manifest field")
+	}
+	if got := vscodeExtensionLicense(filepath.Join(root, "nope")); got != "" {
+		t.Errorf("license of a missing directory = %q, want empty", got)
+	}
+}
+
+// TestLocateDebugpyPrefersTheProjectVirtualenv pins the resolution ORDER at its
+// most load-bearing point.
+//
+// 🔴 A debugger running under a different interpreter from the code sees a
+// different set of installed packages, so a global debugpy silently winning over
+// the project's own is a debug session about the wrong environment — and nothing
+// on screen says which one it picked, which is why Command.Origin exists.
+//
+// The fake venv here is a real executable that answers `import debugpy`
+// successfully, because that is the actual gate: pythonCanImportDebugpy runs the
+// interpreter rather than guessing from a directory layout.
+func TestLocateDebugpyPrefersTheProjectVirtualenv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the shell-script interpreter stub is POSIX-only")
+	}
+	root := t.TempDir()
+	bin := filepath.Join(root, ".venv", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	python := filepath.Join(bin, "python")
+	if err := os.WriteFile(python, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := LocateDebugpy(root)
+	if cmd == nil {
+		t.Fatal("LocateDebugpy found nothing with a project virtualenv that can import debugpy")
+	}
+	if len(cmd.Argv) < 3 || cmd.Argv[0] != python {
+		t.Fatalf("argv = %v, want the project interpreter %q first", cmd.Argv, python)
+	}
+	if cmd.Argv[1] != "-m" || cmd.Argv[2] != "debugpy.adapter" {
+		t.Errorf("argv = %v, want `-m debugpy.adapter`", cmd.Argv)
+	}
+	if len(cmd.Env) != 0 {
+		t.Errorf("env = %v, want none: an installed debugpy needs no PYTHONPATH", cmd.Env)
+	}
+	if !strings.Contains(cmd.Origin, python) {
+		t.Errorf("origin = %q, does not name where it came from", cmd.Origin)
+	}
+}
+
+// TestLocateDebugpyNeverRunsAnInterpreterThatCannotImportIt is the other half of
+// the order, and it caught the assumption it was written to check.
+//
+// A virtualenv whose interpreter cannot import debugpy must never be chosen ON
+// ITS OWN: the adapter would exit immediately with `No module named debugpy`,
+// and on the stdio transport there is no accept to fail, so the symptom is
+// "connection lost" rather than "not installed". But it is entirely correct for
+// that same interpreter to be chosen WITH the extension copy on PYTHONPATH —
+// that combination is the best available answer, because the debuggee still runs
+// under the python the project expects. So the invariant is not "never use this
+// interpreter", it is "never use it without supplying debugpy".
+func TestLocateDebugpyNeverRunsAnInterpreterThatCannotImportIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the shell-script interpreter stub is POSIX-only")
+	}
+	root := t.TempDir()
+	bin := filepath.Join(root, ".venv", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	python := filepath.Join(bin, "python")
+	if err := os.WriteFile(python, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := LocateDebugpy(root)
+	if cmd == nil {
+		return // nothing else on this machine either; nothing to assert
+	}
+	if cmd.Argv[0] != python {
+		return // it fell through to a system interpreter, which is also correct
+	}
+	if len(cmd.Env) == 0 {
+		t.Fatalf("chose %q with no PYTHONPATH, but it cannot import debugpy: %+v", python, cmd)
+	}
+	if !strings.HasPrefix(cmd.Env[0], "PYTHONPATH=") {
+		t.Errorf("env = %v, want a PYTHONPATH supplying debugpy", cmd.Env)
+	}
+}
+
+// TestNotInstalledErrorCarriesAHint checks the message for an adapter that is a
+// LIBRARY rather than a binary. "debugpy not found on PATH" would send the user
+// looking for a command that does not exist even when debugpy is installed
+// correctly, so the typed error carries the real instruction.
+func TestNotInstalledErrorCarriesAHint(t *testing.T) {
+	e := &NotInstalledError{Name: "debugpy", Hint: "run `pip install debugpy`"}
+	got := e.Error()
+	if !strings.Contains(got, "debugpy is not installed") || !strings.Contains(got, "pip install debugpy") {
+		t.Errorf("error = %q, want the name and the install hint", got)
+	}
+	if strings.Contains(got, "PATH") {
+		t.Errorf("error = %q mentions PATH for a library-shaped adapter", got)
+	}
+	// The delve shape still reads as it did.
+	if got := (&NotInstalledError{Name: "delve", Command: "dlv"}).Error(); !strings.Contains(got, "dlv not found on PATH") {
+		t.Errorf("error = %q, want the binary-not-on-PATH wording", got)
 	}
 }

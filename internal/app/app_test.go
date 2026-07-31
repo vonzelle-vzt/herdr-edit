@@ -1849,18 +1849,23 @@ func TestDrawStatusBar_OmitsBranchWhenEmpty(t *testing.T) {
 // out / Pause, then Call stack / Goroutines / Variables / Debug console, then
 // the Esc 5 "Debug actions" picker row. Still one group, so again only the last
 // divider moves: 57 -> 66.
+//
+// Bumped again by Lane B stage 4, which added FOUR rows to that same Debug group
+// (58 -> 62 items, modalHeight 69 -> 73): "Evaluate at cursor", then "Set
+// breakpoint condition" / "Set logpoint message" / "Clear condition / log
+// message". Still one group, so again only the last divider moves: 66 -> 70.
 func TestMenuLayout_NoCustomActions(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
 	a.customActions = nil
 	items, dividers, h := a.menuLayout()
 
-	if h != 69 {
-		t.Errorf("modalHeight = %d, want 69", h)
+	if h != 73 {
+		t.Errorf("modalHeight = %d, want 73", h)
 	}
-	if got := len(items); got != 58 {
-		t.Errorf("item count = %d, want 58 built-ins", got)
+	if got := len(items); got != 62 {
+		t.Errorf("item count = %d, want 62 built-ins", got)
 	}
-	wantDiv := []int{2, 6, 10, 34, 42, 47, 49, 66}
+	wantDiv := []int{2, 6, 10, 34, 42, 47, 49, 70}
 	if len(dividers) != len(wantDiv) {
 		t.Fatalf("dividers = %v, want %v", dividers, wantDiv)
 	}
@@ -2021,8 +2026,8 @@ func TestMenuLayout_WithCustomActions(t *testing.T) {
 	}
 	items, _, h := a.menuLayout()
 
-	if h != 72 { // 69 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
-		t.Errorf("modalHeight = %d, want 72", h)
+	if h != 76 { // 73 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
+		t.Errorf("modalHeight = %d, want 76", h)
 	}
 	// Custom actions should be the second-to-last and third-to-last
 	// rows, with Quit as the final row.

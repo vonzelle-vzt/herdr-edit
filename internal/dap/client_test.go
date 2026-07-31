@@ -11,9 +11,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -986,4 +989,249 @@ func contains(hay, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestEvaluateCarriesTheFrameAndContext pins the pair that decides WHICH scope
+// an expression is evaluated in.
+//
+// 🔴 frameId and context are not independent knobs. "watch" plus a frame id
+// evaluates in that frame; "repl" with no frame evaluates globally. Both delve
+// and debugpy accept the wrong combination and answer it — from another scope,
+// with no error — so a mistake here renders as a plausible number rather than as
+// a failure. The absence of frameId when there is no frame is asserted on the
+// RAW JSON, because `"frameId": 0` is a question about frame zero rather than
+// the absence of a question.
+func TestEvaluateCarriesTheFrameAndContext(t *testing.T) {
+	var col collector
+	c, f := newFakePair(t, col.handlers())
+	defer stopFake(c, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	type outcome struct {
+		res EvaluateResult
+		err error
+	}
+
+	// --- stopped: watch, in a frame -----------------------------------------
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := c.Evaluate(ctx, "sum", 1000, EvalContextWatch)
+		done <- outcome{res, err}
+	}()
+
+	req := f.readRequest()
+	if req.Command != "evaluate" {
+		t.Fatalf("command = %q, want evaluate", req.Command)
+	}
+	raw, err := json.Marshal(req.Arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		t.Fatal(err)
+	}
+	if args["expression"] != "sum" {
+		t.Errorf("expression = %v, want sum", args["expression"])
+	}
+	if args["context"] != EvalContextWatch {
+		t.Errorf("context = %v, want %q", args["context"], EvalContextWatch)
+	}
+	if got, ok := args["frameId"].(float64); !ok || int(got) != 1000 {
+		t.Errorf("frameId = %v, want 1000 — without it the expression is evaluated in the wrong scope", args["frameId"])
+	}
+	f.respond(req, EvaluateResult{Result: "5", Type: "int"})
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("Evaluate: %v", got.err)
+	}
+	if got.res.Result != "5" || got.res.Type != "int" {
+		t.Errorf("result = %+v, want 5/int", got.res)
+	}
+
+	// --- running: repl, no frame -------------------------------------------
+	go func() {
+		res, err := c.Evaluate(ctx, "os.Args", 0, EvalContextRepl)
+		done <- outcome{res, err}
+	}()
+	req = f.readRequest()
+	raw, _ = json.Marshal(req.Arguments)
+	args = map[string]interface{}{}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := args["frameId"]; present {
+		t.Errorf("frameId is present (%v) with no frame to evaluate in; "+
+			"that asks about frame zero rather than asking without a frame", args["frameId"])
+	}
+	if args["context"] != EvalContextRepl {
+		t.Errorf("context = %v, want %q", args["context"], EvalContextRepl)
+	}
+	f.respond(req, EvaluateResult{Result: "[]"})
+	if got := <-done; got.err != nil {
+		t.Fatalf("Evaluate (repl): %v", got.err)
+	}
+}
+
+// TestEvaluateSurfacesARefusal checks a refused evaluate comes back as an error
+// rather than as an empty result.
+//
+// 🔴 A failed response still carries a body, and unmarshalling it into
+// EvaluateResult yields the zero value — i.e. "" — which reads as "this
+// expression evaluated to nothing" instead of "that symbol is not in scope
+// here". call() checks Success before touching Body precisely so this cannot
+// happen, and this is the evaluate-shaped guard for it.
+func TestEvaluateSurfacesARefusal(t *testing.T) {
+	var col collector
+	c, f := newFakePair(t, col.handlers())
+	defer stopFake(c, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := c.Evaluate(ctx, "nope", 1, EvalContextWatch)
+		errc <- err
+	}()
+
+	req := f.readRequest()
+	f.seq++
+	body, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]interface{}{"id": 2010, "format": "could not find symbol value for nope"},
+	})
+	f.write(Response{
+		Seq: f.seq, Type: TypeResponse, RequestSeq: req.Seq,
+		Success: false, Command: "evaluate", Body: body,
+	})
+
+	err := <-errc
+	if err == nil {
+		t.Fatal("a refused evaluate returned no error; the caller would show an empty value")
+	}
+	if !strings.Contains(err.Error(), "could not find symbol value") {
+		t.Errorf("error = %v, want the adapter's own explanation", err)
+	}
+}
+
+// stdioScriptClient spawns a /bin/sh adapter over the STDIO transport, which is
+// the branch delve can never exercise.
+func stdioScriptClient(t *testing.T, script string, h Handlers) *Client {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the /bin/sh adapter stub is POSIX-only")
+	}
+	c, err := StartCommand(context.Background(), "sh-adapter", Command{
+		Argv:      []string{"/bin/sh", "-c", script},
+		Transport: TransportStdio,
+	}, t.TempDir(), h)
+	if err != nil {
+		t.Fatalf("StartCommand(stdio): %v", err)
+	}
+	t.Cleanup(c.Stop)
+	return c
+}
+
+// TestStdioTransportReadsFramedEvents proves the second transport actually
+// reads: a process that writes one Content-Length framed event to its stdout is
+// demultiplexed by the same read loop the socket transport uses.
+//
+// Without this the stdio branch would be covered only by the live debugpy
+// oracle, which skips on a machine with no debugpy — so the transport that the
+// whole "DefaultAdapters is an abstraction" claim rests on would have no
+// unconditional test at all.
+func TestStdioTransportReadsFramedEvents(t *testing.T) {
+	body := `{"seq":1,"type":"event","event":"initialized"}`
+	script := fmt.Sprintf("printf 'Content-Length: %d\\r\\n\\r\\n%%s' '%s'; sleep 2", len(body), body)
+
+	var col collector
+	c := stdioScriptClient(t, script, col.handlers())
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	if err := c.WaitEvent(ctx, EventInitialized); err != nil {
+		t.Fatalf("no initialized event over stdio: %v (events %v)", err, col.names())
+	}
+}
+
+// TestStdioTransportWritesFramedRequests proves the other direction: a request
+// reaches the adapter's STDIN, framed exactly as the socket transport frames it.
+//
+// The adapter here is `cat`, which copies its stdin to a file and exits at EOF —
+// so this also covers the shutdown contract, since the file is only complete
+// because Stop closed the pipe.
+func TestStdioTransportWritesFramedRequests(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the /bin/sh adapter stub is POSIX-only")
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "stdin.txt")
+
+	var col collector
+	c, err := StartCommand(context.Background(), "cat-adapter", Command{
+		Argv:      []string{"/bin/sh", "-c", "cat > " + out},
+		Transport: TransportStdio,
+	}, dir, col.handlers())
+	if err != nil {
+		t.Fatalf("StartCommand(stdio): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, _ = c.Threads(ctx) // never answered; the point is what went out
+	c.Stop()              // closes stdin, so cat sees EOF and flushes
+
+	deadline := time.Now().Add(testTimeout)
+	var data []byte
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(out); err == nil && len(b) > 0 {
+			data = b
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := string(data)
+	if !strings.Contains(got, "Content-Length: ") {
+		t.Fatalf("the adapter's stdin got %q, with no Content-Length frame", got)
+	}
+	if !strings.Contains(got, `"command":"threads"`) {
+		t.Errorf("the adapter's stdin got %q, which does not carry the request", got)
+	}
+}
+
+// TestStdioAdapterDeathIsReported pins how the stdio transport surfaces an
+// adapter that dies on startup.
+//
+// 🔴 There is no accept to fail on this transport, so StartCommand CANNOT report
+// it — the failure arrives one step later, as EOF on the read loop. What must
+// still happen is the two things the UI depends on: a synthetic `terminated`
+// event so the session does not sit in "running" forever, and the adapter's own
+// stderr on the log so "connection lost" is not the whole story. `No module
+// named debugpy` is the real-world spelling of this.
+func TestStdioAdapterDeathIsReported(t *testing.T) {
+	var col collector
+	c := stdioScriptClient(t, "echo 'No module named debugpy' >&2; exit 1", col.handlers())
+
+	if !col.waitForEventName(t, EventTerminated) {
+		t.Fatalf("a dead stdio adapter produced no terminated event; events %v", col.names())
+	}
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		col.mu.Lock()
+		joined := strings.Join(col.logs, " | ")
+		col.mu.Unlock()
+		if strings.Contains(joined, "No module named debugpy") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	col.mu.Lock()
+	logs := append([]string(nil), col.logs...)
+	col.mu.Unlock()
+	t.Fatalf("the adapter's stderr never reached the log; logs %v", logs)
+
+	_ = c
 }

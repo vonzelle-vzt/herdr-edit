@@ -48,14 +48,22 @@ const (
 // reads Condition/LogMessage and never sets Verified true, but the fields
 // exist now so that stage isn't a breaking change to this type.
 type Mark struct {
-	Kind       MarkKind
-	Enabled    bool
-	Condition  string // reserved: a future adapter stage evaluates this before stopping.
-	LogMessage string // reserved: a future adapter stage logs this instead of stopping.
+	Kind    MarkKind
+	Enabled bool
+	// Condition and LogMessage reach the adapter as SourceBreakpoint.condition /
+	// .logMessage. 🔴 internal/app gates BOTH on the adapter's capabilities and
+	// refuses loudly when they are missing: an adapter without
+	// supportsConditionalBreakpoints drops the field SILENTLY, and the breakpoint
+	// then fires every single time, from which the only reasonable conclusion is
+	// that conditions are broken.
+	Condition  string
+	LogMessage string
 
-	// Verified and VerifiedLine are the adapter's confirmation that a
-	// breakpoint actually landed on a real, executable line. Always false /
-	// -1 in this stage, since there is no adapter to ask.
+	// Verified and VerifiedLine are the adapter's confirmation that a breakpoint
+	// actually landed on a real, executable line. The adapter may snap it FORWARD
+	// to the next executable statement, so VerifiedLine is where it will really
+	// stop and is what the gutter draws -- otherwise the stopped arrow lands where
+	// no breakpoint dot is and the debugger looks like it is lying.
 	Verified     bool
 	VerifiedLine int
 }

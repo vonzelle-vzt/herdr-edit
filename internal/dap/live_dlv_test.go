@@ -79,6 +79,30 @@ const (
 	localValue = "5"
 )
 
+// loopBodyMarker tags the body of a REAL loop — the line a conditional
+// breakpoint must stop on exactly once out of ten iterations.
+//
+// 🔴 A loop is the only fixture shape that can tell a working condition from a
+// dropped one. On a line that executes once, a breakpoint with a condition the
+// adapter ignored and a breakpoint with a condition it honoured produce
+// identical, passing behaviour — one stop, in the right place. The claim
+// "conditions work" is only substantiated by a line the program reaches ten
+// times and stops on once.
+const loopBodyMarker = "LOOP-TARGET"
+
+// loopCondition stops the loop on exactly one iteration, and loopConditionValue
+// is what the loop variable must be worth when it does.
+//
+// The value is asserted through `evaluate` rather than inferred from the stop:
+// an adapter that stopped on the first iteration for its own reasons would still
+// have stopped exactly once, so "it stopped once" alone does not distinguish a
+// condition that worked from a breakpoint that only ever fires once anyway.
+const (
+	loopVarName        = "i"
+	loopCondition      = "i == 3"
+	loopConditionValue = "3"
+)
+
 // stdoutSentinel is what the fixture PRINTS, and it is deliberately a string
 // that cannot occur anywhere else in the session.
 //
@@ -140,8 +164,18 @@ func add(a, b int) int {
 	return sum // ` + stepTargetMarker + `
 }
 
+// countTo sums 0..n-1 in a real loop, so a conditional breakpoint has ten
+// chances to fire and must take exactly one of them.
+func countTo(n int) int {
+	total := 0
+	for i := 0; i < n; i++ {
+		total += i // ` + loopBodyMarker + `
+	}
+	return total
+}
+
 func main() {
-	fmt.Println("` + stdoutSentinel + `", add(2, 3))
+	fmt.Println("` + stdoutSentinel + `", add(2, 3), countTo(10))
 }
 `
 	file = write("main.go", src)
@@ -565,9 +599,29 @@ type liveSession struct {
 // test and the test harness were the same code.
 func startStoppedSession(t *testing.T, ctx context.Context, marker string) *liveSession {
 	t.Helper()
+	s := startConfiguredSession(t, ctx, func(file string, lines []string) []SourceBreakpoint {
+		return []SourceBreakpoint{{Line: lineWithMarker(t, lines, marker)}}
+	})
+	stopped := s.awaitStopped(t, "the initial breakpoint")
+	if stopped.Reason != "breakpoint" {
+		t.Fatalf("first stop had reason %q, want breakpoint: %+v", stopped.Reason, stopped)
+	}
+	s.assertStoppedOn(t, ctx, stopped, marker)
+	return s
+}
+
+// startConfiguredSession runs the five-step launch sequence against a real
+// delve with whatever breakpoints bps builds, and returns once configurationDone
+// has been acknowledged — i.e. the moment the program is allowed to run.
+//
+// It does NOT wait for a stop, because not every oracle wants one immediately:
+// the conditional-breakpoint oracle has to be able to observe how MANY stops
+// there are, which a helper that consumed the first would make impossible.
+func startConfiguredSession(t *testing.T, ctx context.Context,
+	bps func(file string, lines []string) []SourceBreakpoint) *liveSession {
+	t.Helper()
 
 	root, file, lines := dlvFixture(t)
-	targetLine := lineWithMarker(t, lines, marker)
 
 	waiter, handlers := newStoppedWaiter(t)
 	adapter, ok := AdapterFor("go")
@@ -587,9 +641,10 @@ func startStoppedSession(t *testing.T, ctx context.Context, marker string) *live
 	}
 	// Measured facts, recorded in the run output rather than asserted: delve
 	// 1.27 answers supportsTerminateRequest ABSENT (so TerminateOrDisconnect
-	// must fall back to disconnect{terminateDebuggee:true}) and does advertise
-	// supportsVariablePaging. Both are read by production code, so seeing what
-	// a real adapter actually says is the point of this file.
+	// must fall back to disconnect{terminateDebuggee:true}) and answers
+	// supportsVariablePaging ABSENT too (so start/count are never sent and
+	// maxDebugVariables is the only cap there is). Both are read by production
+	// code, so seeing what a real adapter actually says is the point of this file.
 	t.Logf("delve capabilities: terminate=%v variablePaging=%v variableType(request)=%v configurationDone=%v",
 		caps.SupportsTerminateRequest, caps.SupportsVariablePaging,
 		initializeArgsForClient(adapter.AdapterID).SupportsVariableType,
@@ -607,12 +662,19 @@ func startStoppedSession(t *testing.T, ctx context.Context, marker string) *live
 	if err := client.WaitEvent(ctx, EventInitialized); err != nil {
 		t.Fatalf("never saw the initialized event: %v (adapter stderr: %v)", err, client.LastStderr())
 	}
-	bps, err := client.SetBreakpoints(ctx, Source{Path: file}, []SourceBreakpoint{{Line: targetLine}})
+	want := bps(file, lines)
+	answers, err := client.SetBreakpoints(ctx, Source{Path: file}, want)
 	if err != nil {
 		t.Fatalf("setBreakpoints: %v", err)
 	}
-	if len(bps) != 1 || !bps[0].Verified {
-		t.Fatalf("delve would not bind a breakpoint on %q (line %d): %+v", marker, targetLine, bps)
+	if len(answers) != len(want) {
+		t.Fatalf("got %d breakpoint answers for %d requests; the response is positional",
+			len(answers), len(want))
+	}
+	for i, ans := range answers {
+		if !ans.Verified {
+			t.Fatalf("delve would not bind breakpoint %+v: %+v", want[i], ans)
+		}
 	}
 	if err := client.SetExceptionBreakpoints(ctx, caps.DefaultFilters()); err != nil {
 		t.Fatalf("setExceptionBreakpoints: %v", err)
@@ -620,14 +682,7 @@ func startStoppedSession(t *testing.T, ctx context.Context, marker string) *live
 	if err := client.ConfigurationDone(ctx); err != nil {
 		t.Fatalf("configurationDone: %v", err)
 	}
-
-	s := &liveSession{client: client, waiter: waiter, caps: caps, file: file, lines: lines}
-	stopped := s.awaitStopped(t, "the initial breakpoint")
-	if stopped.Reason != "breakpoint" {
-		t.Fatalf("first stop had reason %q, want breakpoint: %+v", stopped.Reason, stopped)
-	}
-	s.assertStoppedOn(t, ctx, stopped, marker)
-	return s
+	return &liveSession{client: client, waiter: waiter, caps: caps, file: file, lines: lines}
 }
 
 // awaitStopped blocks for the next stopped event, failing with what the adapter
@@ -795,4 +850,145 @@ func TestLiveDelveVariablesReadsALocal(t *testing.T) {
 	if found.VariablesReference != 0 {
 		t.Errorf("%s is an int and reported children (ref %d)", localName, found.VariablesReference)
 	}
+}
+
+// countStopped counts how many `stopped` events the session has seen. Read off
+// the collector, which records everything the read goroutine delivered, rather
+// than off the waiter channel — a channel a test drains is a channel whose depth
+// no longer answers "how many times did this happen".
+func (s *liveSession) countStopped() int {
+	n := 0
+	for _, name := range s.waiter.col.names() {
+		if name == EventStopped {
+			n++
+		}
+	}
+	return n
+}
+
+// TestLiveDelveConditionalBreakpointFiresOnce is the definition of done for
+// conditional breakpoints: a breakpoint inside a ten-iteration loop, carrying
+// `i == 3`, stops the program EXACTLY ONCE, on the iteration where i is 3.
+//
+// 🔴 Both halves of that sentence are load-bearing and neither is sufficient
+// alone. "Stopped exactly once" without the value passes for a condition that
+// was dropped on the floor and a breakpoint that happened to be hit once;
+// "i == 3 at the stop" without the count passes for a condition that was ignored
+// and simply stopped on the first of ten iterations that also… no, on the FIRST
+// iteration i is 0 — which is precisely why the value is asserted through
+// `evaluate`, in the stopped frame. A dropped condition stops with i == 0 and
+// then nine more times; an honoured one stops once with i == 3.
+//
+// RED against a client that does not put `condition` on the wire: the run then
+// stops ten times and the first stop reports i == 0.
+func TestLiveDelveConditionalBreakpointFiresOnce(t *testing.T) {
+	dlv := requireDlv(t)
+	t.Logf("using %s", dlv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
+	defer cancel()
+
+	var loopLine int
+	s := startConfiguredSession(t, ctx, func(file string, lines []string) []SourceBreakpoint {
+		loopLine = lineWithMarker(t, lines, loopBodyMarker)
+		return []SourceBreakpoint{{Line: loopLine, Condition: loopCondition}}
+	})
+
+	// The capability this whole feature is gated on, read from a real adapter
+	// rather than assumed. Recorded rather than merely asserted, because what
+	// delve actually answers is the thing internal/app branches on.
+	t.Logf("delve capabilities: conditionalBreakpoints=%v logPoints=%v hitConditional=%v",
+		s.caps.SupportsConditionalBreakpoints, s.caps.SupportsLogPoints,
+		s.caps.SupportsHitConditionalBreakpoints)
+	if !s.caps.SupportsConditionalBreakpoints {
+		t.Fatal("delve did not advertise supportsConditionalBreakpoints; the gate would refuse this")
+	}
+
+	stopped := s.awaitStopped(t, "the conditional breakpoint")
+	if stopped.Reason != "breakpoint" {
+		t.Fatalf("stopped for reason %q, want breakpoint: %+v", stopped.Reason, stopped)
+	}
+	top := s.assertStoppedOn(t, ctx, stopped, loopBodyMarker)
+
+	// 🔴 The value, in the STOPPED FRAME. context "watch" plus the frame id is
+	// what makes this the loop's i rather than some other scope's.
+	res, err := s.client.Evaluate(ctx, loopVarName, top.ID, EvalContextWatch)
+	if err != nil {
+		t.Fatalf("evaluate(%q) in frame %d: %v", loopVarName, top.ID, err)
+	}
+	t.Logf("evaluate(%q) = %q (type %q) in frame %d (%s)", loopVarName, res.Result, res.Type, top.ID, top.Name)
+	if res.Result != loopConditionValue {
+		t.Fatalf("stopped with %s = %q, want %q — the condition %q was not honoured "+
+			"(a dropped condition stops on the first iteration, where %s is 0)",
+			loopVarName, res.Result, loopConditionValue, loopCondition, loopVarName)
+	}
+
+	// --- and it must not stop again ---------------------------------------
+	if err := s.client.Continue(ctx, stopped.ThreadID); err != nil {
+		t.Fatalf("continue: %v", err)
+	}
+	deadline := time.Now().Add(90 * time.Second)
+	done := false
+	for time.Now().Before(deadline) {
+		for _, n := range s.waiter.col.names() {
+			if n == EventTerminated || n == EventExited {
+				done = true
+			}
+		}
+		if done {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !done {
+		t.Fatalf("after continue the program never finished; events: %v", s.waiter.col.names())
+	}
+	if got := s.countStopped(); got != 1 {
+		t.Fatalf("the program stopped %d times on a loop of 10 with condition %q; want exactly 1. events: %v",
+			got, loopCondition, s.waiter.col.names())
+	}
+	t.Logf("condition %q: 1 stop out of 10 iterations, %s == %s", loopCondition, loopVarName, res.Result)
+}
+
+// TestLiveDelveLogPointDoesNotStop is the other half of the capability pair:
+// delve advertises supportsLogPoints, and a breakpoint carrying logMessage must
+// therefore run STRAIGHT THROUGH the loop without halting it.
+//
+// 🔴 The assertion is "zero stops and the program finished", not "some output
+// appeared". Which category a logpoint's text arrives under, and whether it
+// arrives at all, is adapter policy; whether the program was halted is the
+// contract — and a logMessage that the adapter treated as an ordinary breakpoint
+// would stop ten times, which is the failure this pins.
+func TestLiveDelveLogPointDoesNotStop(t *testing.T) {
+	requireDlv(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
+	defer cancel()
+
+	s := startConfiguredSession(t, ctx, func(file string, lines []string) []SourceBreakpoint {
+		return []SourceBreakpoint{{
+			Line:       lineWithMarker(t, lines, loopBodyMarker),
+			LogMessage: "i is {i}",
+		}}
+	})
+	if !s.caps.SupportsLogPoints {
+		t.Fatal("delve did not advertise supportsLogPoints; the gate would refuse this")
+	}
+
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, n := range s.waiter.col.names() {
+			if n == EventTerminated || n == EventExited {
+				if got := s.countStopped(); got != 0 {
+					t.Fatalf("a logpoint stopped the program %d time(s); a log point must not halt it. events: %v",
+						got, s.waiter.col.names())
+				}
+				t.Logf("logpoint ran the loop to completion without stopping; events: %v", s.waiter.col.names())
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("the program never finished with a logpoint set; events: %v, stops: %d",
+		s.waiter.col.names(), s.countStopped())
 }

@@ -5,10 +5,14 @@
 // Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
-// debugview.go is Lane B stage 3: everything you do once the program has
-// STOPPED. Stage 2 got you to a breakpoint; this is stepping (F10/F11/F12),
-// the call stack, the goroutine list, variable inspection, and a console
-// holding what the program printed.
+// debugview.go is everything you do once the program has STOPPED. Stage 2 got
+// you to a breakpoint; this is stepping (F10/F11/F12), the call stack, the
+// goroutine list, variable inspection, `evaluate`, and a console holding what
+// the program printed.
+//
+// It is also the SINGLE definition of what the debugger can do — debugMenuGroup
+// feeds both the ≡ menu and the Esc 5 picker — so an action added here is
+// reachable from both surfaces by construction rather than by remembering.
 //
 // # Nothing here is a new widget
 //
@@ -145,9 +149,13 @@ func debugMenuGroup() []menuItemDef {
 		{label: "Call stack", action: (*App).menuDebugStack, enabled: (*App).hasStoppedDebugSession},
 		{label: "Goroutines (threads)", action: (*App).menuDebugThreads, enabled: (*App).hasDebugSession},
 		{label: "Variables", action: (*App).menuDebugVariables, enabled: (*App).hasStoppedDebugSession},
+		{label: "Evaluate at cursor", action: (*App).menuDebugEvaluate, enabled: (*App).hasDebugSession},
 		{label: "Debug console", action: (*App).menuDebugConsole, enabled: (*App).hasDebugConsole},
 		{label: "Toggle breakpoint", shortcut: "Esc 9 / F9", action: (*App).menuToggleBreakpoint, enabled: (*App).hasBreakpointableTab},
 		{label: "Toggle breakpoint enabled", action: (*App).menuToggleBreakpointEnabled, enabled: (*App).hasBreakpointableTab},
+		{label: "Set breakpoint condition", action: (*App).menuSetCondition, enabled: (*App).hasConditionableBreakpoint},
+		{label: "Set logpoint message", action: (*App).menuSetLogpoint, enabled: (*App).hasConditionableBreakpoint},
+		{label: "Clear condition / log message", action: (*App).menuClearBreakpointCondition, enabled: (*App).hasConditionableBreakpoint},
 		{label: "List breakpoints", action: (*App).menuListBreakpoints, enabled: (*App).hasBreakpoints},
 		{label: "Clear breakpoints", action: (*App).menuClearBreakpoints, enabled: (*App).hasBreakpoints},
 		{label: "Export breakpoints (dlv)", action: (*App).menuExportBreakpoints, enabled: (*App).hasBreakpoints},
@@ -772,6 +780,124 @@ func flattenValue(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\t", " ")
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// -----------------------------------------------------------------------------
+// Evaluate
+// -----------------------------------------------------------------------------
+
+// debugEvalWidth is how much of an evaluated value fits on the status line
+// before it is elided. The status bar is one row on a pane that is often sixty
+// columns wide beside an agent.
+const debugEvalWidth = 60
+
+// menuDebugEvaluate asks the adapter what an expression is worth: the selection
+// if there is one, otherwise the word under the cursor.
+//
+// 🔴 The context and the frame travel together. While the program is STOPPED
+// this asks with context "watch" AND the selected frame's id, so the answer is
+// the value in the frame the user is looking at — reusing stage 3's curFrame,
+// which is what makes evaluating after picking frame #2 in the call stack answer
+// about frame #2. While it is RUNNING there is no frame to evaluate in, so the
+// context is "repl" and no frame id is sent. Both adapters accept the wrong
+// pairing and answer it from another scope with no error, so this is a bug that
+// would render as a plausible number.
+//
+// The answer goes to the status line rather than a popup, for exactly the reason
+// lspactions.go gives for hover: this editor has no popup surface, and a one-line
+// flash is the honest version of the feature rather than a reason to withhold it.
+func (a *App) menuDebugEvaluate() {
+	a.closeMenu()
+	if a.debug == nil || a.debug.client == nil {
+		a.flash("Evaluate needs a debug session — F5 starts one")
+		return
+	}
+	expr := a.expressionAtCursor()
+	if expr == "" {
+		a.flash("Nothing to evaluate — put the cursor on a name or select an expression")
+		return
+	}
+
+	client := a.debug.client
+	evalContext, frameID := dap.EvalContextRepl, 0
+	if a.debug.stopped {
+		if f, ok := a.currentFrame(); ok {
+			evalContext, frameID = dap.EvalContextWatch, f.ID
+		}
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), debugRequestTimeout)
+		defer cancel()
+		res, err := client.Evaluate(ctx, expr, frameID, evalContext)
+		ev := &debugEvalEvent{when: time.Now(), expr: expr, res: res}
+		if err != nil {
+			ev.err = err.Error()
+		}
+		a.post(ev)
+	}()
+	a.flash("Evaluating " + expr + "…")
+}
+
+// expressionAtCursor is what Evaluate asks about: the selection when there is
+// one, otherwise the word under the cursor.
+//
+// The selection wins because it is the only way to ask about anything that is
+// not a single identifier — `len(xs)`, `p.Name`, `xs[i+1]` — and a debugger that
+// could only evaluate bare names would be useless the moment you wanted the
+// thing you were actually looking at. A multi-line selection is flattened
+// rather than refused; the adapter will complain if it is not an expression, and
+// its complaint is more useful than ours.
+func (a *App) expressionAtCursor() string {
+	tab := a.activeTabPtr()
+	if tab == nil {
+		return ""
+	}
+	if tab.HasSelection() {
+		return strings.TrimSpace(flattenValue(tab.SelectionText()))
+	}
+	line := tab.Buffer.LineRunes(tab.Cursor.Line)
+	if len(line) == 0 {
+		return ""
+	}
+	start := tab.Cursor.Col
+	if start > len(line) {
+		start = len(line)
+	}
+	for start > 0 && isWordChar(line[start-1]) {
+		start--
+	}
+	end := tab.Cursor.Col
+	for end < len(line) && isWordChar(line[end]) {
+		end++
+	}
+	if start >= end {
+		return ""
+	}
+	return string(line[start:end])
+}
+
+// handleDebugEval puts the answer on the status line.
+//
+// A refusal is reported verbatim rather than swallowed: "could not find symbol
+// value for xs" is the adapter telling the user their expression is out of scope
+// here, which is information, and replacing it with "no result" would throw away
+// the only thing that explains what to type instead.
+func (a *App) handleDebugEval(e *debugEvalEvent) {
+	if e.err != "" {
+		a.flash(e.expr + ": " + e.err)
+		return
+	}
+	value := flattenValue(e.res.Result)
+	if value == "" {
+		a.flash(e.expr + " evaluated to nothing")
+		return
+	}
+	msg := e.expr + " = " + truncateEllipsis(value, debugEvalWidth)
+	if e.res.Type != "" {
+		msg += "  (" + e.res.Type + ")"
+	}
+	a.flash(msg)
 }
 
 // -----------------------------------------------------------------------------

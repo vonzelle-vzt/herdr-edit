@@ -10,6 +10,7 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cloudmanic/spice-edit/internal/editor"
@@ -249,5 +250,118 @@ func TestHasBreakpointableTab_RejectsSynthetic(t *testing.T) {
 	a.menuToggleBreakpoint()
 	if len(a.breakpoints) != before {
 		t.Fatal("expected menuToggleBreakpoint to no-op on a synthetic tab")
+	}
+}
+
+// TestConditionSurvivesToTheExportAndThePersistedList checks the field the mark
+// now really carries reaches the two places that read it.
+//
+// dlv is the interesting flavour: `break` takes no inline condition, so a
+// conditional breakpoint has to be named and then conditioned by name. Emitting
+// a bare `break` — which is what this did while conditions were always empty —
+// pastes a breakpoint that stops EVERY time into a debugger the user is about to
+// trust.
+func TestConditionSurvivesToTheExportAndThePersistedList(t *testing.T) {
+	a, path := debugFixture(t)
+	tab := a.activeTabPtr()
+	tab.SetMark(5, editor.Mark{Kind: editor.MarkBreakpoint, Enabled: true, Condition: "i == 3", VerifiedLine: -1})
+	tab.SetMark(6, editor.Mark{Kind: editor.MarkLogpoint, Enabled: true, LogMessage: "here", VerifiedLine: -1})
+	a.syncBreakpoints()
+
+	if len(a.breakpoints) != 2 {
+		t.Fatalf("breakpoints = %+v, want the breakpoint AND the logpoint", a.breakpoints)
+	}
+	var cond, log *Breakpoint
+	for i := range a.breakpoints {
+		switch a.breakpoints[i].Line {
+		case 5:
+			cond = &a.breakpoints[i]
+		case 6:
+			log = &a.breakpoints[i]
+		}
+	}
+	if cond == nil || cond.Condition != "i == 3" {
+		t.Errorf("the condition did not reach the authoritative list: %+v", a.breakpoints)
+	}
+	if log == nil || log.LogMessage != "here" {
+		t.Errorf("the log message did not reach the authoritative list: %+v", a.breakpoints)
+	}
+
+	script := exportBreakpointScript(a.allBreakpoints(), "dlv")
+	if !strings.Contains(script, "condition ") || !strings.Contains(script, "i == 3") {
+		t.Errorf("dlv export = %q, want a `condition` command; a bare break would stop every time", script)
+	}
+	if !strings.Contains(script, path) {
+		t.Errorf("dlv export = %q, want the file path", script)
+	}
+	if got := exportBreakpointScript(a.allBreakpoints(), "gdb"); !strings.Contains(got, "if i == 3") {
+		t.Errorf("gdb export = %q, want the inline `if` form", got)
+	}
+	if got := exportBreakpointScript(a.allBreakpoints(), "pdb"); !strings.Contains(got, ", i == 3") {
+		t.Errorf("pdb export = %q, want the comma form", got)
+	}
+}
+
+// TestClearConditionRevertsALogpointToABreakpoint covers the escape hatch
+// openPrompt's empty-submit rule makes necessary.
+//
+// 🔴 promptSubmit ignores an empty value — deliberately, so a stray Enter cannot
+// blank a filename in the rename modal — which leaves no way to clear a
+// condition through the prompt that set it. Without this row the only cure is
+// deleting the breakpoint and setting it again, and a logpoint could never be
+// turned back into a breakpoint at all.
+func TestClearConditionRevertsALogpointToABreakpoint(t *testing.T) {
+	a, _ := debugFixture(t)
+	tab := a.activeTabPtr()
+	tab.SetMark(5, editor.Mark{Kind: editor.MarkLogpoint, Enabled: true,
+		Condition: "i == 3", LogMessage: "here", VerifiedLine: -1})
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: 0}, false)
+
+	a.menuClearBreakpointCondition()
+
+	m, ok := tab.MarkAt(5)
+	if !ok {
+		t.Fatal("clearing the condition removed the breakpoint entirely")
+	}
+	if m.Condition != "" || m.LogMessage != "" {
+		t.Errorf("mark = %+v, want both fields cleared", m)
+	}
+	if m.Kind != editor.MarkBreakpoint {
+		t.Errorf("mark kind = %v, want it back to a plain breakpoint", m.Kind)
+	}
+
+	// A second clear says so rather than silently doing nothing.
+	a.menuClearBreakpointCondition()
+	if !strings.Contains(a.statusMsg, "no condition") {
+		t.Errorf("status = %q, want it to say there was nothing to clear", a.statusMsg)
+	}
+}
+
+// TestLogpointMarkShowsTheLogpointGlyph checks the gutter tells the truth about
+// what a logpoint is: ◆, not ●. A logpoint drawn as a breakpoint claims the
+// program will stop there, which is the one thing it will not do.
+func TestLogpointMarkShowsTheLogpointGlyph(t *testing.T) {
+	a, _ := debugFixture(t)
+	tab := a.activeTabPtr()
+	tab.SetMark(5, editor.Mark{Kind: editor.MarkBreakpoint, Enabled: true, VerifiedLine: -1})
+	tab.MoveCursorTo(editor.Position{Line: 5, Col: 0}, false)
+
+	a.menuSetLogpoint()
+	if !a.promptOpen {
+		t.Fatalf("the logpoint prompt did not open; status %q", a.statusMsg)
+	}
+	a.promptValue = []rune("i is {i}")
+	a.promptCursor = len(a.promptValue)
+	a.promptSubmit()
+
+	a.draw()
+	if got := gutterRuneAt(t, a, 5); got != '◆' {
+		t.Errorf("the gutter on a logpoint line is %q, want '◆'", got)
+	}
+
+	// And it still counts as a breakpoint everywhere that matters.
+	a.syncBreakpoints()
+	if len(a.breakpoints) != 1 || a.breakpoints[0].LogMessage != "i is {i}" {
+		t.Errorf("breakpoints = %+v, want the logpoint with its message", a.breakpoints)
 	}
 }

@@ -5,12 +5,19 @@
 // Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
-// breakpoints.go is Lane B stage 1: persistent, gutter-visible, edit-tracking
-// breakpoint marks. There is NO debug adapter behind this — no DAP, no
-// delve, no process launching. A breakpoint here is a place you mark by
-// hand, that survives edits above it (internal/editor/marks.go does the
-// line-tracking), and that you export as `break file:line` lines to paste
-// into dlv, pdb or gdb yourself.
+// breakpoints.go owns the breakpoint MODEL: persistent, gutter-visible,
+// edit-tracking marks, the authoritative list they flatten into, the export, and
+// — since Lane B stage 4 — the condition and log message a mark can carry.
+//
+// It still owns no session. debug.go decides what reaches an adapter and when;
+// everything here is about what the user has asked for, which is why a condition
+// can be set with no debugger running at all and is exported as a `condition`
+// line for driving dlv/pdb/gdb by hand.
+//
+// 🔴 The one exception is afterBreakpointEdit, and it is a single call in one
+// place on purpose: setBreakpoints is WHOLE-FILE, so a mark that changes while a
+// session is live has to re-send that file's complete set or the rest are
+// cleared by the same request that was meant to refine one of them.
 //
 // Modeled on bookmarks.go: same shape, same doc-comment density, same
 // "menu group + polled sync + one place to look" discipline the rest of
@@ -58,6 +65,15 @@ func (a *App) hasBreakpointableTab() bool {
 	return t != nil && t.Path != "" && !t.IsImage() && !t.Synthetic
 }
 
+// isBreakpointKind reports whether a mark kind is one the debugger sends to an
+// adapter. Logpoints are breakpoints that print instead of stopping, so every
+// path that collects, clears, verifies or exports a breakpoint has to accept
+// both — a check that names only MarkBreakpoint silently drops every logpoint
+// the user set, which reads as logpoints not working at all.
+func isBreakpointKind(k editor.MarkKind) bool {
+	return k == editor.MarkBreakpoint || k == editor.MarkLogpoint
+}
+
 // menuToggleBreakpoint sets or clears a breakpoint on the cursor's line.
 // Bound to Esc 9 (mnemonic: F9, the universal toggle-breakpoint key in every
 // GUI debugger this fork's users have used).
@@ -69,13 +85,189 @@ func (a *App) menuToggleBreakpoint() {
 		return
 	}
 	line := tab.Cursor.Line
-	if m, ok := tab.MarkAt(line); ok && m.Kind == editor.MarkBreakpoint {
+	if m, ok := tab.MarkAt(line); ok && isBreakpointKind(m.Kind) {
 		tab.ClearMark(line)
+		a.afterBreakpointEdit()
 		a.flash(fmt.Sprintf("Breakpoint cleared %s:%d", filepath.Base(tab.Path), line+1))
 		return
 	}
 	tab.SetMark(line, editor.Mark{Kind: editor.MarkBreakpoint, Enabled: true, VerifiedLine: -1})
+	a.afterBreakpointEdit()
 	a.flash(fmt.Sprintf("Breakpoint set %s:%d — Esc 5 lists, Esc 9 toggles", filepath.Base(tab.Path), line+1))
+}
+
+// afterBreakpointEdit is the ONE place a breakpoint change is pushed to a live
+// adapter.
+//
+// It exists for the reason syncBreakpoints is polled from a single site: there
+// are now six actions that mutate a Mark, and a hand-placed resend after each
+// one is one the seventh will forget. The symptom would be a breakpoint the
+// editor shows and the debugger does not have, which is exactly the class of bug
+// nothing on screen reports. A no-op when no session is running.
+func (a *App) afterBreakpointEdit() {
+	a.resendBreakpoints()
+}
+
+// breakpointMarkAtCursor returns the breakpoint or logpoint mark under the
+// cursor, having already flashed the reason when there is not one.
+//
+// Shared by the three condition/logpoint actions so their guards cannot drift
+// apart — and so each one refuses in the same words.
+func (a *App) breakpointMarkAtCursor(what string) (*editor.Tab, int, editor.Mark, bool) {
+	tab := a.activeTabPtr()
+	if !a.hasBreakpointableTab() {
+		a.flash("Nothing here to " + what)
+		return nil, 0, editor.Mark{}, false
+	}
+	line := tab.Cursor.Line
+	m, ok := tab.MarkAt(line)
+	if !ok || !isBreakpointKind(m.Kind) {
+		a.flash("No breakpoint on this line — Esc 9 sets one")
+		return nil, 0, editor.Mark{}, false
+	}
+	return tab, line, m, true
+}
+
+// menuSetCondition asks for an expression the debugger must find true before
+// stopping on the breakpoint under the cursor.
+//
+// 🔴 The capability is checked BEFORE the prompt opens, not after it is
+// submitted. An adapter without supportsConditionalBreakpoints does not refuse a
+// condition, it ignores the field — so the breakpoint would be accepted,
+// reported verified, and then fire on every iteration of the loop the condition
+// was written for. Asking the user to type an expression we already know will be
+// thrown away is worse than refusing: it produces a debugger that appears to
+// have taken the condition.
+//
+// The check only fires while a session is LIVE. With no adapter running there is
+// nothing to ask, and refusing then would make a condition unsettable before F5
+// — the moment you actually want to set one. pushBreakpoints runs the same gate
+// on the way out, so a condition typed with no session and started against an
+// adapter that cannot honour it is still reported rather than dropped in silence.
+func (a *App) menuSetCondition() {
+	a.closeMenu()
+	if msg := a.adapterRefusal(false); msg != "" {
+		a.flash(msg)
+		return
+	}
+	_, _, m, ok := a.breakpointMarkAtCursor("set a condition on")
+	if !ok {
+		return
+	}
+	a.openPrompt("Breakpoint condition",
+		"an expression the debugger must find true, e.g. i == 3",
+		m.Condition, (*App).conditionSubmit)
+}
+
+// conditionSubmit stores the typed condition and pushes it to a live adapter.
+func (a *App) conditionSubmit(expr string) {
+	tab, line, m, ok := a.breakpointMarkAtCursor("set a condition on")
+	if !ok {
+		return
+	}
+	m.Condition = expr
+	tab.SetMark(line, m)
+	a.afterBreakpointEdit()
+	a.flash(fmt.Sprintf("Condition on %s:%d — %s", filepath.Base(tab.Path), line+1, expr))
+}
+
+// menuSetLogpoint turns the breakpoint under the cursor into a logpoint: the
+// adapter prints the message and keeps running instead of stopping.
+//
+// Same capability rule as menuSetCondition, and the same reason — an adapter
+// without supportsLogPoints drops logMessage and the "logpoint" becomes an
+// ordinary breakpoint that halts the program, which is the opposite of what was
+// asked for.
+func (a *App) menuSetLogpoint() {
+	a.closeMenu()
+	if msg := a.adapterRefusal(true); msg != "" {
+		a.flash(msg)
+		return
+	}
+	_, _, m, ok := a.breakpointMarkAtCursor("set a log message on")
+	if !ok {
+		return
+	}
+	a.openPrompt("Logpoint message",
+		"printed instead of stopping; {expr} interpolates",
+		m.LogMessage, (*App).logpointSubmit)
+}
+
+// logpointSubmit stores the message, flips the mark's kind so the gutter shows
+// ◆ rather than ●, and pushes it to a live adapter.
+func (a *App) logpointSubmit(msg string) {
+	tab, line, m, ok := a.breakpointMarkAtCursor("set a log message on")
+	if !ok {
+		return
+	}
+	m.LogMessage = msg
+	m.Kind = editor.MarkLogpoint
+	tab.SetMark(line, m)
+	a.afterBreakpointEdit()
+	a.flash(fmt.Sprintf("Logpoint %s:%d — %s", filepath.Base(tab.Path), line+1, msg))
+}
+
+// menuClearBreakpointCondition strips the condition and log message from the
+// mark under the cursor, turning a logpoint back into a plain breakpoint.
+//
+// It is a row of its own because openPrompt IGNORES an empty submit — deliberately,
+// so a stray Enter cannot destroy a filename in the rename modal — which leaves
+// no way to clear a condition through the prompt that set it. Without this, the
+// only cure is deleting the breakpoint and setting it again.
+func (a *App) menuClearBreakpointCondition() {
+	a.closeMenu()
+	tab, line, m, ok := a.breakpointMarkAtCursor("clear a condition on")
+	if !ok {
+		return
+	}
+	if m.Condition == "" && m.LogMessage == "" {
+		a.flash("That breakpoint has no condition or log message")
+		return
+	}
+	m.Condition, m.LogMessage = "", ""
+	m.Kind = editor.MarkBreakpoint
+	tab.SetMark(line, m)
+	a.afterBreakpointEdit()
+	a.flash(fmt.Sprintf("Cleared condition on %s:%d", filepath.Base(tab.Path), line+1))
+}
+
+// adapterRefusal returns the message to show when the LIVE adapter cannot
+// honour a condition (logpoint false) or a log message (logpoint true), or ""
+// when it can — or when there is no session to ask.
+//
+// The adapter is named in the message on purpose: "log points are not supported"
+// reads as a limitation of this editor and sends the user to the wrong place.
+func (a *App) adapterRefusal(logpoint bool) string {
+	// 🔴 `starting` counts as "no session". Capabilities only exist once
+	// initialize has been answered, and a zero Capabilities reads as "supports
+	// nothing" — so gating on it during the seconds the adapter spends compiling
+	// the program would refuse every condition with a message that is simply
+	// false. resendBreakpoints marks the edit dirty instead, and
+	// handleDebugStarted pushes it once the real answer is in.
+	if a.debug == nil || a.debug.starting || a.debug.client == nil {
+		return ""
+	}
+	if logpoint {
+		if a.debug.caps.SupportsLogPoints {
+			return ""
+		}
+		return a.debug.adapter + " does not support log points"
+	}
+	if a.debug.caps.SupportsConditionalBreakpoints {
+		return ""
+	}
+	return a.debug.adapter + " does not support conditional breakpoints"
+}
+
+// hasConditionableBreakpoint gates the condition / logpoint menu rows: there
+// must be a breakpoint under the cursor to put one on.
+func (a *App) hasConditionableBreakpoint() bool {
+	tab := a.activeTabPtr()
+	if !a.hasBreakpointableTab() {
+		return false
+	}
+	m, ok := tab.MarkAt(tab.Cursor.Line)
+	return ok && isBreakpointKind(m.Kind)
 }
 
 // menuToggleBreakpointEnabled flips Enabled on the cursor line's breakpoint
@@ -91,12 +283,13 @@ func (a *App) menuToggleBreakpointEnabled() {
 	}
 	line := tab.Cursor.Line
 	m, ok := tab.MarkAt(line)
-	if !ok || m.Kind != editor.MarkBreakpoint {
+	if !ok || !isBreakpointKind(m.Kind) {
 		a.flash("No breakpoint on this line")
 		return
 	}
 	m.Enabled = !m.Enabled
 	tab.SetMark(line, m)
+	a.afterBreakpointEdit()
 	state := "enabled"
 	if !m.Enabled {
 		state = "disabled"
@@ -156,7 +349,7 @@ func (a *App) syncBreakpoints() {
 		openPaths[tab.Path] = true
 		for _, line := range tab.MarkLines() {
 			m, _ := tab.MarkAt(line)
-			if m.Kind != editor.MarkBreakpoint && m.Kind != editor.MarkLogpoint {
+			if !isBreakpointKind(m.Kind) {
 				continue
 			}
 			fromOpen = append(fromOpen, Breakpoint{
@@ -293,7 +486,7 @@ func (a *App) menuClearBreakpoints() {
 	n := len(a.breakpoints)
 	for _, tab := range a.tabs {
 		for _, line := range tab.MarkLines() {
-			if m, ok := tab.MarkAt(line); ok && (m.Kind == editor.MarkBreakpoint || m.Kind == editor.MarkLogpoint) {
+			if m, ok := tab.MarkAt(line); ok && isBreakpointKind(m.Kind) {
 				tab.ClearMark(line)
 			}
 		}
@@ -302,6 +495,7 @@ func (a *App) menuClearBreakpoints() {
 	if a.bpStore != nil {
 		a.bpStore.Set(a.rootDir, nil)
 	}
+	a.afterBreakpointEdit()
 	a.flash(fmt.Sprintf("Cleared %d breakpoint(s)", n))
 }
 
@@ -328,18 +522,24 @@ func (a *App) menuExportBreakpoints() {
 // flavour ("dlv", "pdb" or "gdb"). Disabled breakpoints are always skipped.
 //
 // All three flavours accept bare `break file:line`, which is what an
-// unconditional breakpoint renders as regardless of flavour; they diverge
-// only once a Condition is set (reserved for a later stage — Condition is
-// always "" today, so in practice every flavour currently produces
-// identical output). The flavour parameter and the branching below exist
-// now so that divergence is a one-line change later, not a rewrite of every
-// call site.
+// unconditional breakpoint renders as regardless of flavour. They diverge once
+// a Condition is set, and as of this stage conditions are real rather than a
+// field nothing writes — so the branching below is now exercised instead of
+// being a reservation.
+//
+// 🔴 dlv is the one that cannot say it in a single command: `break` takes no
+// inline condition, so a named breakpoint plus a `condition` line is the only
+// spelling that works. Emitting a bare `break` for a conditional breakpoint —
+// which is what this did while conditions were always empty — would paste a
+// breakpoint that stops EVERY time into a debugger the user is about to trust.
 func exportBreakpointScript(bps []Breakpoint, flavour string) string {
 	var b strings.Builder
+	n := 0
 	for _, bp := range bps {
 		if !bp.Enabled {
 			continue
 		}
+		n++
 		loc := fmt.Sprintf("%s:%d", bp.Path, bp.Line+1)
 		switch {
 		case bp.Condition == "":
@@ -348,8 +548,9 @@ func exportBreakpointScript(bps []Breakpoint, flavour string) string {
 			fmt.Fprintf(&b, "break %s, %s\n", loc, bp.Condition)
 		case flavour == "gdb":
 			fmt.Fprintf(&b, "break %s if %s\n", loc, bp.Condition)
-		default: // "dlv" has no inline condition syntax on `break` itself.
-			fmt.Fprintf(&b, "break %s\n", loc)
+		default: // dlv: name it, then condition it by name.
+			name := fmt.Sprintf("bp%d", n)
+			fmt.Fprintf(&b, "break %s %s\ncondition %s %s\n", name, loc, name, bp.Condition)
 		}
 	}
 	return b.String()

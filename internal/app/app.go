@@ -1036,6 +1036,10 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleDebugStarted(e)
 	case *debugStoppedEvent:
 		a.handleDebugStopped(e)
+	case *debugRebindEvent:
+		a.handleDebugRebind(e)
+	case *debugEvalEvent:
+		a.handleDebugEval(e)
 	case *debugLogEvent:
 		a.flash(e.msg)
 	case *debugVarsEvent:

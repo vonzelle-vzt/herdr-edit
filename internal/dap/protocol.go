@@ -170,6 +170,44 @@ func (c Capabilities) DefaultFilters() []string {
 	return out
 }
 
+// Evaluate contexts, as the protocol spells them in an evaluate request's
+// `context` field.
+//
+// 🔴 The choice is not cosmetic. EvalContextWatch is evaluated IN THE FRAME
+// named by frameId, which is what makes "what is `i` right now" answer with the
+// selected frame's `i` rather than a package-level one; EvalContextRepl is what
+// an adapter expects when there is no frame to evaluate in. Sending repl with a
+// frame id, or watch without one, is accepted by delve and answered — from the
+// wrong scope, with no error. See Client.Evaluate.
+const (
+	EvalContextWatch = "watch"
+	EvalContextRepl  = "repl"
+)
+
+// EvaluateResult is what an adapter made of an expression.
+//
+// Result is already RENDERED by the adapter — display text, exactly like
+// Variable.Value, and never something to parse. A non-zero VariablesReference
+// means the answer has children; nothing reads it yet, and it is carried so a
+// future "expand this result" does not have to change the type.
+type EvaluateResult struct {
+	Result             string `json:"result"`
+	Type               string `json:"type,omitempty"`
+	VariablesReference int    `json:"variablesReference"`
+}
+
+// evaluateArgs asks the adapter to evaluate an expression.
+//
+// FrameID carries omitempty deliberately: frame 0 is not a valid frame id, and
+// an absent field is how "evaluate outside any frame" is spelled. Sending
+// `"frameId": 0` instead asks a question about frame zero, which some adapters
+// answer and others refuse.
+type evaluateArgs struct {
+	Expression string `json:"expression"`
+	FrameID    int    `json:"frameId,omitempty"`
+	Context    string `json:"context,omitempty"`
+}
+
 // Source names a file to the adapter. Path is absolute; adapters resolve
 // relative paths against their own working directory, which is not ours.
 type Source struct {
@@ -182,6 +220,15 @@ type Source struct {
 // adapter without supportsConditionalBreakpoints treats an empty-string
 // condition as a condition, and one that never evaluates true is a breakpoint
 // that silently never fires.
+//
+// 🔴 omitempty is only half the guard, and the quieter half is the CAPABILITY.
+// An adapter that never advertised supportsConditionalBreakpoints DROPS the
+// field rather than refusing the request, so the breakpoint is accepted,
+// verified, and then fires on every single iteration — and the only visible
+// evidence is a debugger that stops ten times when the user asked for one. The
+// filtering happens in internal/app (sourceBreakpointsFor), which is the layer
+// that has both the capabilities and a status line to complain on; this struct
+// carries whatever it is handed.
 type SourceBreakpoint struct {
 	Line         int    `json:"line"`
 	Column       int    `json:"column,omitempty"`
