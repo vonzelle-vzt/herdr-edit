@@ -1854,18 +1854,23 @@ func TestDrawStatusBar_OmitsBranchWhenEmpty(t *testing.T) {
 // (58 -> 62 items, modalHeight 69 -> 73): "Evaluate at cursor", then "Set
 // breakpoint condition" / "Set logpoint message" / "Clear condition / log
 // message". Still one group, so again only the last divider moves: 66 -> 70.
+//
+// Then "Toggle block comment" landed next to "Toggle line comment", which sits
+// ABOVE three later dividers rather than at the end -- so unlike the debug rows,
+// this one pushes dividers 5, 6 and 7 down by one each (47/49/70 -> 48/50/71)
+// as well as the height and the count.
 func TestMenuLayout_NoCustomActions(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
 	a.customActions = nil
 	items, dividers, h := a.menuLayout()
 
-	if h != 73 {
-		t.Errorf("modalHeight = %d, want 73", h)
+	if h != 74 {
+		t.Errorf("modalHeight = %d, want 74", h)
 	}
-	if got := len(items); got != 62 {
-		t.Errorf("item count = %d, want 62 built-ins", got)
+	if got := len(items); got != 63 {
+		t.Errorf("item count = %d, want 63 built-ins", got)
 	}
-	wantDiv := []int{2, 6, 10, 34, 42, 47, 49, 70}
+	wantDiv := []int{2, 6, 10, 34, 42, 48, 50, 71}
 	if len(dividers) != len(wantDiv) {
 		t.Fatalf("dividers = %v, want %v", dividers, wantDiv)
 	}
@@ -2026,8 +2031,8 @@ func TestMenuLayout_WithCustomActions(t *testing.T) {
 	}
 	items, _, h := a.menuLayout()
 
-	if h != 76 { // 73 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
-		t.Errorf("modalHeight = %d, want 76", h)
+	if h != 77 { // 74 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
+		t.Errorf("modalHeight = %d, want 77", h)
 	}
 	// Custom actions should be the second-to-last and third-to-last
 	// rows, with Quit as the final row.

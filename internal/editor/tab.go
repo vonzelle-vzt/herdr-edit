@@ -18,6 +18,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
+	"github.com/cloudmanic/spice-edit/internal/langconf"
 	"github.com/cloudmanic/spice-edit/internal/theme"
 )
 
@@ -48,10 +49,14 @@ func gutterWidthFor(lineCount int) int {
 // character it should auto-insert immediately after it. Quotes map to
 // themselves because the opener and closer are the same rune — the
 // step-over and word-boundary rules in InsertRune / shouldAutoClose are
-// what keep that from producing duplicate quotes. Package-level (rather
-// than a local const) so a later per-language mode — e.g. no backtick
-// pairing outside Markdown/JS — can override it without touching
-// InsertRune itself.
+// what keep that from producing duplicate quotes.
+//
+// This is now the FALLBACK, used for file types internal/langconf does not
+// cover. The per-language mode this table's comment used to promise is built:
+// pairsFor / closersFor / surroundPairsFor below consult the language first,
+// and land here only when there is nothing to consult. Keeping it means a
+// `.wat` or `.zig` file behaves exactly as it did before per-language data
+// existed, rather than losing auto-close outright.
 var autoClosePairs = map[rune]rune{
 	'(':  ')',
 	'[':  ']',
@@ -75,6 +80,49 @@ func buildAutoCloseClosers() map[rune]bool {
 		m[c] = true
 	}
 	return m
+}
+
+// pairsFor returns the auto-closing pairs for this tab's file type: the
+// language's own if internal/langconf covers it, otherwise the global
+// fallback.
+//
+// 🔴 Rust is the reason this exists. `'a` is a LIFETIME, not a string, so
+// upstream's Rust configuration omits `'` from its auto-closing pairs — the
+// old single global table pasted a closing quote into every generic bound.
+//
+// The returned map belongs to langconf and must not be mutated; it is shared
+// by every tab of that language.
+func (t *Tab) pairsFor() map[rune]rune {
+	if pairs, ok := langconf.AutoClosePairs(t.Path); ok {
+		return pairs
+	}
+	return autoClosePairs
+}
+
+// closersFor returns the set of closing runes for this tab's file type, used
+// by the step-over rule. Derived from the same language data as pairsFor, so
+// a language that does not pair a character also does not step over it —
+// stepping over a rune we never inserted would swallow the keystroke.
+func (t *Tab) closersFor() map[rune]bool {
+	if closers, ok := langconf.AutoCloseClosers(t.Path); ok {
+		return closers
+	}
+	return autoCloseClosers
+}
+
+// surroundPairsFor returns the pairs that wrap a selection rather than
+// replacing it.
+//
+// These are a SEPARATE upstream table from the auto-closing pairs and the
+// difference is real: Rust surrounds a selection with `<`/`>` for generics,
+// but must never auto-close a typed `<`, which would pair every less-than in
+// the file. The fallback is the global pair table, which is what surrounding
+// used before this data existed.
+func (t *Tab) surroundPairsFor() map[rune]rune {
+	if pairs, ok := langconf.SurroundPairs(t.Path); ok {
+		return pairs
+	}
+	return autoClosePairs
 }
 
 // GitLineChange describes the marker rendered in the editor gutter for a line.
@@ -478,20 +526,24 @@ func (t *Tab) InsertString(s string) {
 // Three auto-close behaviours short-circuit the plain insert, checked in
 // this order:
 //
-//  1. A selection plus an opener (`(` `[` `{` `"` `'` ``` ` ``` ) surrounds
-//     the selection instead of replacing it.
+//  1. A selection plus a surrounding opener wraps the selection instead of
+//     replacing it.
 //  2. Typing a closer that's already sitting immediately to the right of
 //     the cursor steps over it instead of inserting a duplicate.
 //  3. Typing an opener with no selection inserts the pair and leaves the
 //     cursor between them — unless it's a quote right after a word
 //     character (shouldAutoClose), which would turn `don` + `'` + `t`
 //     into `don”t`.
+//
+// Which characters count as openers and closers is PER LANGUAGE — see
+// pairsFor / closersFor / surroundPairsFor. Rust does not pair `'` because
+// `'a` is a lifetime; Go and Python do.
 func (t *Tab) InsertRune(r rune) {
 	if t.IsImage() {
 		return
 	}
 	if t.HasSelection() {
-		if closer, ok := autoClosePairs[r]; ok {
+		if closer, ok := t.surroundPairsFor()[r]; ok && closer != 0 {
 			t.surroundSelection(r, closer)
 			return
 		}
@@ -502,7 +554,7 @@ func (t *Tab) InsertRune(r rune) {
 		if t.stepOverAutoClose(r) {
 			return
 		}
-		if closer, ok := autoClosePairs[r]; ok && t.shouldAutoClose(r) {
+		if closer, ok := t.pairsFor()[r]; ok && t.shouldAutoClose(r) {
 			t.insertAutoClosePair(r, closer)
 			return
 		}
@@ -556,7 +608,7 @@ func (t *Tab) insertAutoClosePair(r, closer rune) {
 // existing one. Returns true when it handled the keystroke, in which
 // case the caller must not also perform a normal insert.
 func (t *Tab) stepOverAutoClose(r rune) bool {
-	if !autoCloseClosers[r] {
+	if !t.closersFor()[r] {
 		return false
 	}
 	line := []rune(t.Buffer.Lines[t.Cursor.Line])
@@ -653,7 +705,7 @@ func (t *Tab) deleteEmptyPair() bool {
 	}
 	before := line[t.Cursor.Col-1]
 	after := line[t.Cursor.Col]
-	closer, ok := autoClosePairs[before]
+	closer, ok := t.pairsFor()[before]
 	if !ok || closer != after {
 		return false
 	}

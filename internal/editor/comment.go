@@ -10,6 +10,8 @@ package editor
 import (
 	"path/filepath"
 	"strings"
+
+	"github.com/cloudmanic/spice-edit/internal/langconf"
 )
 
 // lineCommentByExt maps common source file extensions to their single-line
@@ -92,6 +94,142 @@ func LineCommentPrefix(path string) (string, bool) {
 	}
 	prefix, ok := lineCommentByExt[strings.ToLower(filepath.Ext(base))]
 	return prefix, ok
+}
+
+// BlockCommentTokens returns the block-comment delimiters for path, e.g.
+// "/*" and "*/" for Go and Rust, `"""` and `"""` for Python.
+//
+// The data comes from internal/langconf, i.e. from upstream's own language
+// configurations, rather than from a second hand-written table beside
+// lineCommentByExt above. lineCommentByExt is deliberately left alone: it is
+// what `Esc /` has always used and this change must not move that behaviour.
+func BlockCommentTokens(path string) (start, end string, ok bool) {
+	return langconf.BlockComment(path)
+}
+
+// ToggleBlockComment wraps the selection (or the cursor line, when there is
+// no selection) in the language's block-comment delimiters, or unwraps it
+// when it is already wrapped. It returns ok=false for a file type with no
+// block-comment form, which the caller should report the same way it reports
+// an unsupported line comment.
+//
+// The wrap is EXACT — no padding spaces — so wrapping and unwrapping is an
+// identity round trip. A "/* text */" form would have to guess whether to eat
+// the spaces again on the way out, and would stop recognising blocks written
+// by anything else.
+//
+// 🔴 NOT REACHABLE FROM THE UI YET. Every caller today is a _test.go file, so
+// by this fork's own rule (CLAUDE.md, "grep for a call site before believing
+// it works") block commenting is NOT a shipped feature — do not advertise it
+// in README.md or FORK.md until it has a menu entry. Wiring it needs a `≡`
+// menu item and a key binding in internal/app/app.go, next to where
+// ToggleLineComment is dispatched for `Esc /`.
+func (t *Tab) ToggleBlockComment() (changed bool, ok bool) {
+	if t == nil || t.IsImage() || t.Buffer == nil {
+		return false, false
+	}
+	open, closer, ok := BlockCommentTokens(t.Path)
+	if !ok {
+		return false, false
+	}
+	start, end := t.blockCommentRange()
+	if start == end {
+		return false, true
+	}
+	text := t.Buffer.Substring(start, end)
+	if isBlockCommented(text, open, closer) {
+		t.unwrapBlockComment(start, end, open, closer)
+		return true, true
+	}
+	t.wrapBlockComment(start, end, open, closer)
+	return true, true
+}
+
+// blockCommentRange returns the range to wrap: the selection when there is
+// one, otherwise the whole cursor line. An all-whitespace cursor line yields
+// an empty range, which ToggleBlockComment treats as a no-op — commenting
+// nothing would leave a bare `/**/` floating in the file.
+func (t *Tab) blockCommentRange() (Position, Position) {
+	if t.HasSelection() {
+		start, end := PosOrdered(t.Anchor, t.Cursor)
+		return t.Buffer.Clamp(start), t.Buffer.Clamp(end)
+	}
+	line := t.Buffer.Clamp(t.Cursor).Line
+	if strings.TrimSpace(t.Buffer.Lines[line]) == "" {
+		p := Position{Line: line, Col: 0}
+		return p, p
+	}
+	return Position{Line: line, Col: 0},
+		Position{Line: line, Col: len(t.Buffer.LineRunes(line))}
+}
+
+// isBlockCommented reports whether text is already a single block comment.
+//
+// The length guard is what makes Python safe: its open and close delimiters
+// are both `"""`, so a bare `"""` satisfies both HasPrefix and HasSuffix while
+// being one delimiter rather than a wrapped block. Without the guard,
+// toggling it would delete six characters from a three-character selection.
+func isBlockCommented(text, open, closer string) bool {
+	if len(text) < len(open)+len(closer) {
+		return false
+	}
+	return strings.HasPrefix(text, open) && strings.HasSuffix(text, closer)
+}
+
+// wrapBlockComment inserts the delimiters around start..end and leaves the
+// original text selected between them, matching how surroundSelection behaves
+// for brackets.
+func (t *Tab) wrapBlockComment(start, end Position, open, closer string) {
+	t.pushUndo(undoGroupStructural)
+	// Closer first: it lands at end, a position the opener insert (at or
+	// before start) cannot invalidate. The other order would need end
+	// shifted by hand whenever both endpoints share a line.
+	t.bufInsert(end, closer)
+	afterOpen := t.bufInsert(start, open)
+	newEnd := end
+	if start.Line == end.Line {
+		newEnd.Col += len([]rune(open))
+	}
+	t.Anchor = afterOpen
+	t.Cursor = newEnd
+	t.finishBlockComment()
+}
+
+// unwrapBlockComment removes the two delimiters from a range already known to
+// be wrapped.
+//
+// It deletes the delimiters in place rather than replacing the whole range
+// with its inner text. Both deletions stay within a single line, so no line
+// entry disappears and Tab.Marks needs no renumbering — a
+// delete-the-range-and-reinsert version would drop every breakpoint inside a
+// multi-line block comment the moment the user un-commented it.
+func (t *Tab) unwrapBlockComment(start, end Position, open, closer string) {
+	openRunes := len([]rune(open))
+	closeRunes := len([]rune(closer))
+
+	t.pushUndo(undoGroupStructural)
+	// Later delimiter first, so start's coordinates stay valid.
+	t.bufDelete(Position{Line: end.Line, Col: end.Col - closeRunes}, end)
+	t.bufDelete(start, Position{Line: start.Line, Col: start.Col + openRunes})
+
+	newEnd := Position{Line: end.Line, Col: end.Col - closeRunes}
+	if start.Line == end.Line {
+		newEnd.Col -= openRunes
+	}
+	t.Anchor = start
+	t.Cursor = newEnd
+	t.finishBlockComment()
+}
+
+// finishBlockComment applies the bookkeeping both block-comment paths share:
+// clamp the selection back inside the buffer and mark the tab dirty, its
+// styles stale and its cursor moved.
+func (t *Tab) finishBlockComment() {
+	t.Anchor = t.Buffer.Clamp(t.Anchor)
+	t.Cursor = t.Buffer.Clamp(t.Cursor)
+	t.Dirty = true
+	t.StyleStale = true
+	t.cursorMoved = true
 }
 
 // ToggleLineComment comments or uncomments the selected lines. It returns

@@ -109,6 +109,9 @@ internal/dap/                 DAP client (delve over a socket, debugpy over stdi
 internal/app/debug.go         Debug session, DAP events, stopped marker overlay, status
 internal/app/debugview.go     Stepping, call stack, threads, variables, evaluate, debug console
 internal/toolpath/            Where developer tools ACTUALLY live when PATH cannot be trusted
+internal/langconf/            Per-language editing behaviour (pairs, comments, folding), keyed
+                              by language id. data.go is GENERATED — see below
+internal/langconf/gen/        The generator: reads VS Code's language-configuration.json files
 ```
 
 🔴 **`internal/toolpath` is the one utility-shaped package here, and it earns it.**
@@ -119,6 +122,56 @@ other cannot find `dlv` in the same directory is worse than either being wrong, 
 screen would explain it. That is CLAUDE.md's own "share when two copies must AGREE" rule, and
 importing `internal/lsp` from `internal/dap` would be a nonsense dependency direction.
 `TestOnlyOnePlaceKnowsWhereToolsLive` fails if a third copy appears.
+
+🔴 **`internal/langconf/data.go` is generated, third-party DATA, and carries someone
+else's copyright.** It is transcribed by `internal/langconf/gen` from the
+`language-configuration.json` files of the built-in language extensions in
+`github.com/microsoft/vscode` (MIT). Three rules follow, and none of them are
+optional:
+
+1. **Never hand-edit `data.go`.** Change the generator, or run
+   `go generate ./internal/langconf`. `TestGeneratedDataMatchesTheSource` re-runs
+   the generator and diffs the result byte for byte; a hand-edit is a test failure.
+   It skips loudly when VS Code is not installed (CI), and fails when it is
+   installed and the data disagrees.
+2. 🔴 **MIT requires the copyright notice travel with the data.** `NOTICE` at the
+   repo root carries Microsoft's notice, what was taken (data only — no VS Code
+   TypeScript, ever), and the VS Code version it came from. If you regenerate
+   against a newer VS Code, update `NOTICE`'s version and language count too;
+   `langconf.SourceVersion` is the machine-checkable copy of the same claim.
+   The **`microsoft/vscode` repository** is MIT; the branded **"Visual Studio Code"
+   binary** Microsoft ships is a proprietary build of it. We rely on the former.
+   The generator enforces this by taking only extensions whose `package.json`
+   declares publisher `vscode` and license `MIT` — which is why `.wat` (vendored
+   from `microsoft/vscode-js-debug`, a different repo) is deliberately uncovered.
+3. **The extension→language mapping is `lsp.LanguageID`, reused, not copied.**
+   `langconf.LanguageOf` is a one-line wrapper and `TestLanguageOfReusesTheLSPMapping`
+   fails if a second map appears. Two maps would let the editor and the language
+   server disagree about what a file is, and nothing on screen would explain it.
+
+🔴 **`Pair.NotIn` is recorded and NOT enforced — say so, don't quietly imply
+otherwise.** VS Code suppresses several pairs inside strings and comments (Rust's
+`"`, Go's `'`, most of Python's 22). Honouring that needs scope tracking at the
+cursor, which this editor does not have: `HighlightVisible` collapses every Chroma
+token into a `tcell.Style` and discards the token type, `Tab.Styles` is populated
+for the **viewport only**, and `StyleStale` means the grid describes the buffer
+*before* the current keystroke. So the pairs are offered unconditionally and the
+data is kept for a caller that could honour it. A quote auto-closing inside a
+string is a small annoyance; code that *claims* to suppress it and does not is how
+a wrong fix ships. `TestNotInIsRecordedButNotEnforced` is where that claim lives —
+update it there, or not at all.
+
+Auto-close in `tab.go` goes through `pairsFor` / `closersFor` / `surroundPairsFor`,
+which consult the language and **fall back to the package-level `autoClosePairs`**
+for any uncovered file type. That fallback is the whole no-regression story;
+`TestUnknownLanguageFallsBackToTheGlobalPairs` is what stops it being dropped.
+Those three are reachable — `app.go` calls `InsertRune` on every keystroke.
+
+`editor.ToggleBlockComment` is reachable: `app.go` has a "Toggle block comment"
+menu row, which the command palette picks up for free because `paletteCommands`
+derives from `menuLayout`. It gets no leader key on purpose — every lowercase
+rune is taken or reserved, and `Esc /` belongs to the line-comment toggle, which
+is the one people actually reach for.
 
 ```
 internal/app/lspstatus.go     Which language servers are running, in the status bar

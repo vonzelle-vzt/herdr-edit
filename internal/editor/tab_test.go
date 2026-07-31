@@ -1321,3 +1321,160 @@ func TestAllBufferMutationsGoThroughMarkWrappers(t *testing.T) {
 		}
 	}
 }
+
+// TestRustDoesNotAutoCloseALifetimeApostrophe is the bug this per-language
+// work exists to fix. In Rust `'a` is a LIFETIME, not the start of a string,
+// so upstream's language configuration deliberately omits `'` from Rust's
+// auto-closing pairs. The old package-level table closed it for every file
+// type, so writing `fn longest<'a>` produced `fn longest<”a>` and the user
+// had to delete a quote on every generic bound. Go and Python do pair it, and
+// must keep doing so — a fix that switched the apostrophe off everywhere would
+// pass a test that only looked at Rust.
+func TestRustDoesNotAutoCloseALifetimeApostrophe(t *testing.T) {
+	rust := &Tab{Path: "src/lib.rs", Buffer: NewBuffer("")}
+	rust.InsertRune('\'')
+	if rust.Buffer.Lines[0] != "'" {
+		t.Errorf("rust: typing ' gave %q, want %q (a lifetime must not be paired)", rust.Buffer.Lines[0], "'")
+	}
+	if rust.Cursor != (Position{Line: 0, Col: 1}) {
+		t.Errorf("rust: cursor should sit after the lone quote, got %+v", rust.Cursor)
+	}
+
+	// The real-world shape: a lifetime inside a generic bound.
+	bound := &Tab{Path: "src/lib.rs", Buffer: NewBuffer("fn longest<")}
+	bound.Cursor = Position{Line: 0, Col: 11}
+	bound.Anchor = bound.Cursor
+	bound.InsertRune('\'')
+	bound.InsertRune('a')
+	if bound.Buffer.Lines[0] != "fn longest<'a" {
+		t.Errorf("rust: got %q, want %q", bound.Buffer.Lines[0], "fn longest<'a")
+	}
+
+	// Rust still pairs everything it should.
+	for _, c := range []struct{ open, want rune }{{'(', ')'}, {'[', ']'}, {'{', '}'}, {'"', '"'}} {
+		tab := &Tab{Path: "src/lib.rs", Buffer: NewBuffer("")}
+		tab.InsertRune(c.open)
+		if got, want := tab.Buffer.Lines[0], string(c.open)+string(c.want); got != want {
+			t.Errorf("rust: opener %q gave %q, want %q", c.open, got, want)
+		}
+	}
+
+	// The same keystroke in Go and Python still pairs.
+	for _, path := range []string{"main.go", "main.py"} {
+		tab := &Tab{Path: path, Buffer: NewBuffer("")}
+		tab.InsertRune('\'')
+		if tab.Buffer.Lines[0] != "''" {
+			t.Errorf("%s: typing ' gave %q, want %q", path, tab.Buffer.Lines[0], "''")
+		}
+		if tab.Cursor != (Position{Line: 0, Col: 1}) {
+			t.Errorf("%s: cursor should sit between the pair, got %+v", path, tab.Cursor)
+		}
+	}
+}
+
+// TestUnknownLanguageFallsBackToTheGlobalPairs is the no-regression guard for
+// every file type the table does not cover. `.wat` is one such: it is
+// contributed by a VS Code extension that lives in a different repository, so
+// it is deliberately outside the data we took. Those files must keep the six
+// pairs the editor has always had, not lose auto-close entirely — which is
+// exactly what a language-aware rewrite with no fallback would do.
+func TestUnknownLanguageFallsBackToTheGlobalPairs(t *testing.T) {
+	for _, path := range []string{"module.wat", "notes.xyzzy", "", "scratch"} {
+		for open, want := range autoClosePairs {
+			tab := &Tab{Path: path, Buffer: NewBuffer("")}
+			tab.InsertRune(open)
+			if got, expect := tab.Buffer.Lines[0], string(open)+string(want); got != expect {
+				t.Errorf("%q: opener %q gave %q, want %q — the fallback was lost", path, open, got, expect)
+			}
+		}
+		// Step-over and empty-pair backspace ride on the same table.
+		tab := &Tab{Path: path, Buffer: NewBuffer("")}
+		tab.InsertRune('(')
+		tab.InsertRune(')')
+		if tab.Buffer.Lines[0] != "()" || tab.Cursor.Col != 2 {
+			t.Errorf("%q: step-over broken, got %q at %+v", path, tab.Buffer.Lines[0], tab.Cursor)
+		}
+		tab.Cursor = Position{Line: 0, Col: 1}
+		tab.Anchor = tab.Cursor
+		tab.Backspace()
+		if tab.Buffer.Lines[0] != "" {
+			t.Errorf("%q: empty-pair backspace broken, got %q", path, tab.Buffer.Lines[0])
+		}
+	}
+}
+
+// TestAutoCloseStepOverAndBackspaceFollowTheLanguage proves the language table
+// reaches all three auto-close behaviours, not just the insert. Rust does not
+// pair `'`, so a `'` sitting right of the cursor must NOT be stepped over
+// (that would swallow the keystroke and leave the user unable to type a second
+// lifetime), and Backspace between two of them must delete one character
+// rather than treating them as an auto-inserted pair.
+func TestAutoCloseStepOverAndBackspaceFollowTheLanguage(t *testing.T) {
+	step := &Tab{Path: "src/lib.rs", Buffer: NewBuffer("x'")}
+	step.Cursor = Position{Line: 0, Col: 1}
+	step.Anchor = step.Cursor
+	step.InsertRune('\'')
+	if step.Buffer.Lines[0] != "x''" {
+		t.Errorf("rust: ' must be inserted, not stepped over; got %q", step.Buffer.Lines[0])
+	}
+
+	back := &Tab{Path: "src/lib.rs", Buffer: NewBuffer("''")}
+	back.Cursor = Position{Line: 0, Col: 1}
+	back.Anchor = back.Cursor
+	back.Backspace()
+	if back.Buffer.Lines[0] != "'" {
+		t.Errorf("rust: backspace between two quotes should delete one, got %q", back.Buffer.Lines[0])
+	}
+
+	// Go treats the same three keystrokes as a pair, because Go's config does.
+	goStep := &Tab{Path: "main.go", Buffer: NewBuffer("x'")}
+	goStep.Cursor = Position{Line: 0, Col: 1}
+	goStep.Anchor = goStep.Cursor
+	goStep.InsertRune('\'')
+	if goStep.Buffer.Lines[0] != "x'" || goStep.Cursor.Col != 2 {
+		t.Errorf("go: ' should step over the existing one, got %q at %+v", goStep.Buffer.Lines[0], goStep.Cursor)
+	}
+	goBack := &Tab{Path: "main.go", Buffer: NewBuffer("''")}
+	goBack.Cursor = Position{Line: 0, Col: 1}
+	goBack.Anchor = goBack.Cursor
+	goBack.Backspace()
+	if goBack.Buffer.Lines[0] != "" {
+		t.Errorf("go: backspace should remove the empty pair, got %q", goBack.Buffer.Lines[0])
+	}
+}
+
+// TestSurroundSelectionFollowsTheLanguage pins the surrounding pairs as a
+// table distinct from the auto-closing one. Rust surrounds a selection with
+// `<`/`>` — useful for generics — while never auto-closing a typed `<`, which
+// would pair every less-than in the file. Reusing one map for both would have
+// to give up one of those behaviours.
+func TestSurroundSelectionFollowsTheLanguage(t *testing.T) {
+	tab := &Tab{Path: "src/lib.rs", Buffer: NewBuffer("T")}
+	tab.Anchor = Position{Line: 0, Col: 0}
+	tab.Cursor = Position{Line: 0, Col: 1}
+	tab.InsertRune('<')
+	if tab.Buffer.Lines[0] != "<T>" {
+		t.Errorf("rust: selection surround with < gave %q, want %q", tab.Buffer.Lines[0], "<T>")
+	}
+	if tab.SelectionText() != "T" {
+		t.Errorf("rust: original selection should survive, got %q", tab.SelectionText())
+	}
+
+	// A typed `<` with no selection must stay an ordinary character.
+	plain := &Tab{Path: "src/lib.rs", Buffer: NewBuffer("a ")}
+	plain.Cursor = Position{Line: 0, Col: 2}
+	plain.Anchor = plain.Cursor
+	plain.InsertRune('<')
+	if plain.Buffer.Lines[0] != "a <" {
+		t.Errorf("rust: a typed < must not auto-close, got %q", plain.Buffer.Lines[0])
+	}
+
+	// Go has no angle-bracket surround, so `<` replaces the selection there.
+	goTab := &Tab{Path: "main.go", Buffer: NewBuffer("T")}
+	goTab.Anchor = Position{Line: 0, Col: 0}
+	goTab.Cursor = Position{Line: 0, Col: 1}
+	goTab.InsertRune('<')
+	if goTab.Buffer.Lines[0] != "<" {
+		t.Errorf("go: < should replace the selection, got %q", goTab.Buffer.Lines[0])
+	}
+}

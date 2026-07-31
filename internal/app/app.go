@@ -276,6 +276,7 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Cut selection", action: (*App).menuCut, enabled: (*App).hasSelection},
 			{label: "Paste", action: (*App).menuPaste, enabled: (*App).hasClipboard},
 			{label: "Toggle line comment", shortcut: "Esc /", action: (*App).menuToggleLineComment, enabled: (*App).hasCommentableTab},
+			{label: "Toggle block comment", action: (*App).menuToggleBlockComment, enabled: (*App).hasCommentableTab},
 		},
 		// View toggle
 		{
@@ -2770,6 +2771,31 @@ func (a *App) menuToggleLineComment() {
 		return
 	}
 	a.flash("Toggled line comment")
+}
+
+// menuToggleBlockComment wraps the selection (or the cursor line) in the
+// language's block-comment delimiters, or unwraps it when already wrapped.
+//
+// Menu-and-palette only, with no leader key: every lowercase rune in the leader
+// table is taken or reserved, and Esc / already belongs to the line-comment
+// toggle, which is the one people reach for. A row here is reachable from the
+// command palette for free, because paletteCommands derives from menuLayout.
+func (a *App) menuToggleBlockComment() {
+	a.closeMenu()
+	tab := a.activeTabPtr()
+	if tab == nil || tab.IsImage() {
+		return
+	}
+	changed, ok := tab.ToggleBlockComment()
+	if !ok {
+		a.flash("No block comment syntax for this file")
+		return
+	}
+	if !changed {
+		a.flash("Nothing to wrap in a block comment")
+		return
+	}
+	a.flash("Toggled block comment")
 }
 
 // menuRefreshTree forces an immediate sidebar reload. Currently unwired

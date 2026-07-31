@@ -1,0 +1,91 @@
+NOTICE
+======
+
+herdr-edit is distributed under the MIT License; see LICENSE.
+
+This file records third-party material included in herdr-edit and the
+attribution its licence requires to be preserved.
+
+
+-------------------------------------------------------------------------------
+Microsoft Corporation — Visual Studio Code language configuration data
+-------------------------------------------------------------------------------
+
+What was taken
+--------------
+The DATA in `internal/langconf/data.go`: per-language comment markers, bracket
+pairs, auto-closing pairs (including their `notIn` context lists), surrounding
+pairs and folding markers. It is derived from the `language-configuration.json`
+files contributed by the built-in language extensions of Visual Studio Code.
+
+`internal/langconf/gen/main.go` reads those JSON files and emits `data.go`; the
+transcription is mechanical and re-runnable, and
+`TestGeneratedDataMatchesTheSource` fails if the committed table stops matching
+its source.
+
+Data only. No Visual Studio Code source code — TypeScript or otherwise — is
+copied, reproduced, translated or derived from in this project.
+
+Source, and which "VS Code" this means
+--------------------------------------
+This distinction matters and is easy to get wrong:
+
+  * `github.com/microsoft/vscode` is the OPEN SOURCE REPOSITORY, licensed under
+    the MIT License. The language-configuration files live there, and each
+    built-in language extension's `package.json` declares `"license": "MIT"`.
+    THAT is what this data comes from.
+
+  * "Visual Studio Code", the branded binary Microsoft ships from
+    code.visualstudio.com, is a PROPRIETARY BUILD of that repository, released
+    under a separate Microsoft product licence. Nothing from that licence is
+    claimed or relied on here.
+
+The extracted files were read from a local Visual Studio Code installation for
+convenience — the shipped app carries the same MIT-licensed extension files the
+repository does, verified per-extension via the `license` field in each
+`package.json`. Only extensions declaring publisher `vscode` and license `MIT`
+were used, which is the set maintained inside the `microsoft/vscode` repository
+itself. Extensions vendored in from other repositories — `ms-vscode.js-debug`,
+for one — were deliberately excluded so that the provenance stated here is
+exactly true.
+
+Provenance
+----------
+  Upstream project : Visual Studio Code (github.com/microsoft/vscode)
+  Upstream licence : MIT
+  Extracted from   : Visual Studio Code 1.131.0
+  Languages taken  : 69
+  Recorded in code : `langconf.SourceVersion`, and the header of
+                     `internal/langconf/data.go`
+
+Copyright notice (preserved as MIT requires)
+--------------------------------------------
+
+  Copyright (c) Microsoft Corporation. All rights reserved.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
+Regenerating
+------------
+    go generate ./internal/langconf
+
+Re-running the generator against a newer Visual Studio Code updates both the
+data and the `Extracted from` version above. If you bump it, update the version
+and language count in this file too — `langconf.SourceVersion` is the checkable
+copy, this one is the human-readable claim, and they are meant to agree.
