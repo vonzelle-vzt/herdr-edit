@@ -55,7 +55,7 @@ func leaderBindings() []leaderBinding {
 		{'b', (*App).menuToggleInlineBlame},
 		{' ', (*App).menuComplete},
 		{'o', (*App).menuOpenChanges},
-		{'e', (*App).menuJumpToDiffSource},
+		{'e', (*App).menuGoToLocation},
 		{'i', (*App).menuOutline},
 		{'l', (*App).menuCodeActions},
 		{'j', (*App).menuFindReferences},

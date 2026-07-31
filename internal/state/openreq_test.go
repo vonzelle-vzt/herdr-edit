@@ -75,3 +75,29 @@ func TestOpenRequest_MissingIsAbsent(t *testing.T) {
 		t.Fatal("with no file present there should be no request")
 	}
 }
+
+// TestSplitLocation covers the three shapes a panel emits, plus the
+// paths/strings that would break a left-to-right scan. Promoted here from
+// main_test.go along with SplitLocation itself, so internal/app can share the
+// exact same parser instead of growing a second, drifting copy.
+func TestSplitLocation(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantPath string
+		wantL    int
+		wantC    int
+	}{
+		{"src/app.go", "src/app.go", 1, 1},
+		{"src/app.go:42", "src/app.go", 42, 1},
+		{"src/app.go:42:7", "src/app.go", 42, 7},
+		{"/abs/path/to/file.ts:9", "/abs/path/to/file.ts", 9, 1},
+		{"weird:name.go", "weird:name.go", 1, 1},
+		{"file.go:0", "file.go:0", 1, 1},
+	}
+	for _, c := range cases {
+		p, l, col := SplitLocation(c.in)
+		if p != c.wantPath || l != c.wantL || col != c.wantC {
+			t.Errorf("SplitLocation(%q) = %q,%d,%d — want %q,%d,%d", c.in, p, l, col, c.wantPath, c.wantL, c.wantC)
+		}
+	}
+}

@@ -248,7 +248,7 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Toggle bookmark", shortcut: "Esc m", action: (*App).menuToggleBookmark, enabled: (*App).hasFileTab},
 			{label: "Next bookmark", shortcut: "Esc '", action: (*App).menuNextBookmark, enabled: (*App).hasBookmarks},
 			{label: "Clear bookmarks", action: (*App).menuClearBookmarks, enabled: (*App).hasBookmarks},
-			{label: "Jump to source line", shortcut: "Esc e", action: (*App).menuJumpToDiffSource, enabled: (*App).hasDiffTab},
+			{label: "Go to location under cursor", shortcut: "Esc e", action: (*App).menuGoToLocation, enabled: (*App).hasJumpableTab},
 			{label: "Open changes (diff)", shortcut: "Esc o", action: (*App).menuOpenChanges, enabled: (*App).hasFileTab},
 			{shortcut: "Esc b", action: (*App).menuToggleInlineBlame, enabled: alwaysTrue, labelFor: (*App).inlineBlameLabel},
 			{label: "Go to line", shortcut: "Esc g", action: (*App).menuGoToLine, enabled: (*App).hasFindable},
@@ -912,6 +912,17 @@ func (a *App) consumeOpenRequest() {
 	if _, err := os.Stat(req.File); err != nil {
 		a.flash("Cannot open " + filepath.Base(req.File))
 		return
+	}
+	// open-request.json is one global file shared by every running editor, so
+	// with two editors open on different projects a single panel-issued jump
+	// would otherwise land in BOTH of them. Recording lastOpenSeq above before
+	// this check is what makes a request outside our project consumed rather
+	// than retried forever — only the editor whose rootDir actually contains
+	// the file opens it.
+	if a.rootDir != "" {
+		if rel, err := filepath.Rel(a.rootDir, req.File); err != nil || strings.HasPrefix(rel, "..") {
+			return
+		}
 	}
 	a.openFile(req.File)
 	tab := a.activeTabPtr()
