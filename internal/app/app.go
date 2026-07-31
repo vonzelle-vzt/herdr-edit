@@ -643,6 +643,17 @@ type App struct {
 	debug  *debugSession
 	dapReg *dap.Registry
 
+	// The Debug PANEL contract (fork, Lane B stage 5). debugPub mirrors the
+	// session out to debug-session.json the way active publishes the cursor;
+	// lastDebugSeq is the highest debug-request sequence already honoured.
+	//
+	// 🔴 lastDebugSeq starts at debugRequestFloor, NOT at zero like lastOpenSeq.
+	// A stale open-request honoured once at startup reopens a file; a stale
+	// debug-request honoured once at startup launches a process nobody asked
+	// for. See consumeDebugRequest in debug.go.
+	debugPub     *state.DebugPublisher
+	lastDebugSeq int64
+
 	// lastDebugOutput survives the session that produced it (fork, Lane B stage
 	// 3), so the debug console can be read AFTER the program exits — which is
 	// when you most want it. Cleared when the next run starts. See debugview.go.
@@ -698,6 +709,8 @@ func New(rootDir string) (*App, error) {
 		rootDir:        tree.Root.Path,
 		active:         state.NewPublisher(),
 		bpStore:        state.NewBreakpointStore(),
+		debugPub:       state.NewDebugPublisher(),
+		lastDebugSeq:   debugRequestFloor,
 		tree:           tree,
 		hoveredMenuRow: -1,
 		sidebarShown:   true,
@@ -762,6 +775,8 @@ func NewSingleFile(filePath string) (*App, error) {
 		rootDir:        absOr(rootDir),
 		active:         state.NewPublisher(),
 		bpStore:        state.NewBreakpointStore(),
+		debugPub:       state.NewDebugPublisher(),
+		lastDebugSeq:   debugRequestFloor,
 		tree:           nil,
 		hoveredMenuRow: -1,
 		sidebarShown:   false,
@@ -927,13 +942,24 @@ func (a *App) Run() error {
 		}
 		a.handleEvent(ev)
 		a.draw()
-		a.publishActive()
-		a.consumeOpenRequest()
-		a.maybeSyncLSP()
+		// syncBreakpoints runs BEFORE publishDebug: the panel's breakpoint list
+		// comes out of a.breakpoints, and publishing first would mirror a set
+		// that is one event behind the marks the user can see in the gutter.
 		a.syncBreakpoints()
+		a.publishActive()
+		a.publishDebug()
+		a.consumeOpenRequest()
+		a.consumeDebugRequest()
+		a.maybeSyncLSP()
 		a.screen.Show()
 	}
 	a.active.Flush() // do not lose the final position inside the debounce window
+	// 🔴 The CLEAN-EXIT half of the staleness contract, and it belongs in this
+	// block rather than beside stopDebugSession below: a panel that outlives the
+	// editor must find "idle", not the last thing that was true. The other half
+	// (a SIGKILLed editor, which never reaches here at all) is the reader's
+	// timestamp check — see internal/state/debugsession.go.
+	a.publishDebugIdle()
 	if a.bpStore != nil {
 		a.bpStore.Flush() // do not lose a breakpoint toggled just before quitting
 	}
@@ -987,11 +1013,9 @@ func (a *App) consumeOpenRequest() {
 	// would otherwise land in BOTH of them. Recording lastOpenSeq above before
 	// this check is what makes a request outside our project consumed rather
 	// than retried forever — only the editor whose rootDir actually contains
-	// the file opens it.
-	if a.rootDir != "" {
-		if rel, err := filepath.Rel(a.rootDir, req.File); err != nil || strings.HasPrefix(rel, "..") {
-			return
-		}
+	// the file opens it. debug-request.json shares the rule and the helper.
+	if !a.withinRoot(req.File) {
+		return
 	}
 	a.openFile(req.File)
 	tab := a.activeTabPtr()

@@ -45,6 +45,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -54,6 +55,7 @@ import (
 	"github.com/cloudmanic/spice-edit/internal/dap"
 	"github.com/cloudmanic/spice-edit/internal/editor"
 	"github.com/cloudmanic/spice-edit/internal/lsp"
+	"github.com/cloudmanic/spice-edit/internal/state"
 )
 
 // debugStartTimeout bounds bringing a session up. Generous because the adapter
@@ -74,6 +76,24 @@ const maxDebugOutput = 200
 // has a stack of whatever depth the runtime allowed, and the picker is for
 // navigating, not for reading a core dump.
 const maxDebugFrames = 64
+
+// debugRequestFloor is the sequence number below which a debug request is
+// treated as already answered: the instant this PROCESS started.
+//
+// 🔴 This is the ONE deliberate difference from consumeOpenRequest and copying
+// that function's zero would be a bug, not a style choice. lastOpenSeq starts at
+// 0, so an open-request left on disk by a previous session is honoured once at
+// startup — harmless, it opens a file. The same rule here would START A DEBUG
+// SESSION nobody asked for: a `s` pressed in a panel last Tuesday, replayed by
+// whichever editor happens to open next, compiling and running whatever program
+// that editor's active tab belongs to.
+//
+// A package-level var rather than constructor state on purpose. The floor is the
+// thing that must never be forgotten, and a field a constructor sets is a field
+// the NEXT constructor forgets — the guard has to live where the comparison is.
+// The constructors also seed lastDebugSeq from this same var, so the two cannot
+// be different numbers.
+var debugRequestFloor = time.Now().UnixNano()
 
 // boundBreakpoint is one breakpoint as the adapter actually bound it, kept so
 // the gutter can tell the truth about where execution will really stop.
@@ -108,6 +128,13 @@ type debugFrame struct {
 type debugSession struct {
 	client  *dap.Client
 	adapter string
+
+	// config names what this session is running, for the panels that mirror it.
+	// The editor has no launch.json reader — F5 debugs the active file — so it
+	// is the target handed to the adapter, which is a Go PACKAGE directory for
+	// delve and a script for debugpy. Recorded at launch rather than derived
+	// later, because a.activeTabPtr() has moved on by the time anything asks.
+	config string
 
 	// caps is what THIS adapter said it could do at initialize, refreshed if it
 	// revises itself with a `capabilities` event.
@@ -390,7 +417,10 @@ func (a *App) menuStartDebug() {
 	// different program state and mixing the two silently is worse than losing it.
 	a.lastDebugOutput = nil
 
-	a.debug = &debugSession{adapter: adapter.Name, starting: true, bound: map[string][]boundBreakpoint{}}
+	a.debug = &debugSession{
+		adapter: adapter.Name, config: program, starting: true,
+		bound: map[string][]boundBreakpoint{},
+	}
 	go a.runDebugSession(adapter, program, bps)
 
 	if len(bps) == 0 {
@@ -1185,6 +1215,201 @@ func (a *App) drawDebugGutter() {
 	if a.debug.stopped && a.debug.path == tab.Path {
 		paint(a.debug.line, '▶', a.theme.GitAdded)
 	}
+}
+
+// -----------------------------------------------------------------------------
+// The Debug panel contract (Lane B stage 5)
+//
+// 🔴 The panel NEVER speaks DAP. Everything below moves two small JSON files:
+// debug-session.json out (what the debugger is doing) and debug-request.json in
+// (what to do next). The adapter client stays in this process — if a panel ever
+// needed the protocol itself, the split was drawn in the wrong place.
+//
+// Both are driven from the SAME single polled call site in Run as publishActive
+// and consumeOpenRequest, and for the same reason those are: a session changes
+// from a dozen event handlers and a mark changes from six menu actions, so a set
+// of hand-placed hooks would miss one and the symptom would be a stale panel
+// rather than anything that looks like a bug.
+// -----------------------------------------------------------------------------
+
+// publishDebug mirrors the session out to debug-session.json. Cheap when nothing
+// changed: the publisher compares ignoring its own timestamp and writes at most
+// one file per debounce window.
+func (a *App) publishDebug() {
+	a.debugPub.Set(a.debugSnapshot())
+}
+
+// publishDebugIdle is the clean-exit half of the staleness contract: the editor
+// says out loud that there is no session before the process goes away, so a
+// panel opened afterwards shows nothing rather than the last stop.
+//
+// Flushed rather than merely Set, because the debounce window outlives the
+// shutdown block it is called from.
+func (a *App) publishDebugIdle() {
+	a.debugPub.Set(state.DebugSession{State: state.DebugStateIdle, Root: a.rootDir})
+	a.debugPub.Flush()
+}
+
+// debugSnapshot renders the current session as the published payload.
+//
+// 🔴 Every line here is a 0-BASED buffer line; state.DebugPublisher.Set converts
+// the whole payload to the 1-based wire form in one place. Adding a +1 here
+// would double-count, and it would do it on only the fields this function
+// touched — the failure the single conversion point exists to prevent.
+func (a *App) debugSnapshot() state.DebugSession {
+	snap := state.DebugSession{State: state.DebugStateIdle, Root: a.rootDir}
+
+	switch s := a.debug; {
+	case s == nil:
+		// No session. "terminated" rather than "idle" when the last run left
+		// output behind, because that is the difference between "nothing has
+		// happened here" and "your program ran and finished" — and the console
+		// holding that output is still open to be read.
+		if len(a.lastDebugOutput) > 0 {
+			snap.State = state.DebugStateTerminated
+		}
+	default:
+		snap.Adapter, snap.Config, snap.ThreadID = s.adapter, s.config, s.threadID
+		switch {
+		case s.starting:
+			snap.State = state.DebugStateStarting
+		case s.stopped:
+			snap.State = state.DebugStateStopped
+		default:
+			snap.State = state.DebugStateRunning
+		}
+		if s.stopped {
+			snap.Reason, snap.File, snap.Line = s.reason, s.path, s.line
+			snap.Frames = make([]state.DebugFrame, 0, len(s.frames))
+			for _, f := range s.frames {
+				snap.Frames = append(snap.Frames, state.DebugFrame{
+					Name: f.Name, File: f.Path, Line: f.Line,
+				})
+			}
+		}
+	}
+
+	bps := a.allBreakpoints()
+	snap.Breakpoints = make([]state.DebugBreakpoint, 0, len(bps))
+	for _, b := range bps {
+		snap.Breakpoints = append(snap.Breakpoints, state.DebugBreakpoint{
+			File: b.Path, Line: b.Line, Enabled: b.Enabled,
+			Verified:  a.breakpointVerified(b),
+			Condition: b.Condition, LogMessage: b.LogMessage,
+		})
+	}
+	return snap
+}
+
+// breakpointVerified reports whether the live adapter confirmed it can stop on
+// this breakpoint.
+//
+// False with no session, which is honest rather than pessimistic: nothing has
+// bound it, so nothing knows. A panel showing every breakpoint as verified
+// before F5 would be claiming an answer the debugger has not given.
+func (a *App) breakpointVerified(b Breakpoint) bool {
+	if a.debug == nil {
+		return false
+	}
+	for _, bb := range a.debug.bound[b.Path] {
+		if bb.Requested == b.Line {
+			return bb.Verified
+		}
+	}
+	return false
+}
+
+// consumeDebugRequest honours a pending request from the Debug panel. Polled
+// from the SAME single call site as consumeOpenRequest, not a second one.
+//
+// 🔴 The floor is the whole guard, and it is where this deliberately differs
+// from consumeOpenRequest — see debugRequestFloor. Recording the sequence BEFORE
+// acting is the other half: an action that refuses (no debuggable file, no
+// session to step) must still consume the request, or the same one is replayed
+// on every poll for as long as the editor runs.
+//
+// The one thing this does NOT do is scope a session action to a project.
+// debug-request.json is global, like open-request.json, and a verb such as
+// "continue" carries no path to test — so with two editors open on two projects,
+// a panel key reaches both. The file-bearing action IS scoped (toggleBreakpointAt
+// applies withinRoot), which is the case where landing in the wrong editor would
+// edit the wrong file.
+func (a *App) consumeDebugRequest() {
+	req, ok := state.ReadDebugRequest()
+	if !ok || req.Seq <= a.lastDebugSeq || req.Seq <= debugRequestFloor {
+		return
+	}
+	a.lastDebugSeq = req.Seq
+
+	switch req.Action {
+	case state.DebugActionStart:
+		a.menuDebugStartOrContinue()
+	case state.DebugActionContinue:
+		a.menuDebugContinue()
+	case state.DebugActionNext:
+		a.menuDebugStepOver()
+	case state.DebugActionStepIn:
+		a.menuDebugStepIn()
+	case state.DebugActionStepOut:
+		a.menuDebugStepOut()
+	case state.DebugActionPause:
+		a.menuDebugPause()
+	case state.DebugActionStop:
+		a.menuDebugStop()
+	case state.DebugActionToggleBreakpoint:
+		// The wire is 1-based, like every other location this editor accepts.
+		a.toggleBreakpointAt(req.File, bufLineFromAdapter(req.Line))
+	}
+}
+
+// toggleBreakpointAt honours a panel's toggle against a file:line rather than
+// the cursor: it opens the file if needed, moves the cursor there, and then goes
+// through menuToggleBreakpoint.
+//
+// 🔴 Reusing menuToggleBreakpoint rather than writing the mark directly is the
+// point. That function is the ONE place a breakpoint is created or cleared, and
+// it is what calls afterBreakpointEdit — the single site that re-sends the
+// file's whole set to a live adapter. A second toggle that set the mark itself
+// would work perfectly in the gutter and silently never reach the debugger.
+func (a *App) toggleBreakpointAt(file string, line int) {
+	if file == "" {
+		a.flash("Toggle breakpoint needs a file, optionally as file:line")
+		return
+	}
+	if line < 0 {
+		line = 0
+	}
+	if !a.withinRoot(file) {
+		return // another editor's project — see consumeDebugRequest
+	}
+	if _, err := os.Stat(file); err != nil {
+		a.flash("Cannot open " + filepath.Base(file))
+		return
+	}
+	tab := a.activeTabPtr()
+	if tab == nil || tab.Path != file {
+		a.openFile(file)
+		tab = a.activeTabPtr()
+	}
+	if tab == nil {
+		a.flash("Could not open " + filepath.Base(file))
+		return
+	}
+	tab.MoveCursorTo(editor.Position{Line: line, Col: 0}, false)
+	a.menuToggleBreakpoint()
+}
+
+// withinRoot reports whether path lies inside the project this editor was
+// opened on. Shared by consumeOpenRequest and toggleBreakpointAt because both
+// request files are GLOBAL — one editor per project, one file for all of them —
+// so each has to decide whether a request is addressed to it. Two copies of the
+// rule would drift into two different answers to "is this mine".
+func (a *App) withinRoot(path string) bool {
+	if a.rootDir == "" {
+		return true
+	}
+	rel, err := filepath.Rel(a.rootDir, path)
+	return err == nil && !strings.HasPrefix(rel, "..")
 }
 
 // debugStatus is the one-line status-bar summary of the session — the sibling

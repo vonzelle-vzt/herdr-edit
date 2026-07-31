@@ -27,6 +27,7 @@ import (
 
 	"github.com/cloudmanic/spice-edit/internal/dap"
 	"github.com/cloudmanic/spice-edit/internal/editor"
+	"github.com/cloudmanic/spice-edit/internal/state"
 )
 
 // debugFixture writes a small Go file and opens it, returning the app and path.
@@ -1768,4 +1769,338 @@ func TestConditionEditedWhileStartingStillReachesTheAdapter(t *testing.T) {
 	if a.debug.breakpointsDirty {
 		t.Error("the dirty flag survived the resend; every later start would re-push for nothing")
 	}
+}
+
+// -----------------------------------------------------------------------------
+// The Debug panel contract (Lane B stage 5)
+// -----------------------------------------------------------------------------
+
+// panelStateDir points the state package at a temp directory and gives the App
+// a publisher writing into it, which newTestApp deliberately does not do — it
+// builds a bare App rather than running the constructors.
+//
+// 🔴 It does NOT touch a.lastDebugSeq. That is the whole subject of
+// TestStaleDebugRequestIgnoredAtStartup: a helper that seeded the floor would be
+// the test doing the production wiring for it, and the oracle would pass against
+// the bug it exists to catch.
+func panelStateDir(t *testing.T, a *App) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := os.MkdirAll(state.Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.debugPub = state.NewDebugPublisher()
+}
+
+// writeRawDebugRequest puts a request on disk with an EXACT sequence number,
+// which state.WriteDebugRequest cannot do — it always stamps time.Now(). A
+// stale request is the only way to exercise the startup floor.
+func writeRawDebugRequest(t *testing.T, req state.DebugRequest) {
+	t.Helper()
+	blob, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(state.DebugRequestFile(), blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readPublishedSession unmarshals debug-session.json, waiting out the publisher
+// debounce. Reading the FILE is the point: this contract exists to be read from
+// another process, so asserting on the App's own fields would prove nothing
+// about what a panel actually sees.
+func readPublishedSession(t *testing.T) state.DebugSession {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		blob, err := os.ReadFile(state.DebugSessionFile())
+		if err == nil {
+			var s state.DebugSession
+			if json.Unmarshal(blob, &s) == nil && s.TS != 0 {
+				return s
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no readable debug session at %s after 2s", state.DebugSessionFile())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestStaleDebugRequestIgnoredAtStartup is the ONE place this contract differs
+// from openreq.go, and the reason debugreq.go is a separate file.
+//
+// consumeOpenRequest starts its high-water mark at zero, so a request left on
+// disk by a previous session is honoured once at startup. For "open a file"
+// that is a surprise; for "start a debug session" it COMPILES AND RUNS a
+// program nobody asked for, in whatever project the editor happens to open
+// next. A straight copy of consumeOpenRequest fails this test.
+//
+// The second half proves the floor is a floor and not a blanket refusal: a
+// request written after this process started is still honoured. Without it,
+// "consumeDebugRequest does nothing at all" would pass.
+func TestStaleDebugRequestIgnoredAtStartup(t *testing.T) {
+	a, path := debugFixture(t)
+	panelStateDir(t, a)
+
+	writeRawDebugRequest(t, state.DebugRequest{
+		Action: state.DebugActionStart,
+		Seq:    time.Now().Add(-time.Hour).UnixNano(),
+	})
+	a.consumeDebugRequest()
+
+	if a.debug != nil {
+		t.Fatalf("a debug-request written an hour ago started a session (%+v) — the editor "+
+			"launched a process the user did not ask for", a.debug)
+	}
+
+	// A request from NOW, through the real writer, must still be honoured.
+	// toggle-breakpoint rather than start: it is entirely local, so the oracle
+	// does not depend on a debugger being installed.
+	if err := state.WriteDebugRequest(state.DebugActionToggleBreakpoint, path, 6); err != nil {
+		t.Fatal(err)
+	}
+	a.consumeDebugRequest()
+	a.syncBreakpoints()
+	if len(a.breakpoints) != 1 || a.breakpoints[0].Line != 5 {
+		t.Fatalf("a fresh request was ignored too: breakpoints %+v — the floor must let new "+
+			"requests through, not refuse everything", a.breakpoints)
+	}
+}
+
+// TestDebugRequestTogglesABreakpointAtTheRequestedLine pins the panel's `b`
+// key end to end: the wire is 1-based, the mark lands on the 0-based buffer
+// line, and a second request clears it.
+//
+// It also pins that the request is consumed EXACTLY once. Re-reading the same
+// file on the next poll and toggling again would make one keypress set and
+// clear the breakpoint in the same second, which reads as the key not working.
+func TestDebugRequestTogglesABreakpointAtTheRequestedLine(t *testing.T) {
+	a, path := debugFixture(t)
+	panelStateDir(t, a)
+	a.lastDebugSeq = debugRequestFloor
+
+	if err := state.WriteDebugRequest(state.DebugActionToggleBreakpoint, path, 6); err != nil {
+		t.Fatal(err)
+	}
+	a.consumeDebugRequest()
+	a.syncBreakpoints()
+
+	if len(a.breakpoints) != 1 {
+		t.Fatalf("breakpoints = %+v, want exactly one", a.breakpoints)
+	}
+	if got := a.breakpoints[0].Line; got != 5 {
+		t.Errorf("breakpoint on 0-based line %d, want 5 for the 1-based wire line 6", got)
+	}
+
+	// Polling again must NOT re-toggle: the same file is still on disk.
+	for i := 0; i < 5; i++ {
+		a.consumeDebugRequest()
+	}
+	a.syncBreakpoints()
+	if len(a.breakpoints) != 1 {
+		t.Fatalf("re-polling the same request left %d breakpoints — it was honoured more than once",
+			len(a.breakpoints))
+	}
+
+	// A second, distinct request clears it.
+	if err := state.WriteDebugRequest(state.DebugActionToggleBreakpoint, path, 6); err != nil {
+		t.Fatal(err)
+	}
+	a.consumeDebugRequest()
+	a.syncBreakpoints()
+	if len(a.breakpoints) != 0 {
+		t.Fatalf("the second toggle left %+v, want the breakpoint cleared", a.breakpoints)
+	}
+}
+
+// TestDebugRequestOutsideTheProjectIsIgnored pins the multi-editor guard.
+// debug-request.json is ONE global file, so with two editors open on two
+// projects a single panel keypress reaches both. Only the editor whose root
+// actually contains the file may edit it — the same rule consumeOpenRequest
+// applies, through the same helper.
+func TestDebugRequestOutsideTheProjectIsIgnored(t *testing.T) {
+	a, _ := debugFixture(t)
+	panelStateDir(t, a)
+	a.lastDebugSeq = debugRequestFloor
+
+	elsewhere := filepath.Join(t.TempDir(), "other.go")
+	if err := os.WriteFile(elsewhere, []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.WriteDebugRequest(state.DebugActionToggleBreakpoint, elsewhere, 1); err != nil {
+		t.Fatal(err)
+	}
+	a.consumeDebugRequest()
+	a.syncBreakpoints()
+
+	if len(a.breakpoints) != 0 {
+		t.Fatalf("a request for another project's file was honoured: %+v", a.breakpoints)
+	}
+}
+
+// TestDebugRequestMalformedChangesNothing pins that a panel writing junk cannot
+// disturb the editor. The file is read on every poll, so anything that threw or
+// half-applied would do it several times a second.
+func TestDebugRequestMalformedChangesNothing(t *testing.T) {
+	a, path := debugFixture(t)
+	panelStateDir(t, a)
+	a.lastDebugSeq = debugRequestFloor
+	a.toggleBreakpointAt(path, 5)
+	a.syncBreakpoints()
+	before := len(a.breakpoints)
+
+	for _, junk := range []string{"", "{", "not json", `{"action":"launch-missiles","seq":9}`} {
+		if err := os.WriteFile(state.DebugRequestFile(), []byte(junk), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		a.consumeDebugRequest()
+	}
+	a.syncBreakpoints()
+	if len(a.breakpoints) != before {
+		t.Fatalf("junk on disk changed the breakpoint list from %d to %d", before, len(a.breakpoints))
+	}
+	if a.debug != nil {
+		t.Fatal("junk on disk started a debug session")
+	}
+}
+
+// TestPublishDebugMirrorsAStoppedSession is the definition of done for the
+// editor half of the panel contract: everything the panel prints — the state,
+// the stop location, the frames and the breakpoints — has to arrive in one
+// payload, in the SAME 1-based coordinates active.json publishes.
+//
+// The coordinate assertion is the load-bearing one. The App holds 0-based
+// buffer lines and there are three line-bearing fields; a stop location that is
+// right while a frame is off by one is worse than both being wrong, because
+// only one of them looks broken.
+func TestPublishDebugMirrorsAStoppedSession(t *testing.T) {
+	a, path := debugFixture(t)
+	panelStateDir(t, a)
+
+	a.debug = &debugSession{
+		adapter: "delve", config: filepath.Dir(path), running: true,
+		bound: map[string][]boundBreakpoint{path: {{Requested: 5, Bound: 5, Verified: true}}},
+	}
+	a.toggleBreakpointAt(path, 5)
+	a.handleDebugStopped(&debugStoppedEvent{
+		when: time.Now(), path: path, line: 5, frame: "main.add",
+		reason: "breakpoint", threadID: 17,
+		frames: []debugFrame{
+			{ID: 1, Name: "main.add", Path: path, Line: 5},
+			{ID: 2, Name: "main.main", Path: path, Line: 9},
+		},
+	})
+	a.syncBreakpoints()
+	a.publishDebug()
+
+	got := readPublishedSession(t)
+	if got.State != state.DebugStateStopped {
+		t.Errorf("state = %q, want %q", got.State, state.DebugStateStopped)
+	}
+	if got.Adapter != "delve" || got.Reason != "breakpoint" || got.ThreadID != 17 {
+		t.Errorf("published %+v, want delve stopped on a breakpoint in thread 17", got)
+	}
+	if got.File != path || got.Line != 6 {
+		t.Errorf("stop location = %s:%d, want %s:6 (0-based buffer line 5)", got.File, got.Line, path)
+	}
+	if len(got.Frames) != 2 || got.Frames[0].Line != 6 || got.Frames[1].Line != 10 {
+		t.Errorf("frames = %+v, want lines 6 and 10", got.Frames)
+	}
+	if got.Frames[0].Name != "main.add" {
+		t.Errorf("top frame = %q, want main.add", got.Frames[0].Name)
+	}
+	if len(got.Breakpoints) != 1 || got.Breakpoints[0].Line != 6 {
+		t.Fatalf("breakpoints = %+v, want one on line 6", got.Breakpoints)
+	}
+	if !got.Breakpoints[0].Verified {
+		t.Error("the adapter bound this breakpoint, so the panel must be told it is verified")
+	}
+	if got.Root != a.rootDir {
+		t.Errorf("root = %q, want %q", got.Root, a.rootDir)
+	}
+	if got.StaleAfter <= 0 {
+		t.Error("staleAfter must travel with the payload, or a reader cannot age out a dead editor")
+	}
+}
+
+// TestPublishDebugReportsAnUnboundBreakpointHonestly pins that "verified" means
+// the adapter said so. With no session nothing has bound anything, and a panel
+// showing every breakpoint as verified before F5 would be claiming an answer the
+// debugger has not given.
+func TestPublishDebugReportsAnUnboundBreakpointHonestly(t *testing.T) {
+	a, path := debugFixture(t)
+	panelStateDir(t, a)
+	a.toggleBreakpointAt(path, 5)
+	a.syncBreakpoints()
+	a.publishDebug()
+
+	got := readPublishedSession(t)
+	if got.State != state.DebugStateIdle {
+		t.Fatalf("state = %q, want idle with no session", got.State)
+	}
+	if len(got.Breakpoints) != 1 {
+		t.Fatalf("breakpoints = %+v, want the one that is set", got.Breakpoints)
+	}
+	if got.Breakpoints[0].Verified {
+		t.Error("a breakpoint no adapter has seen was published as verified")
+	}
+	if got.File != "" || got.Line != 0 {
+		t.Errorf("an idle payload carries the location %s:%d, want none", got.File, got.Line)
+	}
+}
+
+// TestPublishDebugIdleOnShutdown is the CLEAN-EXIT half of the staleness
+// contract. Without it a panel opened after the editor quit would keep showing
+// the last stop — a program that has not existed since the editor closed.
+func TestPublishDebugIdleOnShutdown(t *testing.T) {
+	a, path := debugFixture(t)
+	panelStateDir(t, a)
+	a.debug = &debugSession{adapter: "delve", running: true, bound: map[string][]boundBreakpoint{}}
+	a.handleDebugStopped(&debugStoppedEvent{
+		when: time.Now(), path: path, line: 5, frame: "main.add", reason: "breakpoint",
+	})
+	a.publishDebug()
+	if got := readPublishedSession(t); got.State != state.DebugStateStopped {
+		t.Fatalf("precondition failed: published state is %q, not a stop to clear", got.State)
+	}
+
+	a.publishDebugIdle()
+
+	got := readPublishedSession(t)
+	if got.State != state.DebugStateIdle {
+		t.Errorf("state after shutdown = %q, want idle", got.State)
+	}
+	if got.File != "" || got.Line != 0 {
+		t.Errorf("shutdown left the stop location %s:%d on disk", got.File, got.Line)
+	}
+}
+
+// TestPublishDebugTerminatedAfterARun pins the state a finished program leaves
+// behind. handleDAPTerminated drops the session, so the naive answer is "idle" —
+// but the console still holds that run's output, and "your program ran and
+// exited" is a different thing to tell the user than "nothing has happened".
+func TestPublishDebugTerminatedAfterARun(t *testing.T) {
+	a, path := debugFixture(t)
+	panelStateDir(t, a)
+	a.debug = &debugSession{adapter: "delve", running: true, bound: map[string][]boundBreakpoint{}}
+	a.handleDebugStopped(&debugStoppedEvent{when: time.Now(), path: path, line: 5, reason: "breakpoint"})
+	a.debug.output = []string{"5"}
+	a.handleDAPTerminated(0, true)
+
+	a.publishDebug()
+	if got := readPublishedSession(t); got.State != state.DebugStateTerminated {
+		t.Fatalf("state = %q after the program exited, want %q", got.State, state.DebugStateTerminated)
+	}
+}
+
+// TestPublishDebugSurvivesNoPublisher pins the nil-receiver contract at the App
+// layer. newTestApp and NewDebugPublisher-with-no-state-directory both leave
+// debugPub nil, and the polled call site must not branch on it.
+func TestPublishDebugSurvivesNoPublisher(t *testing.T) {
+	a, _ := debugFixture(t)
+	a.debugPub = nil
+	a.publishDebug()
+	a.publishDebugIdle()
 }

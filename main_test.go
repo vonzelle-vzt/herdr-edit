@@ -8,9 +8,13 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/cloudmanic/spice-edit/internal/state"
 )
 
 // TestResolveArgs_NoArgsRootsCurrentDir keeps the no-arg path simple:
@@ -142,5 +146,85 @@ func TestResolveArgs_OpenAt(t *testing.T) {
 	}
 	if got := resolveArgs([]string{"--open-at"}); got.Err == nil {
 		t.Error("--open-at with no argument should be an error, not a silent no-op")
+	}
+}
+
+// TestResolveArgs_Debug pins the flag the Debug panel drives the editor with.
+//
+// Every key in that panel becomes one of these invocations, so the parse has to
+// be exact in three places: the verb is accepted, an unknown verb is REFUSED
+// here rather than becoming a key that silently does nothing, and
+// toggle-breakpoint refuses without a location because it has nothing to toggle.
+func TestResolveArgs_Debug(t *testing.T) {
+	for _, action := range state.DebugActions() {
+		args := []string{"--debug", action}
+		if action == state.DebugActionToggleBreakpoint {
+			args = append(args, "src/a.go:12")
+		}
+		got := resolveArgs(args)
+		if got.Err != nil {
+			t.Errorf("--debug %s: unexpected error %v", action, got.Err)
+			continue
+		}
+		if got.Action != actionDebug || got.DebugAction != action {
+			t.Errorf("--debug %s resolved to %+v", action, got)
+		}
+	}
+
+	if got := resolveArgs([]string{"--debug"}); got.Err == nil {
+		t.Error("--debug with no action should be an error, not a silent no-op")
+	}
+	if got := resolveArgs([]string{"--debug", "contnue"}); got.Err == nil {
+		t.Error("a misspelled action should be reported, not written for the editor to ignore")
+	}
+	if got := resolveArgs([]string{"--debug", "toggle-breakpoint"}); got.Err == nil {
+		t.Error("toggle-breakpoint with no location should be an error")
+	}
+}
+
+// TestResolveArgs_DebugCarriesTheLocation pins that the optional location
+// survives the parse untouched. It is split by state.SplitLocation in main —
+// the SAME parser --open-at uses — so this only has to prove the string is
+// carried, not re-implement the split.
+func TestResolveArgs_DebugCarriesTheLocation(t *testing.T) {
+	got := resolveArgs([]string{"--debug", state.DebugActionToggleBreakpoint, "/proj/main.go:42"})
+	if got.OpenFile != "/proj/main.go:42" {
+		t.Fatalf("location = %q, want it carried through verbatim", got.OpenFile)
+	}
+	// A verb that takes no location must not acquire one by accident.
+	if plain := resolveArgs([]string{"--debug", state.DebugActionContinue}); plain.OpenFile != "" {
+		t.Fatalf("continue picked up a location %q", plain.OpenFile)
+	}
+}
+
+// TestHelpNamesEveryDebugAction guards the gap between a CLI that accepts a
+// verb and a user who can find out it exists. The help text is the only place
+// the actions are listed for a human, and a verb added to state.DebugActions()
+// without a mention here is a feature nobody can discover — the same
+// "implementing the request is the easy half" trap CLAUDE.md records for the
+// LSP features that shipped with no call site.
+//
+// It reads the ACTUAL printed output rather than the source literal, so a help
+// block that stops printing would fail too.
+func TestHelpNamesEveryDebugAction(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	printHelp()
+	os.Stdout = saved
+	w.Close()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	help := string(out)
+	for _, action := range state.DebugActions() {
+		if !strings.Contains(help, action) {
+			t.Errorf("--help does not mention the %q action", action)
+		}
 	}
 }

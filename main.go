@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cloudmanic/spice-edit/internal/app"
 	"github.com/cloudmanic/spice-edit/internal/state"
@@ -34,6 +35,7 @@ const (
 	actionVersion cliAction = "version"
 	actionHelp    cliAction = "help"
 	actionOpenAt  cliAction = "open-at"
+	actionDebug   cliAction = "debug"
 )
 
 // cliResult bundles everything resolveArgs hands back: which top-level
@@ -43,7 +45,12 @@ type cliResult struct {
 	Action   cliAction
 	RootDir  string
 	OpenFile string // empty when no file was named (or for non-edit actions)
-	Err      error
+
+	// DebugAction is the verb for actionDebug, already validated against
+	// state.ValidDebugAction. Empty for every other action.
+	DebugAction string
+
+	Err error
 }
 
 // resolveArgs parses the editor's tiny CLI surface. The argument can be:
@@ -76,6 +83,29 @@ func resolveArgs(args []string) cliResult {
 			return cliResult{Err: errors.New("--open-at needs a path, optionally as path:line:col")}
 		}
 		return cliResult{Action: actionOpenAt, OpenFile: args[1]}
+	case "--debug":
+		// Drive an ALREADY-RUNNING editor's debugger. Same mechanism as
+		// --open-at, one file over: the Debug panel mirrors the session out of
+		// debug-session.json and writes the next step back through here, so the
+		// panel never has to speak the debug adapter protocol itself.
+		if len(args) < 2 {
+			return cliResult{Err: errors.New("--debug needs an action: " +
+				strings.Join(state.DebugActions(), " | "))}
+		}
+		// Refused HERE rather than by the editor, which has nowhere to complain
+		// to: a mistyped verb would otherwise be a key that silently did nothing.
+		if !state.ValidDebugAction(args[1]) {
+			return cliResult{Err: fmt.Errorf("unknown debug action %q — want one of: %s",
+				args[1], strings.Join(state.DebugActions(), " | "))}
+		}
+		res := cliResult{Action: actionDebug, DebugAction: args[1]}
+		if len(args) > 2 {
+			res.OpenFile = args[2]
+		}
+		if args[1] == state.DebugActionToggleBreakpoint && res.OpenFile == "" {
+			return cliResult{Err: errors.New("--debug toggle-breakpoint needs a location as file:line")}
+		}
+		return res
 	}
 
 	target := args[0]
@@ -117,6 +147,9 @@ Usage:
   spiceedit <directory>         Open a project directory.
   spiceedit <file>              Open a file (its parent becomes the project root).
   spiceedit --open-at F:L[:C]   Ask a RUNNING editor to jump to that location.
+  spiceedit --debug ACTION      Drive a RUNNING editor's debugger. ACTION is one of
+                                start, continue, next, stepIn, stepOut, pause, stop,
+                                or toggle-breakpoint FILE:LINE.
   spiceedit --version           Print the version and exit.
   spiceedit --help              Print this help and exit.
 
@@ -151,6 +184,27 @@ func main() {
 			os.Exit(1)
 		}
 		if err := state.WriteOpenRequest(abs, line, col); err != nil {
+			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+			os.Exit(1)
+		}
+		return
+	case actionDebug:
+		// The location is optional and only toggle-breakpoint uses it, but it
+		// goes through the SAME SplitLocation as --open-at rather than a second
+		// parser: "file:line" has exactly one correct reading and a panel emits
+		// the identical string for both flags.
+		var abs string
+		line := 0
+		if res.OpenFile != "" {
+			path, l, _ := state.SplitLocation(res.OpenFile)
+			p, err := filepath.Abs(path)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+				os.Exit(1)
+			}
+			abs, line = p, l
+		}
+		if err := state.WriteDebugRequest(res.DebugAction, abs, line); err != nil {
 			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
 			os.Exit(1)
 		}
