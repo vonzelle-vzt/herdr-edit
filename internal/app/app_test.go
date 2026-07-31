@@ -1837,18 +1837,24 @@ func TestDrawStatusBar_OmitsBranchWhenEmpty(t *testing.T) {
 // toggle-enabled, list, clear, export) inserted between View toggle and Quit
 // (42 -> 47 items, modalHeight 52 -> 58, adding one new divider — the one that
 // now separates Debug from Quit — on top of the 6-row shift).
+//
+// Bumped again by the Lane B stage 2 adapter rows (F5 start/continue and Stop
+// debugging) added at the TOP of that same Debug group (47 -> 49 items,
+// modalHeight 58 -> 60). No new divider this time — the two rows join an
+// existing group — so only the last divider, the one separating Debug from
+// Quit, moves: 55 -> 57.
 func TestMenuLayout_NoCustomActions(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
 	a.customActions = nil
 	items, dividers, h := a.menuLayout()
 
-	if h != 58 {
-		t.Errorf("modalHeight = %d, want 58", h)
+	if h != 60 {
+		t.Errorf("modalHeight = %d, want 60", h)
 	}
-	if got := len(items); got != 47 {
-		t.Errorf("item count = %d, want 47 built-ins", got)
+	if got := len(items); got != 49 {
+		t.Errorf("item count = %d, want 49 built-ins", got)
 	}
-	wantDiv := []int{2, 6, 10, 34, 42, 47, 49, 55}
+	wantDiv := []int{2, 6, 10, 34, 42, 47, 49, 57}
 	if len(dividers) != len(wantDiv) {
 		t.Fatalf("dividers = %v, want %v", dividers, wantDiv)
 	}
@@ -2009,8 +2015,8 @@ func TestMenuLayout_WithCustomActions(t *testing.T) {
 	}
 	items, _, h := a.menuLayout()
 
-	if h != 61 { // 58 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
-		t.Errorf("modalHeight = %d, want 61", h)
+	if h != 63 { // 60 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
+		t.Errorf("modalHeight = %d, want 63", h)
 	}
 	// Custom actions should be the second-to-last and third-to-last
 	// rows, with Quit as the final row.

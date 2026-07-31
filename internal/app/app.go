@@ -29,6 +29,7 @@ import (
 
 	"github.com/cloudmanic/spice-edit/internal/clipboard"
 	"github.com/cloudmanic/spice-edit/internal/customactions"
+	"github.com/cloudmanic/spice-edit/internal/dap"
 	"github.com/cloudmanic/spice-edit/internal/editor"
 	"github.com/cloudmanic/spice-edit/internal/filetree"
 	"github.com/cloudmanic/spice-edit/internal/finder"
@@ -280,11 +281,17 @@ func builtinMenuGroups() [][]menuItemDef {
 		{
 			{shortcut: "Esc t", action: (*App).menuToggleSidebar, enabled: alwaysTrue, labelFor: (*App).sidebarToggleLabel, visible: (*App).hasTree},
 		},
-		// Debug (fork, Lane B stage 1) — edit-tracking breakpoint marks with
-		// NO adapter behind them; export renders `break file:line` for
-		// dlv/pdb/gdb.
+		// Debug (fork, Lane B stages 1 and 2) — edit-tracking breakpoint marks,
+		// plus a real adapter that runs the program and stops on them. Export
+		// still renders `break file:line` for driving dlv/pdb/gdb by hand.
+		//
+		// The F5/Stop rows lead the group because they are the actions a user
+		// reaches for during a session, and because the menu is the guaranteed
+		// path to them on a terminal that swallows function keys.
 		{
-			{label: "Toggle breakpoint", shortcut: "Esc 9", action: (*App).menuToggleBreakpoint, enabled: (*App).hasBreakpointableTab},
+			{shortcut: "F5", action: (*App).menuDebugStartOrContinue, enabled: (*App).canStartOrContinueDebug, labelFor: (*App).debugStartLabel},
+			{label: "Stop debugging", action: (*App).menuDebugStop, enabled: (*App).hasDebugSession},
+			{label: "Toggle breakpoint", shortcut: "Esc 9 / F9", action: (*App).menuToggleBreakpoint, enabled: (*App).hasBreakpointableTab},
 			{label: "Toggle breakpoint enabled", action: (*App).menuToggleBreakpointEnabled, enabled: (*App).hasBreakpointableTab},
 			{label: "List breakpoints", shortcut: "Esc 5", action: (*App).menuListBreakpoints, enabled: (*App).hasBreakpoints},
 			{label: "Clear breakpoints", action: (*App).menuClearBreakpoints, enabled: (*App).hasBreakpoints},
@@ -627,6 +634,14 @@ type App struct {
 	breakpoints []Breakpoint
 	bpStore     *state.BreakpointStore
 
+	// Debug adapter (fork, Lane B stage 2) — F5 runs the program under a real
+	// debugger and stops it on those breakpoints. debug is nil whenever no
+	// session exists, which is what every call site checks and what clears the
+	// stopped marker; dapReg is created lazily on the first F5, so a project
+	// that never debugs pays nothing. See debug.go.
+	debug  *debugSession
+	dapReg *dap.Registry
+
 	finderOpen     bool
 	finderQuery    []rune
 	finderCursor   int
@@ -916,6 +931,10 @@ func (a *App) Run() error {
 	if a.bpStore != nil {
 		a.bpStore.Flush() // do not lose a breakpoint toggled just before quitting
 	}
+	// A debugged process must never outlive the editor that launched it — the
+	// adapter does not advertise a terminate request, so this is what actually
+	// kills it. See debug.go / dap.Client.Disconnect.
+	a.stopDebugSession()
 	if a.lsp != nil {
 		a.lsp.Stop()
 	}
@@ -1005,6 +1024,14 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleLSPJump(e)
 	case *diagnosticsEvent:
 		a.handleDiagnostics(e)
+	case *debugEvent:
+		a.handleDAPEvent(e)
+	case *debugStartedEvent:
+		a.handleDebugStarted(e)
+	case *debugStoppedEvent:
+		a.handleDebugStopped(e)
+	case *debugLogEvent:
+		a.flash(e.msg)
 	case *completionEvent:
 		a.handleCompletion(e)
 	case *referencesEvent:
@@ -1434,6 +1461,34 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 		} else {
 			a.menuNextProblem()
 		}
+		return
+	}
+
+	// Debug keys (fork, Lane B stage 2), same placement and for the same
+	// reasons as F8 above: after every modal guard, so an open prompt still
+	// owns the keyboard, and before the Esc block, since an F-key is not
+	// KeyRune and could never reach the leader table anyway.
+	//
+	// All UNSHIFTED. A shifted F-key needs modifyOtherKeys or a kf17-style
+	// terminfo entry and is unreliable through tmux/zellij, so nothing is
+	// allowed to depend on one. Nothing depends on F-keys arriving at all
+	// either: Esc 9 / Esc 5 (leader.go) and the ≡ menu reach every one of
+	// these, which is the guaranteed path on a terminal that eats them.
+	switch ev.Key() {
+	case tcell.KeyF5:
+		a.menuDebugStartOrContinue()
+		return
+	case tcell.KeyF6:
+		a.menuDebugPause()
+		return
+	case tcell.KeyF9:
+		a.menuToggleBreakpoint()
+		return
+	case tcell.KeyF10, tcell.KeyF11, tcell.KeyF12:
+		// Reserved for stepping in stage 3. Bound to an explanation rather
+		// than left unhandled, so pressing the key a debugger user reaches
+		// for first says what it will do instead of appearing broken.
+		a.flash("Stepping arrives in the next stage — F5 continues, F6 pauses")
 		return
 	}
 
@@ -2796,6 +2851,11 @@ func (a *App) draw() {
 		// After Render, so the underline sits on top of the syntax colours rather than being
 		// overwritten by them.
 		a.drawDiagnostics()
+		// The debugger's gutter goes on last of the gutter painters: where
+		// execution is stopped RIGHT NOW must win the cell over a breakpoint
+		// glyph or a git change bar. See drawDebugGutter for why this is an
+		// overlay rather than an editor.Mark.
+		a.drawDebugGutter()
 		a.maybeRequestBlame()
 		a.drawInlineBlame(ex, ey, ew, eh)
 	} else {
@@ -3046,6 +3106,12 @@ func (a *App) drawStatusBar() {
 			}
 			left = fmt.Sprintf(" %s · Ln %d, Col %d · %d lines%s",
 				lang, tab.Cursor.Line+1, tab.Cursor.Col+1, tab.Buffer.LineCount(), dirty)
+			// A live debug session outranks the diagnostics summary: while the
+			// program is stopped, "where am I" is the thing the user is
+			// actually reading this bar for.
+			if dbg := a.debugStatus(); dbg != "" {
+				left += " · " + dbg
+			}
 			// The underline says WHERE the problem is; this says what it is. Without somewhere to
 			// read the message, a squiggle is only half a feature.
 			if diag := a.diagnosticStatus(); diag != "" {

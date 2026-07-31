@@ -78,7 +78,40 @@ jobs:
         run: |
           command -v gopls || { echo "gopls not on PATH — the live LSP oracle would silently skip" >&2; exit 1; }
 
+      # internal/dap/live_dlv_test.go is the same shape of oracle for the debug
+      # adapter: it drives a REAL delve through a real session — launch, bind a
+      # breakpoint, stop on it, read the stack — and t.Skip()s when dlv is
+      # absent. Every trap in that package (correlating on request_seq, the
+      # initialized event arriving before the initialize response, blocking on
+      # the launch response) fails as a HANG or a silently wrong answer, which
+      # is precisely the class of bug only a live adapter catches.
+      #
+      # HERDR_REQUIRE_DAP=1 below is the anti-skip gate: it turns every skip in
+      # that file into a failure, so the oracle going quiet turns CI red instead
+      # of leaving a skipped test that reads as a pass in the summary.
+      - name: Install delve (for the live DAP oracle)
+        run: |
+          go install github.com/go-delve/delve/cmd/dlv@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # Known upstream skew: delve refuses to run against a Go toolchain it does not
+      # recognise yet (its --check-go-version guard), and this job uses go-version:
+      # stable. When Go ships a release before delve supports it, the live oracle
+      # fails here rather than in the DAP client. That guard is deliberately NOT
+      # disabled — a user on that toolchain genuinely cannot debug, and turning off
+      # a safety check to keep a badge green hides a real limitation — so `dlv
+      # version` runs first to name the cause instead of leaving it to look like a
+      # bug in internal/dap.
+      - name: Verify dlv is reachable
+        run: |
+          command -v dlv || { echo "dlv not on PATH — the live DAP oracle would silently skip" >&2; exit 1; }
+          dlv version || { echo "delve will not run against this Go toolchain — an upstream skew, not a fault in internal/dap" >&2; exit 1; }
+
       - name: Test
+        env:
+          # Fail rather than skip if either live oracle cannot run. Both binaries
+          # are installed above, so a skip here means the install broke.
+          HERDR_REQUIRE_DAP: "1"
         run: go test -race -coverprofile=coverage.out ./...
 
       # Print a coverage summary into the run log so reviewers can see
