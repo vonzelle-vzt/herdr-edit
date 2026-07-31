@@ -280,6 +280,16 @@ func builtinMenuGroups() [][]menuItemDef {
 		{
 			{shortcut: "Esc t", action: (*App).menuToggleSidebar, enabled: alwaysTrue, labelFor: (*App).sidebarToggleLabel, visible: (*App).hasTree},
 		},
+		// Debug (fork, Lane B stage 1) — edit-tracking breakpoint marks with
+		// NO adapter behind them; export renders `break file:line` for
+		// dlv/pdb/gdb.
+		{
+			{label: "Toggle breakpoint", shortcut: "Esc 9", action: (*App).menuToggleBreakpoint, enabled: (*App).hasBreakpointableTab},
+			{label: "Toggle breakpoint enabled", action: (*App).menuToggleBreakpointEnabled, enabled: (*App).hasBreakpointableTab},
+			{label: "List breakpoints", shortcut: "Esc 5", action: (*App).menuListBreakpoints, enabled: (*App).hasBreakpoints},
+			{label: "Clear breakpoints", action: (*App).menuClearBreakpoints, enabled: (*App).hasBreakpoints},
+			{label: "Export breakpoints (dlv)", action: (*App).menuExportBreakpoints, enabled: (*App).hasBreakpoints},
+		},
 		// Quit
 		{
 			{label: "Quit editor", shortcut: "Esc q", action: (*App).menuQuit, enabled: alwaysTrue},
@@ -609,6 +619,14 @@ type App struct {
 	bookmarks     []bookmark
 	bookmarkIndex int
 
+	// Breakpoints (fork, Lane B stage 1) — Esc 9 toggles, Esc 5 lists. NO
+	// debug adapter behind this: an edit-tracking, exportable mark, kept
+	// current by syncBreakpoints (see breakpoints.go) from the same polled
+	// call site as active/openRequest below. bpStore is nil-safe and swallows
+	// its own failures, matching state.Publisher's contract.
+	breakpoints []Breakpoint
+	bpStore     *state.BreakpointStore
+
 	finderOpen     bool
 	finderQuery    []rune
 	finderCursor   int
@@ -658,12 +676,14 @@ func New(rootDir string) (*App, error) {
 		// panel would resolve it against ITS OWN working directory rather than the editor's.
 		rootDir:        tree.Root.Path,
 		active:         state.NewPublisher(),
+		bpStore:        state.NewBreakpointStore(),
 		tree:           tree,
 		hoveredMenuRow: -1,
 		sidebarShown:   true,
 		blameEnabled:   true,
 		sidebarWidth:   defaultSidebarWidth,
 	}
+	a.breakpoints = loadPersistedBreakpoints(a.rootDir)
 	a.setActiveFolder(tree.Root.Path)
 	a.loadSpiceConfig()
 	a.refreshGitStatus()
@@ -720,11 +740,13 @@ func NewSingleFile(filePath string) (*App, error) {
 		// Absolute for the same reason as above; single-file mode has no tree to borrow it from.
 		rootDir:        absOr(rootDir),
 		active:         state.NewPublisher(),
+		bpStore:        state.NewBreakpointStore(),
 		tree:           nil,
 		hoveredMenuRow: -1,
 		sidebarShown:   false,
 		sidebarWidth:   defaultSidebarWidth,
 	}
+	a.breakpoints = loadPersistedBreakpoints(a.rootDir)
 	a.setActiveFolder(rootDir)
 	a.loadSpiceConfig()
 	a.loadCustomActions()
@@ -887,9 +909,13 @@ func (a *App) Run() error {
 		a.publishActive()
 		a.consumeOpenRequest()
 		a.maybeSyncLSP()
+		a.syncBreakpoints()
 		a.screen.Show()
 	}
 	a.active.Flush() // do not lose the final position inside the debounce window
+	if a.bpStore != nil {
+		a.bpStore.Flush() // do not lose a breakpoint toggled just before quitting
+	}
 	if a.lsp != nil {
 		a.lsp.Stop()
 	}

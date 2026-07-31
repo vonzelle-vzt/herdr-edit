@@ -64,6 +64,13 @@ func leaderBindings() []leaderBinding {
 		{'y', (*App).menuRenameSymbol},
 		{'m', (*App).menuToggleBookmark},
 		{'\'', (*App).menuNextBookmark},
+		// Breakpoints (fork, Lane B stage 1) — no debug adapter behind
+		// these, just persistent edit-tracking marks. '9' mnemonic: F9,
+		// the universal toggle-breakpoint key; '5' mnemonic: F5, the
+		// universal start/resume key, repurposed here as "show me where
+		// they are" since there's no adapter yet to resume.
+		{'9', (*App).menuToggleBreakpoint},
+		{'5', (*App).menuListBreakpoints},
 		// LSP. Both requests were implemented, tested and advertised in initialize with no caller;
 		// these two keys are the entire wiring.
 		{'h', (*App).menuHover},

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -110,6 +111,13 @@ type Tab struct {
 	Styles     [][]tcell.Style
 	StyleStale bool
 	GitLines   map[int]GitLineChange
+
+	// Marks holds this tab's gutter marks (breakpoints, logpoints, the
+	// future adapter's stopped line), keyed by 0-based buffer line. See
+	// marks.go — SetMark/ClearMark/MarkAt/MarkLines are the public surface,
+	// and bufInsert/bufDelete below are the only two places lines actually
+	// move, so they're the only callers that renumber this map.
+	Marks map[int]Mark
 
 	// lastHighlightScrollY / lastHighlightHeight record the viewport Render
 	// last tokenised for. Without them, every redraw (mouse moves included)
@@ -351,6 +359,13 @@ func (t *Tab) Reload() error {
 	t.Buffer = NewBuffer(string(data))
 	t.Cursor = t.Buffer.Clamp(t.Cursor)
 	t.Anchor = t.Cursor // drop any selection — line indices may have shifted.
+	// Marks survive a reload but must be clamped to the new line count. Their
+	// tracking works by observing OUR edits (bufInsert/bufDelete); an external
+	// rewrite is invisible to that, so a mark can be left pointing past the end
+	// of a file that shrank. Dropping those is the honest answer — a breakpoint
+	// on a line that no longer exists is not a breakpoint, and keeping it would
+	// silently re-anchor it to whatever now occupies that index.
+	t.clampMarks()
 	t.Dirty = false
 	t.DiskGone = false
 	t.Mtime = info.ModTime()
@@ -383,6 +398,36 @@ func (t *Tab) SelectionText() string {
 	return t.Buffer.Substring(t.Anchor, t.Cursor)
 }
 
+// bufInsert is the ONLY path allowed to call t.Buffer.InsertString — every
+// caller in this file goes through it (TestAllBufferMutationsGoThroughMarkWrappers
+// enforces that). Inserting text that contains newlines pushes every mark
+// below the insertion point down by however many lines were added; a mark
+// sitting ON p.Line itself is left alone, since that line still exists
+// afterwards, just with different trailing content.
+func (t *Tab) bufInsert(p Position, text string) Position {
+	pos := t.Buffer.InsertString(p, text)
+	if delta := strings.Count(text, "\n"); delta > 0 {
+		t.shiftMarks(p.Line+1, delta)
+	}
+	return pos
+}
+
+// bufDelete is the ONLY path allowed to call t.Buffer.DeleteRange — every
+// caller in this file goes through it (TestAllBufferMutationsGoThroughMarkWrappers
+// enforces that). Lines strictly between the endpoints, plus the endpoint
+// line at c, disappear as line entries (DeleteRange folds c's tail onto a's
+// line), so any mark sitting on one of THOSE lines dies with them
+// (dropMarksIn) before what remains is renumbered upward (shiftMarks).
+func (t *Tab) bufDelete(a, c Position) Position {
+	pos := t.Buffer.DeleteRange(a, c)
+	lo, hi := PosOrdered(a, c)
+	if hi.Line > lo.Line {
+		t.dropMarksIn(lo.Line+1, hi.Line+1)
+		t.shiftMarks(hi.Line+1, -(hi.Line - lo.Line))
+	}
+	return pos
+}
+
 // DeleteSelection removes the selected range and collapses the cursor to the
 // start of the selection. A no-op when nothing is selected.
 func (t *Tab) DeleteSelection() {
@@ -394,7 +439,7 @@ func (t *Tab) DeleteSelection() {
 	// would make the next undo recover content the user thought was
 	// just-deleted.
 	t.pushUndo(undoGroupStructural)
-	pos := t.Buffer.DeleteRange(t.Anchor, t.Cursor)
+	pos := t.bufDelete(t.Anchor, t.Cursor)
 	t.Cursor = pos
 	t.Anchor = pos
 	t.Dirty = true
@@ -418,7 +463,7 @@ func (t *Tab) InsertString(s string) {
 	} else {
 		t.pushUndo(undoGroupStructural)
 	}
-	t.Cursor = t.Buffer.InsertString(t.Cursor, s)
+	t.Cursor = t.bufInsert(t.Cursor, s)
 	t.Anchor = t.Cursor
 	t.Dirty = true
 	t.StyleStale = true
@@ -463,7 +508,7 @@ func (t *Tab) InsertRune(r rune) {
 		}
 		t.pushUndo(undoGroupTyping)
 	}
-	t.Cursor = t.Buffer.InsertString(t.Cursor, string(r))
+	t.Cursor = t.bufInsert(t.Cursor, string(r))
 	t.Anchor = t.Cursor
 	t.Dirty = true
 	t.StyleStale = true
@@ -497,7 +542,7 @@ func (t *Tab) shouldAutoClose(r rune) bool {
 // burst of "(foo)" style edits still collapses into one undo step.
 func (t *Tab) insertAutoClosePair(r, closer rune) {
 	t.pushUndo(undoGroupTyping)
-	pos := t.Buffer.InsertString(t.Cursor, string(r)+string(closer))
+	pos := t.bufInsert(t.Cursor, string(r)+string(closer))
 	t.Cursor = Position{Line: pos.Line, Col: pos.Col - 1}
 	t.Anchor = t.Cursor
 	t.Dirty = true
@@ -542,8 +587,8 @@ func (t *Tab) surroundSelection(opener, closer rune) {
 	// insert (which lands at or before selStart) can never invalidate.
 	// Inserting in the other order would require shifting selEnd by hand
 	// whenever selStart and selEnd share a line.
-	t.Buffer.InsertString(selEnd, string(closer))
-	afterOpener := t.Buffer.InsertString(selStart, string(opener))
+	t.bufInsert(selEnd, string(closer))
+	afterOpener := t.bufInsert(selStart, string(opener))
 	newCursor := selEnd
 	if selStart.Line == selEnd.Line {
 		// The opener we just inserted on this line shifted every column
@@ -586,7 +631,7 @@ func (t *Tab) Backspace() {
 	} else {
 		prev = Position{Line: t.Cursor.Line, Col: t.Cursor.Col - 1}
 	}
-	t.Cursor = t.Buffer.DeleteRange(prev, t.Cursor)
+	t.Cursor = t.bufDelete(prev, t.Cursor)
 	t.Anchor = t.Cursor
 	t.Dirty = true
 	t.StyleStale = true
@@ -615,7 +660,7 @@ func (t *Tab) deleteEmptyPair() bool {
 	t.pushUndo(undoGroupBackspace)
 	start := Position{Line: t.Cursor.Line, Col: t.Cursor.Col - 1}
 	end := Position{Line: t.Cursor.Line, Col: t.Cursor.Col + 1}
-	t.Cursor = t.Buffer.DeleteRange(start, end)
+	t.Cursor = t.bufDelete(start, end)
 	t.Anchor = t.Cursor
 	t.Dirty = true
 	t.StyleStale = true
@@ -646,7 +691,7 @@ func (t *Tab) Delete() {
 	} else {
 		next = Position{Line: t.Cursor.Line, Col: t.Cursor.Col + 1}
 	}
-	t.Cursor = t.Buffer.DeleteRange(t.Cursor, next)
+	t.Cursor = t.bufDelete(t.Cursor, next)
 	t.Anchor = t.Cursor
 	t.Dirty = true
 	t.StyleStale = true
@@ -853,11 +898,12 @@ func (t *Tab) Render(scr tcell.Screen, th theme.Theme, x, y, w, h int) {
 		if isCursorLine {
 			gutterStyle = gutterStyle.Foreground(th.AccentSoft)
 		}
-		if marker, ok := t.GitLines[lineIdx]; ok && marker != GitLineNone {
-			scr.SetContent(x, cy, gitLineMarkerRune(marker), nil, gutterStyle.Foreground(gitLineMarkerColor(th, marker)))
+		markerR, markerColor, hasMarker := t.gutterMarker(th, lineIdx)
+		if hasMarker {
+			scr.SetContent(x, cy, markerR, nil, gutterStyle.Foreground(markerColor))
 		}
 		for i, r := range numStr {
-			if i == 0 && t.GitLines[lineIdx] != GitLineNone {
+			if i == 0 && hasMarker {
 				continue
 			}
 			scr.SetContent(x+i, cy, r, nil, gutterStyle)

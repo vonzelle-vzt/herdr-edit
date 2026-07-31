@@ -296,3 +296,38 @@ func screenRows(scr tcell.SimulationScreen, w, h int) []string {
 	}
 	return out
 }
+
+// TestBreakpointGutterDrawsWhenWrapped is oracle #2 from the Lane B stage 1
+// brief, and the whole reason renderWrapped exists as a documented risk: the
+// unwrapped Render path and this one duplicate the gutter-priority decision
+// in two different innermost loops, so a fix applied to only one leaves
+// breakpoints invisible in every wrapped tab with no error anywhere. Same
+// assertion shape as TestBreakpointGutterDrawsOverGitBar (tab_test.go), just
+// driven through renderWrapped instead of Render.
+//
+// Confirmed RED against an implementation that patched only tab.go's Render
+// and left this file's gutter block untouched — see the Lane B stage 1
+// report for the captured failure output.
+func TestBreakpointGutterDrawsWhenWrapped(t *testing.T) {
+	const w = 40
+	scr := newSimScreen(t, w, 10)
+	defer scr.Fini()
+
+	tab := wrapTab("x", "x", "x", "x")
+	tab.SetMark(3, Mark{Kind: MarkBreakpoint, Enabled: true})
+	tab.cursorMoved = false
+
+	tab.Render(scr, theme.Default(), 0, 0, w, 10)
+	scr.Show()
+
+	cells, _, _ := scr.GetContents()
+	const row = 3
+	c := cells[row*w+0]
+	if len(c.Runes) == 0 || c.Runes[0] != '●' {
+		got := ' '
+		if len(c.Runes) > 0 {
+			got = c.Runes[0]
+		}
+		t.Fatalf("wrapped gutter col 0 on the marked line = %q, want the breakpoint glyph '●'", got)
+	}
+}

@@ -513,3 +513,36 @@ func TestBufferContentsAfterMixedHistory(t *testing.T) {
 		t.Fatal("trailing junk crept into restored buffer")
 	}
 }
+
+// TestUndoRestoresMarkPositions is oracle #5 from the Lane B stage 1 brief.
+// A mark on line 10 survives a delete that shifts it (bufDelete's own
+// shiftMarks moves it to line 7 — see TestMarksShiftUpWhenLinesDeletedBelow
+// in marks_test.go), but Undo must put it back on line 10, not merely
+// restore the deleted TEXT while leaving the breakpoint at its shifted
+// position. snapshot.Marks (undo.go) is what makes that possible: Undo
+// doesn't try to reverse shiftMarks' arithmetic, it just replays the marks
+// exactly as they were captured before the edit.
+func TestUndoRestoresMarkPositions(t *testing.T) {
+	tab := newScratchTab(linesOf(15))
+	tab.SetMark(10, Mark{Kind: MarkBreakpoint, Enabled: true})
+
+	// Mirrors what DeleteSelection does: capture the pre-edit state, then
+	// mutate through the mark-tracking wrapper.
+	tab.pushUndo(undoGroupStructural)
+	tab.bufDelete(Position{Line: 1, Col: 0}, Position{Line: 4, Col: 0})
+
+	if _, ok := tab.MarkAt(7); !ok {
+		t.Fatalf("setup: expected the mark shifted to line 7 before undo, marks=%v", tab.Marks)
+	}
+
+	if !tab.Undo() {
+		t.Fatal("expected Undo to report a step was undone")
+	}
+	if _, ok := tab.MarkAt(7); ok {
+		t.Fatal("shifted mark should be gone after undo restored the pre-delete state")
+	}
+	m, ok := tab.MarkAt(10)
+	if !ok || m.Kind != MarkBreakpoint {
+		t.Fatalf("expected the mark back on line 10 after undo, marks=%v", tab.Marks)
+	}
+}

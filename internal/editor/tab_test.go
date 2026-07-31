@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -1251,6 +1252,72 @@ func TestTab_Render_GitMarkerDoesNotOverlapLineNumber(t *testing.T) {
 	for i, r := range want {
 		if got := cellRune(1 + i); got != r {
 			t.Errorf("col %d: got %q, want %q", 1+i, got, string(r))
+		}
+	}
+}
+
+// TestBreakpointGutterDrawsOverGitBar is oracle #1 from the Lane B stage 1
+// brief: when a line carries BOTH a git change-bar and a breakpoint mark, the
+// gutter cell must show the breakpoint glyph, not the git bar. Reads the
+// actual rendered cell via GetContents rather than recomputing the expected
+// glyph from the same priority logic under test — a self-referential oracle
+// already let a one-column overlay bug ship in this repo once.
+func TestBreakpointGutterDrawsOverGitBar(t *testing.T) {
+	const w = 40
+	scr := newSimScreen(t, w, 10)
+	defer scr.Fini()
+
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer(strings.Repeat("x\n", 9) + "x")
+	tab.GitLines = map[int]GitLineChange{3: GitLineModified}
+	tab.SetMark(3, Mark{Kind: MarkBreakpoint, Enabled: true})
+	tab.cursorMoved = false
+
+	tab.Render(scr, theme.Default(), 0, 0, w, 10)
+	scr.Show()
+
+	cells, _, _ := scr.GetContents()
+	const row = 3
+	c := cells[row*w+0]
+	if len(c.Runes) == 0 || c.Runes[0] != '●' {
+		got := ' '
+		if len(c.Runes) > 0 {
+			got = c.Runes[0]
+		}
+		t.Fatalf("gutter col 0 on a line with both a git marker and a breakpoint = %q, want the breakpoint glyph '●'", got)
+	}
+}
+
+// TestAllBufferMutationsGoThroughMarkWrappers reads tab.go's OWN source and
+// fails if a raw t.Buffer.InsertString( / t.Buffer.DeleteRange( call appears
+// outside the bodies of bufInsert / bufDelete. Those two functions are the
+// only place lines actually move, and therefore the only place marks get
+// renumbered — a tenth call site that bypasses them would leave a breakpoint
+// silently pointing at the wrong line, with nothing else able to catch it,
+// because Marks itself would look perfectly fine right up until the next
+// edit above it drifted it off course. Opinionated, but it's the
+// machine-checkable form of the invariant, which this repo's own culture
+// prefers over pinning the symptom instead (see CLAUDE.md's LSP-caller
+// grep).
+func TestAllBufferMutationsGoThroughMarkWrappers(t *testing.T) {
+	src, err := os.ReadFile("tab.go")
+	if err != nil {
+		t.Fatalf("read tab.go: %v", err)
+	}
+	funcStart := regexp.MustCompile(`^func \(t \*Tab\) (\w+)\(`)
+	rawCall := regexp.MustCompile(`t\.Buffer\.(InsertString|DeleteRange)\(`)
+	allowed := map[string]bool{"bufInsert": true, "bufDelete": true}
+
+	current := ""
+	for i, line := range strings.Split(string(src), "\n") {
+		if m := funcStart.FindStringSubmatch(line); m != nil {
+			current = m[1]
+		} else if line == "}" {
+			current = ""
+		}
+		if rawCall.MatchString(line) && !allowed[current] {
+			t.Errorf("tab.go:%d: raw buffer mutation %q outside bufInsert/bufDelete (in func %q) — route it through the mark-tracking wrapper",
+				i+1, strings.TrimSpace(line), current)
 		}
 	}
 }
