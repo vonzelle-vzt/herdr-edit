@@ -107,6 +107,25 @@ jobs:
           command -v dlv || { echo "dlv not on PATH — the live DAP oracle would silently skip" >&2; exit 1; }
           dlv version || { echo "delve will not run against this Go toolchain — an upstream skew, not a fault in internal/dap" >&2; exit 1; }
 
+      # The SECOND adapter. internal/dap/live_debugpy_test.go and the app-level end-to-end oracle
+      # both drive a real debugpy, and HERDR_REQUIRE_DAP=1 below turns their skip into a failure —
+      # which is exactly what it is for, and exactly what caught this: v0.15.0 went red on main
+      # because CI installed gopls and dlv but never debugpy, so four oracles that pass locally
+      # could not run here. The gate was right; the environment was incomplete. Installing the
+      # dependency is the fix; relaxing the gate would have restored a green badge over four
+      # oracles that never execute, which is the state this whole anti-skip mechanism exists to
+      # prevent.
+      - name: Install debugpy (for the live DAP oracle)
+        run: |
+          python3 -m pip install --user debugpy \
+            || python3 -m pip install debugpy \
+            || python3 -m pip install --break-system-packages debugpy
+
+      - name: Verify debugpy is reachable
+        run: |
+          python3 -c "import debugpy; print('debugpy', debugpy.__version__)" \
+            || { echo "debugpy is not importable — the live debugpy oracles would fail under HERDR_REQUIRE_DAP=1" >&2; exit 1; }
+
       - name: Test
         env:
           # Fail rather than skip if either live oracle cannot run. Both binaries
