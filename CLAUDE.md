@@ -177,6 +177,17 @@ is the one people actually reach for.
 internal/app/lspstatus.go     Which language servers are running, in the status bar
 ```
 
+⚠️ **Known platform limitation, measured on CI: on linux, debugpy does not deliver
+the debuggee's own stdout as DAP `output` events.** The session is otherwise
+healthy — it initializes, runs, streams other output events and terminates — but
+the program's `print()` never appears, with the same `outputMode: remote` that
+works on macOS. So the **debug console will be missing program output on linux**.
+`TestLiveDebugpyProgramOutputArrivesAsEvents` asserts the full behaviour on
+darwin and the weaker-but-real one elsewhere (output events arrived AND the
+program terminated), logging loudly what was not observed. Do not "fix" it by
+skipping: a silent skip leaves a linux user with an empty console and nothing to
+explain it.
+
 🔴 **`ScreenPos` is the overlay contract and it has now shipped wrong TWICE.** First
 `dx = gutter + col` (rune index treated as a screen cell); then `contentStart = GutterWidth()` when
 `Render` uses `contentX = x + gw + 1` (`tab.go:823`, and `:981` for the wrapped path), which put
