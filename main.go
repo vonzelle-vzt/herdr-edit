@@ -17,8 +17,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 
 	"github.com/cloudmanic/spice-edit/internal/app"
 	"github.com/cloudmanic/spice-edit/internal/state"
@@ -127,33 +125,6 @@ for the action menu. See https://github.com/cloudmanic/spice-edit for
 hotkeys and the full feature list.`)
 }
 
-// splitLocation parses "path", "path:line" and "path:line:col" into their
-// parts, defaulting line and col to 1.
-//
-// Splitting from the RIGHT is what makes this correct on the paths that
-// actually occur: an absolute Windows-style path or any filename containing a
-// colon would be cut in the wrong place by a left-to-right scan, and the
-// trailing numeric fields are the only unambiguous part of the string.
-func splitLocation(s string) (path string, line, col int) {
-	line, col = 1, 1
-	parts := strings.Split(s, ":")
-	for len(parts) > 1 {
-		last := parts[len(parts)-1]
-		n, err := strconv.Atoi(last)
-		if err != nil || n < 1 {
-			break
-		}
-		if col == 1 && line == 1 {
-			line = n
-		} else {
-			col = line
-			line = n
-		}
-		parts = parts[:len(parts)-1]
-	}
-	return strings.Join(parts, ":"), line, col
-}
-
 // main routes to the action resolveArgs picked. Edit is by far the
 // common path; the print-and-exit branches stay tiny and side-effect
 // free so a sanity script or CI check can call --version without
@@ -173,7 +144,7 @@ func main() {
 		printHelp()
 		return
 	case actionOpenAt:
-		path, line, col := splitLocation(res.OpenFile)
+		path, line, col := state.SplitLocation(res.OpenFile)
 		abs, err := filepath.Abs(path)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "herdr-edit:", err)

@@ -97,7 +97,31 @@ internal/app/startpage.go     The no-tabs-open view: project, branch, changed fi
 internal/filetree/gitignore.go  git ls-files based filter for the tree
 internal/editor/geometry.go   Gutter width + buffer->screen mapping, for the overlay
 internal/editor/persist.go    Undo history that survives the process
+internal/editor/marks.go      Breakpoint/logpoint marks that track buffer edits
+internal/search/              Workspace search: a pure-Go scan reusing editor.Matches
+internal/app/locationref.go   Parse+jump "path:line:col" from any generated list (Esc e)
+internal/app/searchpanel.go   Esc F -> internal/search -> a jumpable synthetic tab
+internal/app/problems.go      Diagnostics list + next/prev problem (Esc ; . , and F8)
+internal/app/dochighlight.go  Tint other occurrences of the symbol under the cursor
+internal/app/breakpoints.go   Breakpoint model, persistence, dlv/pdb/gdb export
+internal/app/lspstatus.go     Which language servers are running, in the status bar
 ```
+
+🔴 **`ScreenPos` is the overlay contract and it has now shipped wrong TWICE.** First
+`dx = gutter + col` (rune index treated as a screen cell); then `contentStart = GutterWidth()` when
+`Render` uses `contentX = x + gw + 1` (`tab.go:823`, and `:981` for the wrapped path), which put
+*every* overlay one column left of its text on every line. Both times every unit test passed, because
+`TestScreenPos_*` **and** the diagnostics overlay test each computed the expected column with the
+same formula they were checking. An oracle that restates the arithmetic it checks measures nothing.
+`TestScreenPos_MatchesRenderedGlyphs` is the guard: it scans a `SimulationScreen` for where a known
+glyph actually landed. Any new geometry or overlay code needs an assertion of that kind — derived
+from observed output, never from a second copy of the formula.
+
+🔴 **Every buffer mutation must go through `bufInsert`/`bufDelete`**, which keep `Tab.Marks` in step.
+There are **nine** such sites, not the obvious five — `insertAutoClosePair`, both arms of
+`surroundSelection` and `deleteEmptyPair` also rewrite the buffer, so breakpoints would stay correct
+under ordinary typing and go silently wrong the moment you surrounded a selection with a quote.
+`TestAllBufferMutationsGoThroughMarkWrappers` reads `tab.go` and fails on a raw mutation.
 
 ## Conventions
 
@@ -209,8 +233,8 @@ replaced by "Window too small".
 The tree **fits its content, and narrows before it hides**. Three helpers own
 this and nothing else may duplicate their arithmetic:
 
-- `autoSidebarWidth()` — what the tree *wants*: `Tree.NaturalWidth()+1` (the +1
-  is the splitter column), floored at `defaultSidebarWidth` so a short-named
+- `autoSidebarWidth()` — what the tree *wants*: `Tree.FitWidth(autoSidebarPercentile)+1`
+  (`app.go:1140`; the +1 is the splitter column), floored at `defaultSidebarWidth` so a short-named
   project still looks normal, and capped at `maxAutoSidebarNum/Den` (2/5) of the
   pane so a deep tree with long names cannot push the editor out. This is what
   makes the sidebar **grow** as well as shrink — it previously only ever clamped

@@ -366,13 +366,18 @@ func (t *Tab) renderWrapped(scr tcell.Screen, th theme.Theme, x, y, w, h int) {
 		if segIdx == 0 {
 			// Line number only on a line's FIRST row. Repeating it on continuation rows would read as
 			// several separate lines with the same number, which is worse than a blank gutter.
+			//
+			// Goes through the SAME t.gutterMarker helper Render (tab.go) uses, on purpose: this loop
+			// and Render's already diverge from each other for unrelated reasons (see this file's top
+			// comment), and resolving the mark-vs-git-bar priority twice is exactly the kind of drift
+			// that leaves a breakpoint invisible in every wrapped tab with nothing to say why.
 			numStr := fmtRightAligned(lineIdx+1, gw-1)
-			if marker, mok := t.GitLines[lineIdx]; mok && marker != GitLineNone {
-				scr.SetContent(x, cy, gitLineMarkerRune(marker), nil,
-					gutterStyle.Foreground(gitLineMarkerColor(th, marker)))
+			markerR, markerColor, hasMarker := t.gutterMarker(th, lineIdx)
+			if hasMarker {
+				scr.SetContent(x, cy, markerR, nil, gutterStyle.Foreground(markerColor))
 			}
 			for i, r := range numStr {
-				if i == 0 && t.GitLines[lineIdx] != GitLineNone {
+				if i == 0 && hasMarker {
 					continue
 				}
 				scr.SetContent(x+i, cy, r, nil, gutterStyle)

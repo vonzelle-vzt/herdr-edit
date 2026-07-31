@@ -125,7 +125,12 @@ func parseHunkNewStart(header string) (int, bool) {
 }
 
 // menuJumpToDiffSource opens the real file at the line under the cursor in a
-// diff tab. Bound to Esc e.
+// diff tab. No longer bound to Esc e directly — menuGoToLocation
+// (locationref.go) is the Esc e handler now, and calls this as its diff
+// branch only after confirming the active tab's Label ends in ".diff". That
+// extra check is what stops a stale a.diffSource from a previous Esc o
+// hijacking a later, unrelated synthetic tab (this file's own guard below
+// only checks a.diffSource != "", which is not enough on its own).
 func (a *App) menuJumpToDiffSource() {
 	a.closeMenu()
 	tab := a.activeTabPtr()
@@ -146,8 +151,11 @@ func (a *App) menuJumpToDiffSource() {
 	}
 }
 
-// hasDiffTab gates the menu row: jumping to a source line only means anything
-// while a diff is on screen.
+// hasDiffTab reports whether the active tab is a diff we can jump out of. No
+// longer the menu row's enable predicate (hasJumpableTab is, since Esc e now
+// covers non-diff tabs too) — kept for menuJumpToDiffSource's own tests and
+// as a building block if a future action needs "is this specifically a diff"
+// rather than "is there anything to jump from".
 func (a *App) hasDiffTab() bool {
 	tab := a.activeTabPtr()
 	return tab != nil && tab.Synthetic && a.diffSource != ""

@@ -167,6 +167,17 @@ func (c *Client) initialize(ctx context.Context, rootURI string) error {
 					},
 				},
 			},
+			// workspace/symbol has no textDocument scope at all — it searches the
+			// whole project, not a document — so it advertises under a sibling
+			// "workspace" key rather than inside "textDocument" above. Live
+			// testing against gopls shows it answers workspace/symbol whether or
+			// not this is declared (server capabilities, not client ones, gate
+			// whether a method exists at all) — it's declared anyway because
+			// advertising only what we actually understand is the rule this file
+			// follows everywhere else, and a pickier server may yet care.
+			"workspace": map[string]interface{}{
+				"symbol": map[string]interface{}{},
+			},
 		},
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -347,6 +358,20 @@ func (c *Client) DocumentSymbol(ctx context.Context, uri string) ([]Symbol, erro
 	raw, err := c.call(ctx, "textDocument/documentSymbol", documentParams{
 		TextDocument: textDocumentIdentifier{URI: uri},
 	})
+	if err != nil {
+		return nil, err
+	}
+	return symbols(raw), nil
+}
+
+// WorkspaceSymbol searches the whole project for symbols matching query — the
+// request behind workspace-wide "go to symbol" (VS Code's Ctrl+T). Unlike
+// documentSymbol, a workspace/symbol result is always the flat
+// SymbolInformation/WorkspaceSymbol shape; the spec has no nested variant
+// here, so this is the one caller of symbols() that always takes the flat
+// branch.
+func (c *Client) WorkspaceSymbol(ctx context.Context, query string) ([]Symbol, error) {
+	raw, err := c.call(ctx, "workspace/symbol", map[string]string{"query": query})
 	if err != nil {
 		return nil, err
 	}

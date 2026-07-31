@@ -55,26 +55,38 @@ const (
 // state at a moment in time. We don't include scroll position — undo is
 // about *what* was in the buffer, not where the user happened to be
 // looking — but cursor + anchor are part of the user's state.
+//
+// Marks rides along for the same reason cursor/anchor do: a breakpoint's
+// LINE is part of what "this version of the buffer" means, and shiftMarks /
+// dropMarksIn only ever renumber marks forward through live edits — they
+// have no way to know an Undo just rewound the buffer out from under them.
+// Without this, undoing a delete that killed a marked line would restore the
+// text but leave the breakpoint gone, or undoing an insert would leave it
+// sitting a few lines too low. persist.go's persistedSnapshot deliberately
+// stays a separate type, so this field never touches the on-disk format.
 type snapshot struct {
 	Lines  []string
 	Cursor Position
 	Anchor Position
+	Marks  map[int]Mark
 }
 
 // captureSnapshot returns a deep copy of the current buffer state so a
 // later mutation can't bleed into history.
 func (t *Tab) captureSnapshot() snapshot {
 	if t.Buffer == nil {
-		return snapshot{Cursor: t.Cursor, Anchor: t.Anchor}
+		return snapshot{Cursor: t.Cursor, Anchor: t.Anchor, Marks: copyMarks(t.Marks)}
 	}
 	lines := make([]string, len(t.Buffer.Lines))
 	copy(lines, t.Buffer.Lines)
-	return snapshot{Lines: lines, Cursor: t.Cursor, Anchor: t.Anchor}
+	return snapshot{Lines: lines, Cursor: t.Cursor, Anchor: t.Anchor, Marks: copyMarks(t.Marks)}
 }
 
 // applySnapshot replaces the buffer with s. It also re-copies the lines
 // so the live buffer doesn't share storage with the history entry —
-// otherwise the next edit would silently rewrite the past.
+// otherwise the next edit would silently rewrite the past. Marks are
+// replaced wholesale (not shifted) since s.Marks already reflects exactly
+// where they belonged in that version of the buffer.
 func (t *Tab) applySnapshot(s snapshot) {
 	lines := make([]string, len(s.Lines))
 	copy(lines, s.Lines)
@@ -84,6 +96,7 @@ func (t *Tab) applySnapshot(s snapshot) {
 	t.Buffer.Lines = lines
 	t.Cursor = s.Cursor
 	t.Anchor = s.Anchor
+	t.Marks = copyMarks(s.Marks)
 	t.cursorMoved = true
 	t.StyleStale = true
 }

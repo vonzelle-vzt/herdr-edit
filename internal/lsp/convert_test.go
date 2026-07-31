@@ -294,6 +294,48 @@ func TestSymbols_BothWireShapes(t *testing.T) {
 	}
 }
 
+// TestSymbols_WorkspaceSymbolPopulatesURI pins that the flat branch — the one
+// workspace/symbol always uses — fills in URI, which documentSymbol has no
+// use for and never sets.
+func TestSymbols_WorkspaceSymbolPopulatesURI(t *testing.T) {
+	flat := []byte(`[{"name":"Handler","kind":12,"location":{"uri":"file:///proj/main.go","range":{"start":{"line":9,"character":0},"end":{"line":9,"character":6}}}}]`)
+	got := symbols(flat)
+	if len(got) != 1 {
+		t.Fatalf("decoded to %d symbols, want 1", len(got))
+	}
+	if got[0].URI != "file:///proj/main.go" || got[0].Line != 9 || got[0].LineUnknown {
+		t.Errorf("symbol = %+v", got[0])
+	}
+}
+
+// TestSymbols_WorkspaceSymbolNoRangeIsUnknownLine pins the shape LSP 3.17
+// explicitly allows for a WorkspaceSymbol location: {uri} with no "range" at
+// all. Decoding that straight into Range would silently give Line the zero
+// value — a symbol confidently reported on line 1 that is actually nowhere
+// near it, which is the documentSymbol shape bug in a new costume. The
+// decoder must flag it as unknown instead of guessing.
+func TestSymbols_WorkspaceSymbolNoRangeIsUnknownLine(t *testing.T) {
+	noRange := []byte(`[{"name":"Foo","kind":12,"location":{"uri":"file:///proj/foo.go"}}]`)
+	got := symbols(noRange)
+	if len(got) != 1 {
+		t.Fatalf("decoded to %d symbols, want 1", len(got))
+	}
+	if !got[0].LineUnknown {
+		t.Errorf("symbol = %+v, want LineUnknown = true", got[0])
+	}
+	if got[0].URI != "file:///proj/foo.go" {
+		t.Errorf("URI = %q", got[0].URI)
+	}
+
+	// An explicit JSON null for range must be treated the same way as an
+	// absent field, not unmarshalled into a zero-value Range.
+	nullRange := []byte(`[{"name":"Bar","kind":12,"location":{"uri":"file:///proj/bar.go","range":null}}]`)
+	got = symbols(nullRange)
+	if len(got) != 1 || !got[0].LineUnknown {
+		t.Errorf("null range: symbol = %+v, want LineUnknown = true", got)
+	}
+}
+
 // TestSymbols_Degrades pins junk yields nothing rather than a phantom entry.
 func TestSymbols_Degrades(t *testing.T) {
 	for _, in := range []string{"", "null", "[]", "not json", `[{"name":""}]`} {

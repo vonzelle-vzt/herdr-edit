@@ -99,7 +99,7 @@ func (a *App) handleReferences(e *referencesEvent) {
 	}
 	a.tabs = append(a.tabs, editorSyntheticTab("references: "+e.sym+".txt", b.String()))
 	a.activeTab = len(a.tabs) - 1
-	a.flash("Esc p opens any of these; Esc w closes the list")
+	a.flash("Esc e opens the one under the cursor; Esc w closes the list")
 }
 
 // menuRenameSymbol prompts for the new name and applies the server's edits.

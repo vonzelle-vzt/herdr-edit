@@ -238,16 +238,22 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Find in file", shortcut: "Esc f", action: (*App).menuFind, enabled: (*App).hasFindable},
 			{label: "Replace in file", action: (*App).menuReplace, enabled: (*App).hasFindable},
 			{label: "Find file in project", shortcut: "Esc p", action: (*App).menuFindFile, enabled: (*App).hasFinder},
+			{label: "Search in workspace", shortcut: "Esc F", action: (*App).menuSearchInFiles, enabled: (*App).hasSearch},
 			{label: "Run a command", shortcut: "Esc k", action: (*App).menuCommandPalette, enabled: alwaysTrue},
 			{label: "Complete at cursor", shortcut: "Esc space", action: (*App).menuComplete, enabled: (*App).hasFindable},
 			{label: "Go to symbol (outline)", shortcut: "Esc i", action: (*App).menuOutline, enabled: (*App).hasLSPFile},
+			{label: "Go to symbol in workspace", shortcut: "Esc I", action: (*App).menuWorkspaceSymbol, enabled: alwaysTrue},
 			{label: "Fix at cursor", shortcut: "Esc l", action: (*App).menuCodeActions, enabled: (*App).hasLSPFile},
 			{label: "Find references", shortcut: "Esc j", action: (*App).menuFindReferences, enabled: (*App).hasFileTab},
 			{label: "Rename symbol", shortcut: "Esc y", action: (*App).menuRenameSymbol, enabled: (*App).hasFileTab},
+			{label: "Language server status", action: (*App).menuLSPStatus, enabled: alwaysTrue},
+			{label: "Problems", shortcut: "Esc ;", action: (*App).menuProblems, enabled: (*App).hasProblems},
+			{label: "Next problem", shortcut: "Esc .", action: (*App).menuNextProblem, enabled: (*App).hasProblems},
+			{label: "Previous problem", shortcut: "Esc ,", action: (*App).menuPrevProblem, enabled: (*App).hasProblems},
 			{label: "Toggle bookmark", shortcut: "Esc m", action: (*App).menuToggleBookmark, enabled: (*App).hasFileTab},
 			{label: "Next bookmark", shortcut: "Esc '", action: (*App).menuNextBookmark, enabled: (*App).hasBookmarks},
 			{label: "Clear bookmarks", action: (*App).menuClearBookmarks, enabled: (*App).hasBookmarks},
-			{label: "Jump to source line", shortcut: "Esc e", action: (*App).menuJumpToDiffSource, enabled: (*App).hasDiffTab},
+			{label: "Go to location under cursor", shortcut: "Esc e", action: (*App).menuGoToLocation, enabled: (*App).hasJumpableTab},
 			{label: "Open changes (diff)", shortcut: "Esc o", action: (*App).menuOpenChanges, enabled: (*App).hasFileTab},
 			{shortcut: "Esc b", action: (*App).menuToggleInlineBlame, enabled: alwaysTrue, labelFor: (*App).inlineBlameLabel},
 			{label: "Go to line", shortcut: "Esc g", action: (*App).menuGoToLine, enabled: (*App).hasFindable},
@@ -273,6 +279,16 @@ func builtinMenuGroups() [][]menuItemDef {
 		// View toggle
 		{
 			{shortcut: "Esc t", action: (*App).menuToggleSidebar, enabled: alwaysTrue, labelFor: (*App).sidebarToggleLabel, visible: (*App).hasTree},
+		},
+		// Debug (fork, Lane B stage 1) — edit-tracking breakpoint marks with
+		// NO adapter behind them; export renders `break file:line` for
+		// dlv/pdb/gdb.
+		{
+			{label: "Toggle breakpoint", shortcut: "Esc 9", action: (*App).menuToggleBreakpoint, enabled: (*App).hasBreakpointableTab},
+			{label: "Toggle breakpoint enabled", action: (*App).menuToggleBreakpointEnabled, enabled: (*App).hasBreakpointableTab},
+			{label: "List breakpoints", shortcut: "Esc 5", action: (*App).menuListBreakpoints, enabled: (*App).hasBreakpoints},
+			{label: "Clear breakpoints", action: (*App).menuClearBreakpoints, enabled: (*App).hasBreakpoints},
+			{label: "Export breakpoints (dlv)", action: (*App).menuExportBreakpoints, enabled: (*App).hasBreakpoints},
 		},
 		// Quit
 		{
@@ -577,6 +593,19 @@ type App struct {
 	blameCache    map[blameKey]string
 	blameInflight map[blameKey]bool
 
+	// Document highlight (fork) — ambient tint of every visible occurrence
+	// of the identifier under the cursor, no key of its own. Cached against
+	// (path, sym, ScrollY, height, lineCount) because draw() repaints on
+	// every event including bare mouse motion, and an uncached scan on each
+	// of those would be a stall the user reads as the editor hanging. See
+	// dochighlight.go.
+	docHighlightPath      string
+	docHighlightSym       string
+	docHighlightScrollY   int
+	docHighlightHeight    int
+	docHighlightLineCount int
+	docHighlightMatches   []editor.Match
+
 	// Highest open-request sequence already honoured. See consumeOpenRequest.
 	lastOpenSeq int64
 
@@ -589,6 +618,14 @@ type App struct {
 	// bookmarks a file:line; the harpoon ports mark panes, not places in code.
 	bookmarks     []bookmark
 	bookmarkIndex int
+
+	// Breakpoints (fork, Lane B stage 1) — Esc 9 toggles, Esc 5 lists. NO
+	// debug adapter behind this: an edit-tracking, exportable mark, kept
+	// current by syncBreakpoints (see breakpoints.go) from the same polled
+	// call site as active/openRequest below. bpStore is nil-safe and swallows
+	// its own failures, matching state.Publisher's contract.
+	breakpoints []Breakpoint
+	bpStore     *state.BreakpointStore
 
 	finderOpen     bool
 	finderQuery    []rune
@@ -639,12 +676,14 @@ func New(rootDir string) (*App, error) {
 		// panel would resolve it against ITS OWN working directory rather than the editor's.
 		rootDir:        tree.Root.Path,
 		active:         state.NewPublisher(),
+		bpStore:        state.NewBreakpointStore(),
 		tree:           tree,
 		hoveredMenuRow: -1,
 		sidebarShown:   true,
 		blameEnabled:   true,
 		sidebarWidth:   defaultSidebarWidth,
 	}
+	a.breakpoints = loadPersistedBreakpoints(a.rootDir)
 	a.setActiveFolder(tree.Root.Path)
 	a.loadSpiceConfig()
 	a.refreshGitStatus()
@@ -701,11 +740,13 @@ func NewSingleFile(filePath string) (*App, error) {
 		// Absolute for the same reason as above; single-file mode has no tree to borrow it from.
 		rootDir:        absOr(rootDir),
 		active:         state.NewPublisher(),
+		bpStore:        state.NewBreakpointStore(),
 		tree:           nil,
 		hoveredMenuRow: -1,
 		sidebarShown:   false,
 		sidebarWidth:   defaultSidebarWidth,
 	}
+	a.breakpoints = loadPersistedBreakpoints(a.rootDir)
 	a.setActiveFolder(rootDir)
 	a.loadSpiceConfig()
 	a.loadCustomActions()
@@ -868,9 +909,13 @@ func (a *App) Run() error {
 		a.publishActive()
 		a.consumeOpenRequest()
 		a.maybeSyncLSP()
+		a.syncBreakpoints()
 		a.screen.Show()
 	}
 	a.active.Flush() // do not lose the final position inside the debounce window
+	if a.bpStore != nil {
+		a.bpStore.Flush() // do not lose a breakpoint toggled just before quitting
+	}
 	if a.lsp != nil {
 		a.lsp.Stop()
 	}
@@ -911,6 +956,17 @@ func (a *App) consumeOpenRequest() {
 	if _, err := os.Stat(req.File); err != nil {
 		a.flash("Cannot open " + filepath.Base(req.File))
 		return
+	}
+	// open-request.json is one global file shared by every running editor, so
+	// with two editors open on different projects a single panel-issued jump
+	// would otherwise land in BOTH of them. Recording lastOpenSeq above before
+	// this check is what makes a request outside our project consumed rather
+	// than retried forever — only the editor whose rootDir actually contains
+	// the file opens it.
+	if a.rootDir != "" {
+		if rel, err := filepath.Rel(a.rootDir, req.File); err != nil || strings.HasPrefix(rel, "..") {
+			return
+		}
 	}
 	a.openFile(req.File)
 	tab := a.activeTabPtr()
@@ -955,6 +1011,8 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleReferences(e)
 	case *symbolsEvent:
 		a.handleSymbols(e)
+	case *workspaceSymbolsEvent:
+		a.handleWorkspaceSymbols(e)
 	case *codeActionsEvent:
 		a.handleCodeActions(e)
 	case *renameEvent:
@@ -974,6 +1032,8 @@ func (a *App) handleEvent(ev tcell.Event) {
 		if a.finderOpen {
 			a.refreshFinderResults()
 		}
+	case *searchResultsEvent:
+		a.handleSearchResults(e)
 	}
 }
 
@@ -1359,6 +1419,21 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 	}
 	if a.finderOpen {
 		a.handleFinderKey(ev)
+		return
+	}
+
+	// F8 / Shift+F8 — the VS Code muscle memory for next/prev problem. A
+	// bonus path only: Esc . / Esc , (leader.go) and the command palette
+	// fully cover this feature on their own. Placed here, after every modal
+	// guard above, so an open prompt/confirm/form/etc. still owns the
+	// keyboard; and it isn't KeyRune, so it can never be swallowed by the
+	// Esc-leader dispatch below.
+	if ev.Key() == tcell.KeyF8 {
+		if ev.Modifiers()&tcell.ModShift != 0 {
+			a.menuPrevProblem()
+		} else {
+			a.menuNextProblem()
+		}
 		return
 	}
 
@@ -2714,6 +2789,10 @@ func (a *App) draw() {
 	if tab := a.activeTabPtr(); tab != nil {
 		ex, ey, ew, eh := a.editorRect()
 		tab.Render(a.screen, a.theme, ex, ey, ew, eh)
+		// Document highlight draws BEFORE diagnostics: a squiggle under an actual
+		// mistake must always win the eye over a tint that's just saying "this word
+		// again".
+		a.drawDocumentHighlights()
 		// After Render, so the underline sits on top of the syntax colours rather than being
 		// overwritten by them.
 		a.drawDiagnostics()
@@ -2932,6 +3011,21 @@ func (a *App) drawStatusBar() {
 		if rw < sw {
 			drawAt(a.screen, sx+sw-rw, sy, right, style)
 			rightWidth = rw
+		}
+	}
+
+	// LSP status tag, drawn next to the left of the branch. The status bar
+	// is shared with the git branch and the diagnostics summary, so this
+	// clips against whatever rightWidth the branch already claimed rather
+	// than ever overlapping it.
+	if tag := a.lspStatusText(); tag != "" {
+		avail := sw - rightWidth
+		if avail >= 3 { // room for at least " x "
+			trimmed := trimRunes(tag, avail-2)
+			right := " " + trimmed + " "
+			rw := len([]rune(right))
+			drawAt(a.screen, sx+sw-rightWidth-rw, sy, right, style)
+			rightWidth += rw
 		}
 	}
 

@@ -169,3 +169,39 @@ func TestFinder_InvalidateResetsState(t *testing.T) {
 		t.Fatalf("state after Invalidate: got %v, want StateIdle", f.State())
 	}
 }
+
+// TestFinder_PathsReturnsIndependentCopy pins Paths' two promises: nil
+// before any build (matching Search's "nothing to show yet" contract), and
+// afterwards a copy the caller can freely hold onto — mutating the returned
+// slice must never corrupt the Finder's own cache, which a future Rebuild
+// would otherwise silently pick up.
+func TestFinder_PathsReturnsIndependentCopy(t *testing.T) {
+	f := New(t.TempDir())
+	if got := f.Paths(); got != nil {
+		t.Fatalf("Paths before Rebuild: got %v, want nil", got)
+	}
+
+	dir := t.TempDir()
+	mustWrite(t, dir, "a.go", "x")
+	mustWrite(t, dir, "b.go", "x")
+	f = New(dir)
+	done := make(chan struct{})
+	f.Rebuild(func() { close(done) })
+	<-done
+
+	got := f.Paths()
+	want := []string{"a.go", "b.go"}
+	if len(got) != len(want) {
+		t.Fatalf("Paths() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Paths() = %v, want %v", got, want)
+		}
+	}
+
+	got[0] = "mutated"
+	if fresh := f.Paths(); fresh[0] != "a.go" {
+		t.Fatalf("mutating the returned slice corrupted the cache: %v", fresh)
+	}
+}

@@ -23,6 +23,8 @@ package app
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +46,15 @@ type codeActionsEvent struct {
 }
 
 func (e *codeActionsEvent) When() time.Time { return e.when }
+
+// workspaceSymbolsEvent delivers a workspace/symbol answer, like symbolsEvent
+// does for the file-local outline.
+type workspaceSymbolsEvent struct {
+	syms []lsp.Symbol
+	when time.Time
+}
+
+func (e *workspaceSymbolsEvent) When() time.Time { return e.when }
 
 // menuOutline asks for the file's symbols. Bound to Esc i.
 func (a *App) menuOutline() {
@@ -103,6 +114,94 @@ func (a *App) handleSymbols(e *symbolsEvent) {
 		})
 	}
 	a.openPaletteWith(cmds, "Go to symbol")
+}
+
+// menuWorkspaceSymbol prompts for a symbol name and searches every running
+// language server for it — VS Code's Ctrl+T. Bound to Esc I (shift-i),
+// mirroring Esc i's file-local outline.
+//
+// 🔴 Servers start LAZILY, on the first file of a matching language (see
+// registry.go). Before any Go file has been opened, Running() is empty, a
+// query would fan out to nothing, and the picker would show no results —
+// indistinguishable from "your symbol does not exist". Checking Running()
+// here, before the prompt even opens, turns that silent failure into an
+// explicit message.
+func (a *App) menuWorkspaceSymbol() {
+	a.closeMenu()
+	if a.lsp == nil || len(a.lsp.Running()) == 0 {
+		a.flash("No language server is running yet — open a file first")
+		return
+	}
+	a.openPrompt("Go to symbol in workspace", "symbol name", "", (*App).workspaceSymbolSubmit)
+}
+
+// workspaceSymbolSubmit runs the prompt's query on a goroutine and posts the
+// answer back, the same discipline every other LSP action here follows:
+// calling the manager inline would block Run's PollEvent loop on however long
+// every running server takes to answer.
+func (a *App) workspaceSymbolSubmit(query string) {
+	mgr := a.lsp
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		syms, err := mgr.WorkspaceSymbol(ctx, query)
+		if err != nil {
+			syms = nil
+		}
+		a.post(&workspaceSymbolsEvent{syms: syms, when: time.Now()})
+	}()
+	a.flash("Searching workspace…")
+}
+
+// handleWorkspaceSymbols presents workspace/symbol results through the
+// palette, the same reuse handleSymbols relies on for the file-local outline.
+// Each row shows which file the symbol lives in, since results can span the
+// whole project rather than one open tab; selecting one opens that file and,
+// when the server actually sent a line, moves the cursor to it.
+func (a *App) handleWorkspaceSymbols(e *workspaceSymbolsEvent) {
+	if len(e.syms) == 0 {
+		a.flash("No matching symbols")
+		return
+	}
+	cmds := make([]paletteCommand, 0, len(e.syms))
+	for _, s := range e.syms {
+		path := lsp.PathFromURI(s.URI)
+		line := s.Line
+		lineUnknown := s.LineUnknown
+		lineLabel := "?"
+		if !lineUnknown {
+			lineLabel = strconv.Itoa(line + 1) // display is 1-based; the protocol is 0-based
+		}
+		where := filepath.Base(path)
+		if where == "" || where == "." {
+			where = "?"
+		}
+		shortcut := where + ":" + lineLabel
+		if kind := lsp.SymbolKindName(s.Kind); kind != "" {
+			shortcut = kind + "  " + shortcut
+		}
+		cmds = append(cmds, paletteCommand{
+			label:    s.Name,
+			shortcut: shortcut,
+			enabled:  alwaysTrue,
+			action: func(app *App) {
+				if path == "" {
+					app.flash("Could not resolve that symbol's file")
+					return
+				}
+				if t := app.activeTabPtr(); t == nil || t.Path != path {
+					app.openFile(path)
+				}
+				if lineUnknown {
+					return
+				}
+				if t := app.activeTabPtr(); t != nil {
+					t.MoveCursorTo(posAtLine(line), false)
+				}
+			},
+		})
+	}
+	a.openPaletteWith(cmds, "Go to symbol in workspace")
 }
 
 // menuCodeActions asks what can be fixed at the cursor. Bound to Esc l — the

@@ -16,8 +16,10 @@ package editor
 // work right up until this one changed, and the failure would be silently
 // misplaced squiggles rather than anything that looks like a bug.
 
-// GutterWidth is the width of the line-number column for this tab's buffer,
-// i.e. how far in from the editor rectangle the text actually starts.
+// GutterWidth is the width of the line-number column for this tab's buffer.
+// Text starts one cell further in than this (see ScreenPos's contentStart) —
+// that extra cell is the blank separator Render paints between the numbers
+// and the code.
 func (t *Tab) GutterWidth() int {
 	return gutterWidthFor(len(t.Buffer.Lines))
 }
@@ -32,8 +34,18 @@ func (t *Tab) ScreenPos(line, col, viewW, viewH int) (dx, dy int, visible bool) 
 	if line < t.ScrollY || line >= t.ScrollY+viewH {
 		return 0, 0, false
 	}
-	gut := t.GutterWidth()
-	// 🔴 col is a RUNE index; the screen is measured in CELLS, and a hard tab is
+	// 🔴 Render's contentX is GutterWidth()+1, not GutterWidth(): one extra
+	// cell separates the line-number column from the text (see the "1  "
+	// vs "1   package" gap Render paints, and the cursor placement below).
+	// A version of this function that omitted the +1 shipped and passed
+	// every unit test in this package, because those tests only checked
+	// this formula against ITSELF — never against a rendered screen. Found
+	// by building a tcell.SimulationScreen, rendering, and reading where
+	// the glyphs actually landed (per CLAUDE.md's "verify by rendering"
+	// rule): every overlay was one column left of the real text on every
+	// line, tabs or not.
+	contentStart := t.GutterWidth() + 1
+	// col is a RUNE index; the screen is measured in CELLS, and a hard tab is
 	// not one cell. Treating them as interchangeable put every overlay a few
 	// columns to the left of the text it was describing on any tab-indented
 	// line -- which is most Go source. The diagnostic underline landed on the
@@ -41,13 +53,13 @@ func (t *Tab) ScreenPos(line, col, viewW, viewH int) (dx, dy int, visible bool) 
 	// instead of following it.
 	//
 	// This is the SAME arithmetic Render uses to place the cursor
-	// (LineVisualCol against ScrollX), and it has to stay that way: the cursor
-	// is the position users verify by eye, so anything that disagrees with it
-	// is wrong by definition.
+	// (LineVisualCol against ScrollX, offset from contentX), and it has to
+	// stay that way: the cursor is the position users verify by eye, so
+	// anything that disagrees with it is wrong by definition.
 	runes := []rune(t.LineText(line))
-	dx = gut + (LineVisualCol(runes, col) - LineVisualCol(runes, t.ScrollX))
+	dx = contentStart + (LineVisualCol(runes, col) - LineVisualCol(runes, t.ScrollX))
 	dy = line - t.ScrollY
-	if dx < gut || dx >= viewW {
+	if dx < contentStart || dx >= viewW {
 		return 0, 0, false
 	}
 	return dx, dy, true

@@ -28,8 +28,39 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// SplitLocation parses "path", "path:line" and "path:line:col" into their
+// parts, defaulting line and col to 1.
+//
+// Splitting from the RIGHT is what makes this correct on the paths that
+// actually occur: an absolute path or any filename containing a colon would
+// be cut in the wrong place by a left-to-right scan, and the trailing numeric
+// fields are the only unambiguous part of the string. Promoted from main.go
+// so internal/app can parse a "path:line:col" reference too (menuGoToLocation)
+// without a second, drifting copy of this logic.
+func SplitLocation(s string) (path string, line, col int) {
+	line, col = 1, 1
+	parts := strings.Split(s, ":")
+	for len(parts) > 1 {
+		last := parts[len(parts)-1]
+		n, err := strconv.Atoi(last)
+		if err != nil || n < 1 {
+			break
+		}
+		if col == 1 && line == 1 {
+			line = n
+		} else {
+			col = line
+			line = n
+		}
+		parts = parts[:len(parts)-1]
+	}
+	return strings.Join(parts, ":"), line, col
+}
 
 // OpenRequestFile is the path panels write and the editor polls.
 func OpenRequestFile() string {

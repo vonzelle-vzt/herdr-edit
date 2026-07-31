@@ -48,6 +48,7 @@ func leaderBindings() []leaderBinding {
 		{'t', (*App).menuToggleSidebar},
 		{'/', (*App).menuToggleLineComment},
 		{'f', (*App).openFind},
+		{'F', (*App).menuSearchInFiles},
 		{'p', (*App).openFinder},
 		{'g', (*App).menuGoToLine},
 		{'a', (*App).menuSelectAll},
@@ -55,18 +56,32 @@ func leaderBindings() []leaderBinding {
 		{'b', (*App).menuToggleInlineBlame},
 		{' ', (*App).menuComplete},
 		{'o', (*App).menuOpenChanges},
-		{'e', (*App).menuJumpToDiffSource},
+		{'e', (*App).menuGoToLocation},
 		{'i', (*App).menuOutline},
+		{'I', (*App).menuWorkspaceSymbol},
 		{'l', (*App).menuCodeActions},
 		{'j', (*App).menuFindReferences},
 		{'y', (*App).menuRenameSymbol},
 		{'m', (*App).menuToggleBookmark},
 		{'\'', (*App).menuNextBookmark},
+		// Breakpoints (fork, Lane B stage 1) — no debug adapter behind
+		// these, just persistent edit-tracking marks. '9' mnemonic: F9,
+		// the universal toggle-breakpoint key; '5' mnemonic: F5, the
+		// universal start/resume key, repurposed here as "show me where
+		// they are" since there's no adapter yet to resume.
+		{'9', (*App).menuToggleBreakpoint},
+		{'5', (*App).menuListBreakpoints},
 		// LSP. Both requests were implemented, tested and advertised in initialize with no caller;
 		// these two keys are the entire wiring.
 		{'h', (*App).menuHover},
 		{'d', (*App).menuGoToDefinition},
 		{'z', (*App).menuToggleWrap},
+		// Problems list + next/prev, the VS Code F8 muscle memory. F8 /
+		// Shift+F8 are wired directly in handleKey (not KeyRune, so they
+		// can't go through this table) — these three are the primary path.
+		{';', (*App).menuProblems},
+		{'.', (*App).menuNextProblem},
+		{',', (*App).menuPrevProblem},
 	}
 }
 
