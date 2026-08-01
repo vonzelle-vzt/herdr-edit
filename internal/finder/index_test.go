@@ -135,3 +135,59 @@ func sliceEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// TestGitIndexDeduplicatesUnmergedPaths pins a bug that only appears during a
+// merge — which is exactly when the conflict features are in use.
+//
+// 🔴 `git ls-files --cached` emits an UNMERGED path once PER STAGE: three times
+// for an ordinary conflict (base, ours, theirs). So the fuzzy finder listed the
+// same file three times and workspace search scanned it three times, reporting
+// 39 hits in a file that has 13. It reads as a search bug and is really the
+// shape of git's output.
+func TestGitIndexDeduplicatesUnmergedPaths(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed; this asserts on real git output")
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+root)
+		_ = cmd.Run() // the merge is EXPECTED to fail
+	}
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "t@example.com")
+	run("config", "user.name", "T")
+	write("base\n")
+	run("add", "a.txt")
+	run("commit", "-qm", "base")
+	run("checkout", "-qb", "feature")
+	write("theirs\n")
+	run("commit", "-qam", "theirs")
+	run("checkout", "-q", "main")
+	write("ours\n")
+	run("commit", "-qam", "ours")
+	run("merge", "feature")
+
+	paths, err := buildIndexGit(root)
+	if err != nil {
+		t.Fatalf("buildIndexGit: %v", err)
+	}
+	seen := map[string]int{}
+	for _, p := range paths {
+		seen[p]++
+	}
+	if n := seen["a.txt"]; n != 1 {
+		t.Fatalf("the conflicted path appears %d time(s) in the index, want 1 — "+
+			"every search over it would report %dx the real hit count", n, n)
+	}
+}

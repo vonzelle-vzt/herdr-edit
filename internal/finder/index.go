@@ -110,11 +110,27 @@ func buildIndexGit(rootDir string) ([]string, error) {
 	// Split on \0; trim the trailing empty entry git always writes.
 	parts := bytes.Split(out, []byte{0})
 	paths := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
 	for _, p := range parts {
 		if len(p) == 0 {
 			continue
 		}
 		s := string(p)
+		// 🔴 Deduplicate. `git ls-files --cached` emits an UNMERGED path once
+		// per stage — three times for an ordinary conflict, one per side plus
+		// the base. So during a merge every conflicted file appeared three
+		// times in the fuzzy finder and was scanned three times by workspace
+		// search, which reported 39 hits in a file that has 13. It looks like a
+		// search bug and is really a git output shape, and it shows up in
+		// exactly the state the conflict features exist for.
+		//
+		// --deduplicate would also do it, but it is git 2.31+ and this falls
+		// back to a manual walk on any git failure — a flag that makes older
+		// git error out would silently downgrade the whole index.
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
 		// git ls-files already emits forward-slash paths even on
 		// Windows, so we don't need to translate. Sort happens at
 		// the end so we don't have to maintain order here.

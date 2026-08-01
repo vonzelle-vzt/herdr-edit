@@ -372,16 +372,22 @@ func TestConflictTintIsSkippedOnAWrappedTab(t *testing.T) {
 // conflictMenuLabels is the list every reachability assertion below checks
 // against — written out once, so the test and the menu cannot drift apart
 // silently in two places.
+// conflictMenuLabels DERIVES the labels from conflictMenuGroup rather than
+// restating them.
+//
+// 🔴 It used to be a hand-written copy, and that copy is what an oracle cannot
+// afford: renaming the actions so the command palette could actually find them
+// (they lacked the word "conflict", so the one term a user would type returned
+// only the two navigation rows) turned this test red for a rename, while a
+// genuinely MISSING action would look identical. A restated list polices
+// nothing and cries wolf — the same failure as the panel-title list in the
+// sibling repo.
 func conflictMenuLabels() []string {
-	return []string{
-		"Take ours (current change)",
-		"Take theirs (incoming change)",
-		"Take both",
-		"Next conflict",
-		"Previous conflict",
-		"Resolve all as ours…",
-		"Resolve all as theirs…",
+	var out []string
+	for _, it := range conflictMenuGroup() {
+		out = append(out, it.label)
 	}
+	return out
 }
 
 // TestConflictActionsAreReachableFromTheMenuAndThePalette is the
@@ -435,7 +441,7 @@ func TestConflictActionsAreReachableFromTheMenuAndThePalette(t *testing.T) {
 	}
 	fired := false
 	for _, cmd := range a.paletteCommands() {
-		if cmd.label != "Take ours (current change)" {
+		if cmd.label != conflictMenuGroup()[0].label {
 			continue
 		}
 		if !cmd.enabled(a) {

@@ -157,15 +157,19 @@ func (a *App) tintLine(tab *editor.Tab, line int, tint tcell.Color, ex, ey, ew, 
 // the menu it has always seen, not seven greyed-out rows pushing Quit off the
 // bottom. menuLayout drops a group that filters down to empty, dividers and
 // all, so the group vanishes whole.
+// 🔴 Every label carries the word "conflict" on purpose. The command palette
+// matches on the label, so "Take ours (current change)" was invisible to
+// someone typing the one word they would actually reach for — found by trying
+// to screenshot the feature and getting only the two navigation rows back.
 func conflictMenuGroup() []menuItemDef {
 	return []menuItemDef{
-		{label: "Take ours (current change)", action: (*App).menuConflictTakeOurs, enabled: (*App).hasConflictAtCursor, visible: (*App).hasConflicts},
-		{label: "Take theirs (incoming change)", action: (*App).menuConflictTakeTheirs, enabled: (*App).hasConflictAtCursor, visible: (*App).hasConflicts},
-		{label: "Take both", action: (*App).menuConflictTakeBoth, enabled: (*App).hasConflictAtCursor, visible: (*App).hasConflicts},
+		{label: "Conflict: take ours (current change)", action: (*App).menuConflictTakeOurs, enabled: (*App).hasConflictAtCursor, visible: (*App).hasConflicts},
+		{label: "Conflict: take theirs (incoming change)", action: (*App).menuConflictTakeTheirs, enabled: (*App).hasConflictAtCursor, visible: (*App).hasConflicts},
+		{label: "Conflict: take both", action: (*App).menuConflictTakeBoth, enabled: (*App).hasConflictAtCursor, visible: (*App).hasConflicts},
 		{label: "Next conflict", action: (*App).menuConflictNext, enabled: (*App).hasConflicts, visible: (*App).hasConflicts},
 		{label: "Previous conflict", action: (*App).menuConflictPrev, enabled: (*App).hasConflicts, visible: (*App).hasConflicts},
-		{label: "Resolve all as ours…", action: (*App).menuConflictAllOurs, enabled: (*App).hasConflicts, visible: (*App).hasConflicts},
-		{label: "Resolve all as theirs…", action: (*App).menuConflictAllTheirs, enabled: (*App).hasConflicts, visible: (*App).hasConflicts},
+		{label: "Conflict: resolve all as ours…", action: (*App).menuConflictAllOurs, enabled: (*App).hasConflicts, visible: (*App).hasConflicts},
+		{label: "Conflict: resolve all as theirs…", action: (*App).menuConflictAllTheirs, enabled: (*App).hasConflicts, visible: (*App).hasConflicts},
 	}
 }
 
