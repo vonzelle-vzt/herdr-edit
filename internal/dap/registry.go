@@ -59,7 +59,40 @@ type Adapter struct {
 	Transport Transport
 
 	// Languages this adapter debugs, as internal/lsp LanguageID values.
+	//
+	// 🔴 EMPTY means config-only, and the emptiness IS the feature — see
+	// Adapter.ConfigOnly. Do not add a boolean beside it.
 	Languages []string
+
+	// ConfigTypes are the launch.json `type` values that select this adapter.
+	//
+	// 🔴 A SECOND selector, not a duplicate of Languages, because the two
+	// questions are different and one table cannot answer both. AdapterFor asks
+	// "what debugs the file on screen" and is first-match-wins over Languages;
+	// this asks "what did the user's configuration name", which is the only
+	// question with an answer for a browser. The aliases are here in full
+	// (`node` as well as `pwa-node`) because a user's launch.json is written
+	// against VS Code's spelling, while AdapterID is what goes on the wire.
+	ConfigTypes []string
+
+	// WorkspaceFolderKey is the configuration key this adapter reads the project
+	// root out of, or "" for an adapter that needs no such key.
+	//
+	// 🔴 DATA rather than an `if` in the merge, and it is load-bearing for
+	// exactly one row today. MEASURED in js-debug 1.117.0's own bundle: its
+	// chrome defaults carry `webRoot: "${workspaceFolder}"`, and its resolver
+	// reads `__workspaceFolder` off the configuration to expand it —
+	//
+	//	function zH(r){return r.__workspaceFolder||(r=GH(r)), …}
+	//	function GH(r){let e="${workspaceFolder}"; … "webRoot" in t &&
+	//	  t.webRoot?.includes(e) && (t.webRoot="/") … }
+	//
+	// so with the key ABSENT it takes the GH branch and sets webRoot to "/".
+	// Every browser url then maps to nothing on disk and no breakpoint ever
+	// binds, while the session initializes, runs and terminates without a single
+	// error. Node never needed it, which is why this was invisible until a
+	// browser row existed.
+	WorkspaceFolderKey string
 
 	// UsesChildSessions says this adapter's root connection is a COORDINATOR
 	// that debugs nothing itself, and that the session the user interacts with
@@ -128,6 +161,7 @@ var DefaultAdapters = []Adapter{
 		Argv:         [][]string{{"dlv", "dap", "--client-addr", "unix:" + SocketPlaceholder}},
 		Transport:    TransportSocket,
 		Languages:    []string{"go"},
+		ConfigTypes:  []string{"go"},
 		ProgramIsDir: true, // `mode: debug` builds a package, not a file
 		Launch: map[string]interface{}{
 			"request": "launch",
@@ -159,8 +193,11 @@ var DefaultAdapters = []Adapter{
 		// port when given --port; with no arguments it speaks the protocol over
 		// its own stdin/stdout (verified against debugpy 1.8.20's --help and a
 		// full live session).
-		Transport:    TransportStdio,
-		Languages:    []string{"python"},
+		Transport: TransportStdio,
+		Languages: []string{"python"},
+		// Both spellings: VS Code's Python extension migrated `python` to
+		// `debugpy`, and real launch.json files in the wild carry either.
+		ConfigTypes:  []string{"python", "debugpy"},
 		ProgramIsDir: false, // debugpy runs the FILE
 		Launch: map[string]interface{}{
 			"request": "launch",
@@ -190,8 +227,13 @@ var DefaultAdapters = []Adapter{
 		// 🔴 A THIRD transport shape. delve is a socket we listen on, debugpy
 		// speaks stdio, and js-debug is a TCP server we dial — and only the
 		// third can carry the second connection a child session needs.
-		Transport:             TransportServer,
-		Languages:             []string{"javascript", "javascriptreact"},
+		Transport: TransportServer,
+		Languages: []string{"javascript", "javascriptreact"},
+		// `node-terminal` is VS Code's "run a command in a terminal" variant.
+		// It resolves to the same server and the same wire type; what differs
+		// is which keys the user sets, which is their file's business.
+		ConfigTypes:           []string{"node", "pwa-node", "node-terminal"},
+		WorkspaceFolderKey:    "__workspaceFolder",
 		ProgramIsDir:          false, // node runs the FILE
 		UsesChildSessions:     true,
 		BreakpointsBindLazily: true,
@@ -209,6 +251,57 @@ var DefaultAdapters = []Adapter{
 		InstallHint: "download js-debug-dap-v1.117.0.tar.gz from " +
 			"https://github.com/microsoft/vscode-js-debug/releases and extract it into " +
 			"~/.local/share/js-debug/ (node is also required)",
+	},
+	{
+		// The FOURTH row, and the first that is CONFIG-ONLY. Same LocateJsDebug,
+		// same TransportServer, same binary, same coordinator-plus-child shape —
+		// everything that differs is in this literal.
+		Name:      "js-debug (chrome)",
+		AdapterID: "pwa-chrome",
+		Locate:    LocateJsDebug,
+		Transport: TransportServer,
+
+		// 🔴 nil IS THE FEATURE, not an omission. AdapterFor is first-match-wins
+		// over Languages and the Node row above already claims `javascript`, so a
+		// chrome row claiming it would answer for every .js file the user opens —
+		// launching a browser for a server-side script, with which row won
+		// depending on nothing but the order of this slice. A browser session is
+		// something the user ASKS for by name; there is no file on disk that
+		// means "debug this in Chrome". Reachable only through a launch.json
+		// configuration, therefore, and Adapter.ConfigOnly derives that from the
+		// emptiness rather than from a flag somebody has to remember to set.
+		Languages:   nil,
+		ConfigTypes: []string{"chrome", "pwa-chrome"},
+
+		// 🔴 The key this whole row is broken without. See Adapter.WorkspaceFolderKey:
+		// js-debug's chrome defaults carry webRoot:"${workspaceFolder}", its
+		// resolver expands that from __workspaceFolder, and the fallback when the
+		// key is absent sets webRoot to "/" — so every source url maps to nothing
+		// on disk and no breakpoint binds, on a session that reports no error.
+		WorkspaceFolderKey: "__workspaceFolder",
+
+		// A browser is a coordinator-plus-child exactly as node is: the root
+		// launches Chrome and hands the page over as a child session, and the
+		// same provisional-breakpoint answers come back.
+		UsesChildSessions:     true,
+		BreakpointsBindLazily: true,
+		ProgramIsDir:          false, // a browser runs a URL, not a file
+
+		Launch: map[string]interface{}{
+			"request": "launch",
+			"type":    "pwa-chrome",
+
+			// 🔴 Deliberately NO webRoot and NO userDataDir here. js-debug's own
+			// default webRoot is "${workspaceFolder}", which now resolves because
+			// we send the folder — restating it would be a second copy of a value
+			// the adapter already owns. And its default userDataDir is a fresh
+			// temp profile: pointing at the developer's real Chrome profile would
+			// make running the debugger interfere with the browser they are using,
+			// which is not a trade a debug adapter gets to make for them.
+		},
+		InstallHint: "download js-debug-dap-v1.117.0.tar.gz from " +
+			"https://github.com/microsoft/vscode-js-debug/releases and extract it into " +
+			"~/.local/share/js-debug/ (node and a Chrome/Chromium install are also required)",
 	},
 }
 
@@ -241,6 +334,11 @@ func NewRegistry(root string) *Registry {
 }
 
 // AdapterFor finds the adapter handling a language id.
+//
+// 🔴 First-match-wins over Languages, which is why a config-only adapter must
+// leave Languages empty. A second row claiming `javascript` would be
+// unreachable at best and would silently steal every Node session at worst,
+// depending only on table order.
 func AdapterFor(lang string) (Adapter, bool) {
 	for _, a := range DefaultAdapters {
 		for _, l := range a.Languages {
@@ -250,6 +348,59 @@ func AdapterFor(lang string) (Adapter, bool) {
 		}
 	}
 	return Adapter{}, false
+}
+
+// ConfigOnly reports whether this adapter is reachable ONLY through a
+// launch.json configuration, never by opening a file.
+//
+// 🔴 DERIVED from Languages being empty rather than declared by a flag of its
+// own. A boolean would be a second thing to remember, and forgetting to set it
+// on a row that claims a language is not a compile error — it is a browser
+// adapter quietly answering for every .js file the user opens, which is
+// precisely the failure this property exists to prevent.
+func (a Adapter) ConfigOnly() bool { return len(a.Languages) == 0 }
+
+// AdapterForConfigType finds the adapter a launch.json `type` selects.
+func AdapterForConfigType(t string) (Adapter, bool) {
+	for _, a := range DefaultAdapters {
+		for _, ct := range a.ConfigTypes {
+			if ct == t {
+				return a, true
+			}
+		}
+	}
+	return Adapter{}, false
+}
+
+// KnownConfigTypes lists every launch.json type the table can serve, for the
+// message shown when a configuration names one it cannot.
+//
+// Derived from the table so it cannot drift: a hand-written list in an error
+// string is a claim that goes stale the first time a row is added, and the user
+// reading it has no way to tell.
+func KnownConfigTypes() []string {
+	var out []string
+	for _, a := range DefaultAdapters {
+		out = append(out, a.ConfigTypes...)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DebuggableLanguages lists every language id F5 can start a session for.
+//
+// It exists so the "nothing here to debug" message can be DERIVED from the
+// adapter table instead of restating it. That message said "open a Go or Python
+// file first" for the whole life of the js-debug adapter — a sentence that was
+// true when it was written and became a lie the moment a third row landed, with
+// nothing to catch it.
+func DebuggableLanguages() []string {
+	var out []string
+	for _, a := range DefaultAdapters {
+		out = append(out, a.Languages...)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Resolve turns an adapter into something executable, or nil when it is not
@@ -309,9 +460,19 @@ func findExecutable(name string) string {
 
 // Available reports which configured adapters are actually installed, so "F5
 // does nothing" has a visible answer rather than being experienced.
+//
+// 🔴 Config-only rows are omitted, and it is not cosmetic. The chrome row is
+// the SAME binary as the node row resolved through the SAME Locate hook, so
+// listing both would report "js-debug, js-debug (chrome) installed" — a status
+// line implying two installs where there is one, and one that would grow by a
+// word every time a browser or a worker variant was added. The condition is
+// derived from Adapter.ConfigOnly so nothing has to be remembered here.
 func (r *Registry) Available() []string {
 	var out []string
 	for _, a := range DefaultAdapters {
+		if a.ConfigOnly() {
+			continue
+		}
 		if r.Resolve(a) != nil {
 			out = append(out, a.Name)
 		}

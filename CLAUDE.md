@@ -245,6 +245,68 @@ with no `dapDebugServer.js` anywhere (1.131.0). `LocateJsDebug` probes for the
 FILE for exactly that reason. The standalone release tarball is the only route,
 we ship no copy of it, and `NOTICE` records that as a separate second entry.
 
+### launch.json, config-only adapters, and the key that binds nothing (fork)
+
+`internal/dap/launchjson.go` could read a project's launch.json perfectly, was
+carefully tested, and had **no non-test caller for its whole life** — the exact
+pattern this file records happening three times before, and the grep prescribed
+above is what found it. `internal/app/launchpicker.go` is that caller, and
+`internal/dap/launchselect.go` is the resolution half it needed.
+
+🔴 **A config-only adapter declares NO languages, and the emptiness IS the
+feature.** `AdapterFor` is first-match-wins over `Adapter.Languages`, and
+js-debug's node row already claims `javascript` — so a chrome row claiming it
+would answer for every `.js` file opened, launching a browser for a server-side
+script, decided by nothing but the order of `DefaultAdapters`. Selection by
+launch.json `type` is a SECOND table (`Adapter.ConfigTypes`) because the two
+questions genuinely differ: "what debugs the file on screen" has no answer for a
+browser. `Adapter.ConfigOnly()` derives the distinction from `len(Languages)==0`
+rather than from a boolean somebody has to remember to set, and `Available()` /
+`Describe()` skip those rows so one install is not reported twice.
+`TestAdapterTableCannotStealOrHide` fails on a duplicate language claim, on a
+config-only row with no config type, and on a chrome row that leaked into the
+installed list.
+
+🔴 **`__workspaceFolder` is what makes a browser breakpoint bind, and its absence
+is completely silent.** MEASURED in the installed js-debug 1.117.0 bundle: the
+chrome defaults carry `webRoot: "${workspaceFolder}"`, and the resolver expands
+it from a key it reads off the configuration —
+
+```js
+function zH(r){ return r.__workspaceFolder || (r = GH(r)), … }
+function GH(r){ let e="${workspaceFolder}"; …
+  "webRoot" in t && t.webRoot?.includes(e) && (t.webRoot = "/") … }
+```
+
+so with the key absent `GH` runs and `webRoot` becomes `"/"`. Every fetched url
+then maps to a path that is not there and **nothing binds**. Measured end to end
+against real headless Chrome: without the key the session initializes, launches,
+emits `loadedSource` and `output`, stays healthy and never stops — a 120-second
+timeout with no error anywhere; with it, the same test stops on the marked line
+in 3.3s. Node never needed it, which is why this was invisible through the whole
+js-debug stage. It is `Adapter.WorkspaceFolderKey` — **data on the row, not an
+`if` in the merge** — and `internal/dap/live_jschrome_test.go` is the only oracle
+in the repo that can fail when it is dropped. `TestChromeWireConfigIsCompleteOffline`
+is its offline half, so a machine with no browser still measures the wire config.
+
+⚠️ **Compounds are READ and REFUSED BY NAME.** The editor debugs one leaf session
+at a time (see the SCOPE note above), so a `compounds` entry cannot run — but
+omitting it from the picker made the user's own configuration simply *missing*,
+which reads as a broken picker rather than as an unsupported feature. It gets a
+row that says so. `${command:…}` and `${input:…}` are refused the same way, by
+name: they need a prompt VS Code has and this editor does not, and expanding them
+to nothing would launch something plausible and wrong.
+
+🔴 **A malformed launch.json STOPS F5 rather than falling back.** Falling through
+to the language-keyed path debugs *something* — just not what the user
+configured — so a stray comma reads as "the editor ignores my launch.json".
+There is also exactly **ONE** start path: `runDebugSession` takes a resolved
+`dap.LaunchSpec`, and F5-on-a-file goes through `dap.SpecForFile`. Two start
+functions would mean two copies of the coordinator handshake, `adoptChildSession`
+and the verbatim child configuration, and the copy is where binding quietly
+stops. `TestSpecForFileIsTheOldPathByteForByte` is what keeps the file path
+identical to what the three live oracles already measured.
+
 **Two bugs the third adapter exposed in code that already shipped:**
 
 - 🔴 `evaluateArgs.FrameID` was an int with `omitempty`, justified by a comment

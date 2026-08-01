@@ -141,6 +141,12 @@ func (e *debugThreadsEvent) When() time.Time { return e.when }
 func debugMenuGroup() []menuItemDef {
 	return []menuItemDef{
 		{shortcut: "F5", action: (*App).menuDebugStartOrContinue, enabled: (*App).canStartOrContinueDebug, labelFor: (*App).debugStartLabel},
+		// 🔴 The escape hatch for the remembered choice. F5 re-runs whatever was
+		// picked last, which is the right default and a trap without a way out:
+		// changing your mind would otherwise mean editing launch.json or
+		// restarting the editor. Enabled only where there is something to
+		// choose between — see launchpicker.go.
+		{label: "Choose debug configuration…", action: (*App).menuChooseLaunchConfig, enabled: (*App).hasLaunchConfigurations},
 		{label: "Step over", shortcut: "F10", action: (*App).menuDebugStepOver, enabled: (*App).hasStoppedDebugSession},
 		{label: "Step into", shortcut: "F11", action: (*App).menuDebugStepIn, enabled: (*App).hasStoppedDebugSession},
 		{label: "Step out", shortcut: "F12", action: (*App).menuDebugStepOut, enabled: (*App).hasStoppedDebugSession},

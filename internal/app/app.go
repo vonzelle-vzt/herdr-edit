@@ -649,6 +649,11 @@ type App struct {
 	debug  *debugSession
 	dapReg *dap.Registry
 
+	// launch is the project's .vscode/launch.json plus the configuration the
+	// user last picked out of it. See launchpicker.go — the choice is held in
+	// MEMORY ONLY and dropped whenever the file changes underneath it.
+	launch launchState
+
 	// The Debug PANEL contract (fork, Lane B stage 5). debugPub mirrors the
 	// session out to debug-session.json the way active publishes the cursor;
 	// lastDebugSeq is the highest debug-request sequence already honoured.

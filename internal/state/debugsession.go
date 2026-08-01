@@ -106,11 +106,15 @@ type DebugBreakpoint struct {
 // DebugPublisher.Set returns the 1-based wire form. Nothing else in the editor
 // constructs one, which is what keeps that safe — see toWire.
 type DebugSession struct {
-	Adapter string `json:"adapter"` // "delve", "debugpy"; "" when idle
+	Adapter string `json:"adapter"` // "delve", "debugpy", "js-debug"; "" when idle
 
-	// Config names what this session is running. The editor has no launch.json
-	// reader — F5 debugs the active file — so today this is the target the
-	// adapter was pointed at. The panel lists .vscode/launch.json itself.
+	// Config names what this session is running: the target the adapter was
+	// pointed at, which is a package directory, a script, or a URL for a
+	// browser session. The editor now reads .vscode/launch.json (see
+	// internal/app/launchpicker.go), so this may come from a configuration the
+	// user picked rather than from the file that was on screen — which is
+	// exactly why a panel must show it rather than infer it from the active
+	// file.
 	Config string `json:"config"`
 
 	State  string `json:"state"`  // one of the DebugState* constants

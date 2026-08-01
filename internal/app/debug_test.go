@@ -2383,11 +2383,16 @@ func withFakeJsDebugAdapter(t *testing.T, argv []string, lazyBind bool) {
 	t.Helper()
 	saved := dap.DefaultAdapters
 	dap.DefaultAdapters = append([]dap.Adapter{{
-		Name:                  "fake-js-debug",
-		AdapterID:             "pwa-node",
-		Locate:                func(string) *dap.Command { return &dap.Command{Argv: argv, Origin: "test"} },
-		Transport:             dap.TransportServer,
-		Languages:             []string{"javascript"},
+		Name:      "fake-js-debug",
+		AdapterID: "pwa-node",
+		Locate:    func(string) *dap.Command { return &dap.Command{Argv: argv, Origin: "test"} },
+		Transport: dap.TransportServer,
+		Languages: []string{"javascript"},
+		// A config type of its own rather than borrowing "node": the launch.json
+		// router selects on ConfigTypes, and taking the real row's spelling would
+		// make which adapter answered depend on table order in yet another place.
+		ConfigTypes:           []string{"fake-node"},
+		WorkspaceFolderKey:    "__workspaceFolder",
 		UsesChildSessions:     true,
 		BreakpointsBindLazily: lazyBind,
 		Launch:                map[string]interface{}{"request": "launch", "type": "pwa-node"},

@@ -676,3 +676,122 @@ func TestJsDebugServerInRefusesTheVSCodeShape(t *testing.T) {
 		t.Fatalf("accepted the directory %q as the adapter server", got)
 	}
 }
+
+// TestAdapterTableCannotStealOrHide is the Stage 3 oracle, and every assertion
+// is DERIVED from DefaultAdapters rather than restated against it.
+//
+// 🔴 The browser adapter is the same binary, the same Locate hook and the same
+// transport as the Node one. Only the table row differs, so the table row is
+// where it can go wrong — in two opposite directions, both silent:
+//
+//   - STEALING. AdapterFor is first-match-wins over Languages. A chrome row that
+//     claimed `javascript` would answer for every .js file the user opens, and
+//     whether it did so would depend on nothing but the order of this slice.
+//     Every Node session would launch a browser and the file on screen would
+//     never be reached.
+//   - HIDING. Available() and Describe() are what the status bar shows for "is a
+//     debugger installed". Two rows resolving to one install would report
+//     "js-debug, js-debug (chrome) installed" — a count that is wrong and that
+//     grows by a word with every variant added.
+//
+// Both are prevented by ONE property, `len(Languages) == 0`, so nothing has to
+// be remembered when the next row lands.
+func TestAdapterTableCannotStealOrHide(t *testing.T) {
+	// No two adapters may claim the same language. First-match-wins means the
+	// loser is unreachable and nothing says so.
+	claimed := map[string]string{}
+	for _, a := range DefaultAdapters {
+		for _, lang := range a.Languages {
+			if prev, dup := claimed[lang]; dup {
+				t.Errorf("%q and %q both claim language %q; AdapterFor is first-match-wins, "+
+					"so one of them silently never runs", prev, a.Name, lang)
+			}
+			claimed[lang] = a.Name
+		}
+	}
+
+	// Every config-only row must be selectable by SOMETHING, or it is dead
+	// weight nobody can reach, and must be absent from the installed list.
+	names := map[string]bool{}
+	for _, a := range DefaultAdapters {
+		if names[a.Name] {
+			t.Errorf("two adapters are both called %q; the status bar cannot tell them apart", a.Name)
+		}
+		names[a.Name] = true
+
+		if !a.ConfigOnly() {
+			continue
+		}
+		if len(a.ConfigTypes) == 0 {
+			t.Errorf("%q claims no language AND no config type — nothing can ever select it", a.Name)
+		}
+		if a.AdapterID == "" {
+			t.Errorf("%q has no AdapterID to force `type` to", a.Name)
+		}
+	}
+
+	// The row this stage exists for. It must be reachable BY CONFIG TYPE and
+	// unreachable BY LANGUAGE — that pairing is the whole feature.
+	chrome, ok := AdapterForConfigType("pwa-chrome")
+	if !ok {
+		t.Fatal("no adapter answers the launch.json type pwa-chrome; browser debugging is " +
+			"unreachable through the picker, which is its only route")
+	}
+	if !chrome.ConfigOnly() {
+		t.Errorf("the pwa-chrome adapter claims languages %v; it would steal them from js-debug",
+			chrome.Languages)
+	}
+	if chrome.AdapterID != "pwa-chrome" {
+		t.Errorf("chrome AdapterID = %q, want pwa-chrome — the standalone server dispatches on "+
+			"the canonical name, not on the `chrome` alias the VS Code extension registers",
+			chrome.AdapterID)
+	}
+	if chrome.WorkspaceFolderKey != "__workspaceFolder" {
+		t.Errorf("chrome WorkspaceFolderKey = %q; without __workspaceFolder js-debug falls back "+
+			"to webRoot=\"/\" and no browser breakpoint ever binds", chrome.WorkspaceFolderKey)
+	}
+	if !chrome.UsesChildSessions {
+		t.Error("the chrome row does not declare UsesChildSessions; js-debug's root is a " +
+			"coordinator for a browser exactly as it is for node, so breakpoints would be " +
+			"armed on the connection that debugs nothing")
+	}
+	if !chrome.BreakpointsBindLazily {
+		t.Error("the chrome row does not declare BreakpointsBindLazily; every working browser " +
+			"breakpoint would be drawn as a refused one")
+	}
+	// And opening a .js file must still reach the NODE row, not this one.
+	if a, ok := AdapterFor("javascript"); !ok || a.AdapterID != "pwa-node" {
+		t.Errorf("javascript resolves to %+v; the browser row stole the Node language", a)
+	}
+
+	// Available() is the installed-adapters list, and it must not double-count.
+	// A real fixture rather than a synthetic table: the chrome row resolves
+	// through the very same LocateJsDebug, so only a real resolution proves the
+	// exclusion is doing anything.
+	if findExecutable("node") == "" {
+		t.Skip("no node on this machine; js-debug cannot be resolved, so Available() " +
+			"could not distinguish an excluded row from an uninstalled one")
+	}
+	root := t.TempDir()
+	writeJsDebugServer(t, root, filepath.Join("node_modules", "@vscode", "js-debug", "src", "dapDebugServer.js"))
+	reg := NewRegistry(root)
+	avail := reg.Available()
+
+	seen := 0
+	for _, name := range avail {
+		if name == chrome.Name {
+			t.Errorf("Available() lists the config-only row %q; it is the same install as the "+
+				"Node row and would be reported twice", name)
+		}
+		if name == "js-debug" {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("Available() = %v; want js-debug exactly once (the fixture installs it, so a "+
+			"zero here means this assertion is measuring nothing)", avail)
+	}
+	if strings.Count(reg.Describe(), "js-debug") != 1 {
+		t.Errorf("Describe() = %q, want one mention of js-debug", reg.Describe())
+	}
+}

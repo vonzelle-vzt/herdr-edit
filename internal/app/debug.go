@@ -178,11 +178,13 @@ type debugSession struct {
 	// rather than being looked up again by whoever is drawing.
 	lazyBind bool
 
-	// config names what this session is running, for the panels that mirror it.
-	// The editor has no launch.json reader — F5 debugs the active file — so it
-	// is the target handed to the adapter, which is a Go PACKAGE directory for
-	// delve and a script for debugpy. Recorded at launch rather than derived
-	// later, because a.activeTabPtr() has moved on by the time anything asks.
+	// config names what this session is running, for the panels that mirror it:
+	// LaunchSpec.Target, i.e. the program, the url, or the configuration's name
+	// when it has neither. That is a Go PACKAGE directory for delve, a script
+	// for debugpy, and a URL for a browser session out of launch.json.
+	// Recorded at launch rather than derived later, because a.activeTabPtr()
+	// has moved on by the time anything asks — and because a launch.json
+	// configuration need have nothing to do with the active tab at all.
 	config string
 
 	// caps is what THIS adapter said it could do at initialize, refreshed if it
@@ -412,19 +414,33 @@ func (a *App) hasDebuggableTab() bool {
 func (a *App) hasDebugSession() bool { return a.debug != nil }
 
 // canStartOrContinueDebug gates the F5 row: either there is something to
-// resume, or there is a file a debugger understands.
+// resume, or there is something to start.
+//
+// 🔴 The launch.json arm is what makes a config-only adapter reachable at all.
+// Gating solely on hasDebuggableTab asks "does an adapter claim this file's
+// language", which for a browser configuration is permanently no — so a user
+// editing index.html beside a "Launch Chrome" entry would find F5 greyed out
+// and the picker, its only route, unreachable.
 func (a *App) canStartOrContinueDebug() bool {
-	return a.hasDebugSession() || a.hasDebuggableTab()
+	return a.hasDebugSession() || a.hasDebuggableTab() || a.hasLaunchConfigurations()
 }
 
 // debugStartLabel is the dynamic label for the F5 menu row, so one row reads
 // correctly in all three states rather than three rows being mostly disabled.
+//
+// 🔴 It NAMES the remembered launch.json configuration, and that is not a
+// nicety. A sticky choice with no visible indicator is a hidden mode: next
+// week's F5 would run a different program from the file on screen, with nothing
+// anywhere to explain it. Either the choice is visible or it should not persist.
 func (a *App) debugStartLabel() string {
 	if a.debug != nil && a.debug.stopped {
 		return "Continue"
 	}
 	if a.debug != nil && (a.debug.running || a.debug.starting) {
 		return "Debugging… (running)"
+	}
+	if name := a.rememberedLaunchName(); name != "" {
+		return "Start debugging (" + name + ")"
 	}
 	return "Start debugging"
 }
@@ -438,64 +454,6 @@ func (a *App) menuDebugStartOrContinue() {
 		return
 	}
 	a.menuStartDebug()
-}
-
-// menuStartDebug launches the program under a debug adapter.
-//
-// Everything after the guards happens on a goroutine and comes back as a posted
-// event — see this file's header.
-func (a *App) menuStartDebug() {
-	a.closeMenu()
-
-	if a.debug != nil && (a.debug.starting || a.debug.running) {
-		a.flash("A debug session is already running — Stop debugging first")
-		return
-	}
-	tab := a.activeTabPtr()
-	if !a.hasDebuggableTab() {
-		a.flash("Nothing here to debug — open a Go or Python file first")
-		return
-	}
-	adapter, ok := dap.AdapterFor(lsp.LanguageID(tab.Path))
-	if !ok {
-		a.flash("No debug adapter for this file type")
-		return
-	}
-	if a.dapReg == nil {
-		a.dapReg = dap.NewRegistry(a.rootDir)
-	}
-
-	// Snapshot the breakpoints HERE, on the main goroutine. Reading
-	// a.breakpoints from the background one would race the poll in Run that
-	// keeps it current.
-	bps := a.enabledBreakpoints()
-
-	// 🔴 What `program` names is per-adapter. Delve's debug mode builds a Go
-	// PACKAGE, so it has to be the enclosing directory; debugpy runs a SCRIPT, so
-	// it has to be the file. Hardcoding the directory — which is what stage 2 did,
-	// correctly, for the only adapter that existed — makes debugpy try to execute
-	// a directory.
-	program := tab.Path
-	if adapter.ProgramIsDir {
-		program = filepath.Dir(tab.Path)
-	}
-
-	// A new run starts a clean console; the previous run's output belonged to a
-	// different program state and mixing the two silently is worse than losing it.
-	a.lastDebugOutput = nil
-
-	a.debug = &debugSession{
-		adapter: adapter.Name, config: program, starting: true,
-		lazyBind: adapter.BreakpointsBindLazily,
-		bound:    map[string][]boundBreakpoint{},
-	}
-	go a.runDebugSession(adapter, program, bps)
-
-	if len(bps) == 0 {
-		a.flash("Starting " + adapter.Name + " — no breakpoints set, the program will run to completion")
-		return
-	}
-	a.flash(fmt.Sprintf("Starting %s with %d breakpoint(s)…", adapter.Name, len(bps)))
 }
 
 // enabledBreakpoints returns the breakpoints worth sending to an adapter.
@@ -525,7 +483,15 @@ func (a *App) enabledBreakpoints() []Breakpoint {
 // Blocking on the launch response before sending breakpoints deadlocks against
 // adapters that withhold it until configurationDone; skipping configurationDone
 // leaves the program parked forever. Both fail as a hang with nothing logged.
-func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpoint) {
+//
+// 🔴 It takes a resolved LaunchSpec rather than (adapter, program) so that F5 on
+// a source file and a launch.json configuration are the SAME start path. Two
+// copies of this sequence would be two copies of the coordinator handshake,
+// adoptChildSession and the verbatim child configuration — and the copy is where
+// breakpoints quietly stop binding while the session still looks healthy.
+func (a *App) runDebugSession(spec dap.LaunchSpec, bps []Breakpoint) {
+	adapter := spec.Adapter
+
 	ctx, cancel := context.WithTimeout(context.Background(), debugStartTimeout)
 	defer cancel()
 
@@ -562,12 +528,12 @@ func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpo
 		return
 	}
 
-	cfg := make(map[string]interface{}, len(adapter.Launch)+1)
-	for k, v := range adapter.Launch {
-		cfg[k] = v
-	}
-	cfg["program"] = program
-	if _, err := client.Launch(cfg); err != nil {
+	// 🔴 launchOrAttach, not Launch. This call site sent `launch` unconditionally,
+	// which is correct for every configuration the editor could previously
+	// produce and WRONG for the first `"request": "attach"` a user writes: it
+	// would START a second copy of the process they meant to attach to, and both
+	// would then be running. The child path already knew this; the root did not.
+	if _, err := launchOrAttach(client, spec.Request, spec.Args); err != nil {
 		client.Stop()
 		fail(err)
 		return
@@ -698,7 +664,7 @@ func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *
 	// __pendingTargetId naming the process the root ALREADY started, and adding
 	// program back asks it to launch a second copy — so the user would step
 	// through one process while another ran unobserved.
-	if _, err := launchOrAttach(leaf, cs); err != nil {
+	if _, err := launchOrAttach(leaf, cs.Request, cs.Configuration); err != nil {
 		leaf.Stop()
 		return nil, dap.Capabilities{}, err
 	}
@@ -709,15 +675,21 @@ func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *
 	return leaf, caps, nil
 }
 
-// launchOrAttach starts a child session the way its parent asked for it. A
-// coordinator that spawned a process wants `launch`; one that found an existing
-// target wants `attach`, and sending the wrong verb is refused rather than
-// silently reinterpreted.
-func launchOrAttach(client *dap.Client, cs dap.ChildSession) (<-chan dap.Response, error) {
-	if cs.Request == "attach" {
-		return client.Attach(cs.Configuration)
+// launchOrAttach sends a configuration the way it asked to be sent: `attach` to
+// join a process that already exists, `launch` to start one.
+//
+// 🔴 BOTH start paths go through this, and only the child's did before. The root
+// called client.Launch unconditionally, so a `"request": "attach"` configuration
+// out of launch.json would have STARTED the program it was written to attach to
+// — leaving the user stepping through a second copy while the one they cared
+// about ran on untouched. Nothing in the protocol reports that as an error;
+// `attach` and `launch` are both valid requests, so the adapter simply does what
+// it was told.
+func launchOrAttach(client *dap.Client, request string, cfg map[string]interface{}) (<-chan dap.Response, error) {
+	if request == "attach" {
+		return client.Attach(cfg)
 	}
-	return client.Launch(cs.Configuration)
+	return client.Launch(cfg)
 }
 
 // pushBreakpoints sends each file's COMPLETE breakpoint set and reports what the

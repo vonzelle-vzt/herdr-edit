@@ -24,13 +24,6 @@
 // use one.
 package dap
 
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
-)
-
 // LaunchConfig is one entry from a launch.json "configurations" array.
 type LaunchConfig struct {
 	// Name is what the user sees in the picker.
@@ -50,45 +43,36 @@ type LaunchConfig struct {
 // where a user who has ever debugged this project already has them.
 const LaunchJSONPath = ".vscode/launch.json"
 
-// LoadLaunchConfigs reads and parses a project's launch.json.
+// LoadLaunchConfigs reads a project's launch.json and returns only its
+// `configurations` array.
+//
+// 🔴 A THIN WRAPPER over LoadLaunchFile, not a second reader. The file is
+// parsed in exactly one place (launchselect.go) so that "what is in this
+// launch.json" can never have two answers — a project whose compounds were
+// visible to one caller and invisible to another is precisely how a
+// configuration goes missing from a picker with nothing to explain it.
 //
 // A missing file is not an error — most projects have none — so it returns an
 // empty slice and no error. A malformed one IS an error: the user wrote
 // something they expect to be used, and silently ignoring it would leave them
 // wondering why their configuration does nothing.
 func LoadLaunchConfigs(root string) ([]LaunchConfig, error) {
-	path := filepath.Join(root, filepath.FromSlash(LaunchJSONPath))
-	data, err := os.ReadFile(path)
+	f, err := LoadLaunchFile(root)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	return ParseLaunchJSON(data)
+	return f.Configurations, nil
 }
 
-// ParseLaunchJSON parses launch.json content that has already been read.
-// Separate from LoadLaunchConfigs so the parsing is testable without a
-// filesystem.
+// ParseLaunchJSON parses launch.json content that has already been read,
+// returning only its configurations. The other thin wrapper — see
+// LoadLaunchConfigs.
 func ParseLaunchJSON(data []byte) ([]LaunchConfig, error) {
-	var doc struct {
-		Version        string                   `json:"version"`
-		Configurations []map[string]interface{} `json:"configurations"`
+	f, err := ParseLaunchFile(data)
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(StripJSONC(data), &doc); err != nil {
-		return nil, fmt.Errorf("launch.json: %w", err)
-	}
-	out := make([]LaunchConfig, 0, len(doc.Configurations))
-	for _, cfg := range doc.Configurations {
-		out = append(out, LaunchConfig{
-			Name:    stringField(cfg, "name"),
-			Type:    stringField(cfg, "type"),
-			Request: stringField(cfg, "request"),
-			Args:    cfg,
-		})
-	}
-	return out, nil
+	return f.Configurations, nil
 }
 
 // stringField reads a string out of a decoded JSON object, tolerating both a

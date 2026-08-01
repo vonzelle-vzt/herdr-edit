@@ -160,10 +160,65 @@ jobs:
           test -f "$HOME/.local/share/js-debug/js-debug/src/dapDebugServer.js" \
             || { echo "dapDebugServer.js is not where LocateJsDebug looks — the live js-debug oracles would fail under HERDR_REQUIRE_DAP=1" >&2; ls -R "$HOME/.local/share/js-debug" | head -50; exit 1; }
 
+      # The FOURTH adapter row, and the first that is config-only.
+      # internal/dap/live_jschrome_test.go drives a real headless Chrome against a page served
+      # from a stdlib httptest.Server, and it is the ONLY oracle in the repo that can fail when
+      # `__workspaceFolder` is dropped from a browser launch configuration.
+      #
+      # 🔴 That is not a theoretical gap. MEASURED locally against js-debug 1.117.0: with the key
+      # absent the session initializes, launches Chrome, emits `loadedSource` and `output` events
+      # and stays perfectly healthy — and NO BREAKPOINT EVER BINDS, because js-debug's fallback
+      # sets webRoot to "/". The run failed on the 120-second timeout with no error anywhere.
+      # With the key present the same test stops on the marked line in 3.3 seconds. No offline
+      # test can tell those two apart, which is the whole reason this step exists.
+      #
+      # Chrome is resolved rather than assumed: both runner images normally ship Google Chrome,
+      # but "normally" is not a measurement, so this installs one when the image has none and
+      # FAILS when it still cannot find one. A missing browser would otherwise be a skip, and a
+      # skip reads as a pass in the summary — the exact failure the anti-skip gate exists for.
+      # HERDR_CHROME is exported so the oracle uses the binary this step verified rather than
+      # searching again and possibly finding a different one.
+      - name: Install Chrome (for the live browser DAP oracle)
+        shell: bash
+        run: |
+          set -uo pipefail
+          find_chrome() {
+            if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+              echo "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"; return 0
+            fi
+            for n in google-chrome google-chrome-stable chromium chromium-browser; do
+              p="$(command -v "$n" 2>/dev/null)" && [ -n "$p" ] && { echo "$p"; return 0; }
+            done
+            return 1
+          }
+          if ! CHROME="$(find_chrome)"; then
+            echo "no browser in the runner image; installing one"
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              brew install --cask google-chrome || true
+            else
+              sudo apt-get update -qq || true
+              sudo apt-get install -y -qq google-chrome-stable \
+                || sudo apt-get install -y -qq chromium-browser \
+                || sudo snap install chromium || true
+            fi
+            CHROME="$(find_chrome)" || true
+          fi
+          if [ -z "${CHROME:-}" ]; then
+            echo "no Chrome or Chromium could be resolved — the live browser oracle would fail under HERDR_REQUIRE_DAP=1" >&2
+            exit 1
+          fi
+          echo "HERDR_CHROME=$CHROME" >> "$GITHUB_ENV"
+
+      - name: Verify Chrome is reachable
+        shell: bash
+        run: |
+          test -x "$HERDR_CHROME" || { echo "HERDR_CHROME=$HERDR_CHROME is not executable" >&2; exit 1; }
+          "$HERDR_CHROME" --version || { echo "the resolved browser will not run" >&2; exit 1; }
+
       - name: Test
         env:
-          # Fail rather than skip if either live oracle cannot run. Both binaries
-          # are installed above, so a skip here means the install broke.
+          # Fail rather than skip if any live oracle cannot run. Every dependency is
+          # installed above, so a skip here means an install broke.
           HERDR_REQUIRE_DAP: "1"
         run: go test -race -coverprofile=coverage.out ./...
 
