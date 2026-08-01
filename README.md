@@ -25,7 +25,7 @@ the language intelligence and the responsive layout on top. See
 
 This is the editor half of a two-part stack. The other half is
 [**herdr-extensions**](https://github.com/vonzelle-vzt/herdr-extensions) — original work, no upstream —
-which turns a herdr session into an IDE: eleven panels, the layout, the keybindings, a live app
+which turns a herdr session into an IDE: 15 panels, the layout, the keybindings, a live app
 preview, screenshot paste, and the installer that puts this editor in place.
 
 ```
@@ -83,6 +83,51 @@ diagnostic reported inline at the end of the offending line:
  Opened routes.go
 ```
 
+### Real captures
+
+<p align="center">
+  <img src="docs/assets/conflict-resolution.png"
+       alt="A real merge conflict in herdr-edit: green tint on the 'ours' body, blue tint on the 'theirs' body, conflict gutter glyphs, live gopls diagnostics inline reading 'expected statement, found &lt;&lt;', and lsp:gopls in the status bar."
+       width="100%">
+</p>
+
+Not a mock: `gopls` is running against the file *while it is mid-conflict* and is already flagging
+the raw conflict markers as a syntax error, inline, at the exact column.
+
+<p align="center">
+  <img src="docs/assets/conflict-actions.png"
+       alt="The command palette filtered to 'conflict', listing all seven conflict-resolution actions."
+       width="100%">
+</p>
+
+`Esc k`, type `conflict` — every resolution action is a palette entry, not a chord you have to
+remember.
+
+<p align="center">
+  <img src="docs/assets/workspace-search.png"
+       alt="Esc F workspace search results shown as a jumpable list, with a header stating the active options and match counts."
+       width="100%">
+</p>
+
+The results list is itself a jumpable source — `Esc e` on any row opens that file at that line.
+
+<p align="center">
+  <img src="docs/assets/project-start.png"
+       alt="The editor's start page and file tree, showing a 'U' conflict status marker next to src/payments.go."
+       width="100%">
+</p>
+
+The tree marks the conflicted file `U` from the start page, before you have opened it.
+
+<p align="center">
+  <img src="docs/assets/debug-configurations.png"
+       alt="The command palette filtered to 'debug', showing 'Start debugging  F5', 'Choose debug configuration…' and 'Debug actions  Esc 5'."
+       width="100%">
+</p>
+
+Debugging surfaces through the same palette as everything else — `F5` starts the remembered
+configuration, and the picker is one entry away.
+
 ## Why this fork exists
 
 Everything a VS Code user misses in a terminal is a shell command away — file tree, git, search,
@@ -120,6 +165,7 @@ embeds standalone Monaco with no LSP at all.
 | **Inline git blame** | `Esc b`. Author, coarse relative age and subject, dimmed at end-of-line. Only the cursor's line is blamed — `git blame` on a whole file is linear in history and would run on every scroll. Diagnostics win the end of the line when both want it. |
 | **Go to line, select all** | `Esc g`, `Esc a`. `SelectAll` had been complete and unit-tested in `internal/editor` with **zero** non-test callers; only the wiring was missing. |
 | **`--open-at`, the reverse contract** | `herdr-edit --open-at path:line[:col]` asks an **already-running** editor to jump there. `active.json` flows editor → panels; this flows panels → editor, which is what turns a read-only review into an edit: the Review panel hands you a line from the agent's diff and you land on it with a language server attached. |
+| **Merge-conflict detection and resolution** | A conflicted file opens with the `ours` and `theirs` bodies tinted, conflict-marker gutter glyphs, and the language server still running *through* the markers — so a syntax error inside a half-resolved conflict is flagged the same as anywhere else. Seven resolution actions (take ours, take theirs, take both, …) are reachable from the `≡` menu and the command palette; the file tree marks a conflicted file `U` before you have opened it. |
 | **A diff view** | `Esc o` opens the active file's diff as a real tab, and pressing it again flips the baseline between your branch's **merge-base** and **HEAD** — "what does this branch change" versus "what have I not committed", which are different questions and the first is the one you ask of an agent's work. Built as a *synthetic tab* rather than a new render mode: word wrap already taught this codebase what a second geometry path costs, so a tab whose buffer happens to hold diff text inherits scrolling, search, selection and mouse hit-testing for free, and refuses to save. |
 | **Rename and find-references** | `Esc y` renames a symbol project-wide; `Esc j` lists every use. Rename decodes **both** WorkspaceEdit wire shapes — servers send either `changes` or `documentChanges`, and handling one makes rename silently do nothing against half of them. Edits apply back-to-front per file, because changing text length at one position invalidates every position after it. |
 | **Bookmarks** | `Esc m` pins a `file:line`, `Esc '` cycles them. A 401-repo sweep of herdr's marketplace found **no plugin that bookmarks a place in the code** — the "harpoon" ports mark panes and workspaces, which is navigation between windows, not between lines. |
@@ -130,8 +176,10 @@ embeds standalone Monaco with no LSP at all.
 | **Go to symbol in workspace** | `Esc I`, the workspace-wide sibling of `Esc i`. The one request that cannot resolve a single server from a file path, so it fans out to every running server and merges. Servers start lazily on the first file of a matching language, so before you open one the fan-out would return nothing — indistinguishable from "your symbol does not exist" — and the editor now says so instead of showing an empty picker. |
 | **Jump from any generated list** | `Esc e` opens whatever `path:line:col` the cursor is sitting on, in a diff, a references list, a search result or a problems list. Find-references used to print exactly such a list and then tell you to press a key that takes no line number, so the `:line:col` was decorative. A feature that produces a list needs a test that *consumes* it the way a user would. |
 | **Document highlight** | Other occurrences of the symbol under the cursor tint as you move, the way VS Code does constantly. Suppressed on wrapped tabs, during a selection and while the find bar is open, and memoized — `draw()` repaints on every event including mouse motion. |
-| **Breakpoints that follow your edits** | `Esc 9` toggles one, `Esc 5` lists them; they persist across sessions and export as `break file:line` for dlv, pdb or gdb. Insert a line above a breakpoint and it moves down with it; delete its lines and it dies. That tracking is why the debugger belongs *inside* the editor — an external process cannot do it without being told about every keystroke. |
+| **Breakpoints that follow your edits** | `Esc 9` toggles one, `Esc 5` lists them; they persist across sessions and export as `break file:line` for dlv, pdb or gdb. Insert a line above a breakpoint and it moves down with it; delete its lines and it dies. That tracking is why the debugger belongs *inside* the editor — an external process cannot do it without being told about every keystroke. Conditions and logpoints are supported; a breakpoint the adapter could not bind to an executable line shows pending rather than claiming it is armed. |
+| **A real debugger, launched from `F5`** | `internal/dap` resolves a project's `.vscode/launch.json` (JSONC) through a picker and drives an adapter over one of three transports: **delve** (Go) over a Unix socket, **debugpy** (Python) over stdio, and **js-debug** over a TCP server this editor dials — the same server that backs VS Code's own JS/**browser** (`pwa-chrome`) debugging. Stepping, the call stack, threads, variables, evaluate and a debug console are all reachable from the Debug view; herdr-extensions' Debug panel mirrors the session and drives it from outside without ever speaking DAP itself. Scope is **one active leaf session at a time** — a second `startDebugging` request (a worker thread, a second `next dev` target) is refused out loud rather than silently replacing what is on screen, so a real Next.js project debugs only its first target. TypeScript is not claimed here: js-debug's own `Languages` table omits it, because no oracle here proves a breakpoint binds through a source map. |
 | **A language-server status you can see** | The status bar names the servers actually running, and the menu explains the full picture. "Why are there no squiggles" deserves an answer on screen rather than an investigation. |
+| **Per-language editing behaviour for 69 languages** | Auto-close pairs, comment markers and folding markers are keyed by language id, generated from the `language-configuration.json` files of VS Code's own MIT-licensed built-in extensions (`internal/langconf/gen`, extracted from `microsoft/vscode` 1.131.0 — see `NOTICE`). An uncovered file type falls back to the same package-level pairs upstream always used, so this only adds coverage, never removes it. |
 | **Persistent undo** | History used to die with the process. |
 | **Active-file publishing** | A debounced `{file,line,col,root}` snapshot other tools can read. |
 
@@ -163,6 +211,7 @@ primary surface, because macOS Terminal and tmux frequently swallow right-click.
 | `Esc` `t` | Show/hide the file tree | |
 | `Esc` `/` | Toggle line comment | marker chosen by file type |
 | `Esc` `f` | **Find** in file | |
+| `Esc` `F` | **Search the whole project** | results open as a list; `Esc e` jumps to one |
 | `Esc` `p` | **Find file** in project | fuzzy, background-indexed |
 | `Esc` `h` | **Hover** — types and docs at the cursor | needs a language server |
 | `Esc` `d` | **Go to definition** | needs a language server |
@@ -175,11 +224,32 @@ primary surface, because macOS Terminal and tmux frequently swallow right-click.
 | `Esc` `o` | **Open changes** — the file's diff as a tab | press again to flip merge-base ⟷ HEAD |
 | `Esc` `j` | **Find references** | every use of the symbol, as a list you can open from |
 | `Esc` `i` | **Go to symbol** — the file's outline | nested symbols indented |
+| `Esc` `I` | **Go to symbol in the workspace** | asks every running language server and merges |
 | `Esc` `l` | **Fix at cursor** — code actions | the lightbulb, as in VS Code |
-| `Esc` `e` | **Jump to source line** from a diff | put the cursor on any diff row |
+| `Esc` `e` | **Go to the location under the cursor** | works on a diff, a search result, a references list or a problems list — anything holding `path:line:col` |
 | `Esc` `y` | **Rename symbol** | project-wide, applied across files on disk |
 | `Esc` `m` | **Toggle bookmark** on this line | |
 | `Esc` `'` | **Next bookmark** | cycles, wrapping |
+| `Esc` `;` | **Problems** — every reported diagnostic | a jumpable list; the header says whose diagnostics they are |
+| `Esc` `.` / `,` | **Next / previous problem** | wraps; also `F8` / `Shift+F8` |
+| `Esc` `9` | **Toggle breakpoint** | also `F9`; survives edits above it and closing the editor |
+| `Esc` `5` | **Debug actions** | stepping, stack, threads, variables, evaluate, console |
+
+### Debugging
+
+F-keys where VS Code puts them. All unshifted: shifted F-keys need `modifyOtherKeys` or a specific
+terminfo entry and are unreliable through a multiplexer, so nothing depends on one.
+
+| Key | Action | |
+| --- | --- | --- |
+| `F5` | **Start debugging**, or continue when stopped | asks which `launch.json` configuration when there is more than one |
+| `F6` | Pause | |
+| `F9` | Toggle breakpoint | same as `Esc` `9` |
+| `F10` / `F11` / `F12` | Step **over** / **into** / **out** | |
+| `F8` / `Shift+F8` | Next / previous problem | |
+
+Everything here is also in the `≡` menu and the command palette, so no feature depends on an F-key
+arriving through your terminal and your multiplexer.
 
 Deliberately unbound: `c` / `x` / `v`, because the terminal's own copy and paste already own that
 path; and rename / delete / revert, which are destructive enough to want the menu's confirm dialog.
@@ -318,6 +388,52 @@ common way an LSP setup appears to "just not work".
 
 ---
 
+## Debugging
+
+`F5` resolves a project's `.vscode/launch.json` (JSONC) through a picker and starts one of three
+adapters, chosen by `type`: **delve** for Go, **debugpy** for Python, and **js-debug** for Node and
+for the browser (`pwa-chrome`). Each speaks a different transport — a socket this editor listens on,
+stdio, and a TCP server this editor dials — which is why `internal/dap` is a sibling of the LSP
+client rather than sharing its transport code.
+
+The editor is the only thing that speaks DAP. herdr-extensions' Debug panel never dials an adapter
+itself — it mirrors the session through a file and drives it through another one:
+
+```
+ editor ⇄ adapter                      editor  →  debug-session.json  →  Debug panel
+ ┌────────────┐                        (session state, stop location,
+ │            │  Unix socket           call stack, breakpoints)
+ │            │◄──────────────► delve
+ │ herdr-edit │
+ │ internal/  │  stdio
+ │   dap      │◄──────────────► debugpy         Debug panel  →  debug-request.json  →  editor
+ │            │                                 (start / continue / step / breakpoint toggle)
+ │            │  TCP (we dial)
+ │            │◄──────────────► js-debug ◄─┐
+ └────────────┘                            │ startDebugging (reverse request)
+                                     child session — the ONLY place
+                                     breakpoints actually bind
+```
+
+Why the split: a breakpoint has to move when you insert a line above it, and only the process
+holding the buffer can do that — so the DAP client lives in the editor, and the panel is a remote
+control, never a second DAP client. A debug session the editor stopped publishing more than a minute
+ago is reported by the panel as **stale**, not as a program still stopped somewhere, because a killed
+editor never gets to write "idle" for itself.
+
+**Scope is one active leaf session.** js-debug's root session is a coordinator, not a debuggee — it
+launches the program and then asks, via a `startDebugging` reverse request, to open a *second*
+session that is the one actually running. A second `startDebugging` while a session is already
+active (a worker thread, a second `next dev` target) is refused out loud rather than silently
+dropped or silently replacing what is on screen, so a real Next.js project debugs only its first
+target — a deliberate cut, not an oversight.
+
+**Not claimed:** TypeScript debugging. js-debug's own adapter table omits it from `Languages` on
+purpose, because nothing here proves a breakpoint binds through a source map rather than landing on
+the compiled output.
+
+---
+
 ## Configuration
 
 `~/.config/spiceedit/config.json` (or `$XDG_CONFIG_HOME/spiceedit/`):
@@ -371,6 +487,11 @@ text, and then every column past it is off. Conversion happens at the protocol b
 **A diagnostic `code` may be a string *or* a number.** The spec allows both, and decoding into a
 concrete type makes every server that chose the other one fail to parse — dropping the *whole*
 diagnostics payload, not just the code field.
+
+**On Linux, a debugged program's own stdout does not reach the debug console.** Measured on CI: a
+debugpy session initializes, runs, streams other output events and terminates cleanly, but the
+debuggee's `print()` never arrives as a DAP `output` event on Linux — the identical configuration
+works on macOS. The session itself is healthy; only that one stream is missing.
 
 **A publish replaces, it never merges.** Servers send the complete list for a document every time,
 including an empty list once everything is fixed. Merging would leave repaired problems underlined

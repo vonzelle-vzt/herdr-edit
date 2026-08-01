@@ -2,18 +2,46 @@
 
 ## Project Structure & Module Organization
 
-SpiceEdit is a Go terminal editor module at `github.com/cloudmanic/spice-edit`; the CLI entry point is `main.go` and the binary is `herdr-edit`. Core packages live under `internal/`: `app` owns the event loop and rendering, `editor` owns buffers/tabs/editing behavior, `filetree` manages the sidebar tree, and supporting packages cover clipboard, formatting, icons, config, theme, finder, and versioning. Tests sit beside source files as `*_test.go`. Release packaging includes `install.sh` and samples under `samples/`. (Upstream's `website/` Hugo site and `Formula/spice-edit.rb` were removed in this fork — they belong to cloudmanic/spice-edit.)
+herdr-edit is a Go terminal editor. The module path is still `github.com/cloudmanic/spice-edit` — kept from upstream so merges stay clean — but the repo is `vonzelle-vzt/herdr-edit` and the binary is `herdr-edit`. The CLI entry point is `main.go`.
+
+Packages under `internal/`:
+
+| package | owns |
+| --- | --- |
+| `app` | the event loop, layout, every modal, and all fork feature wiring |
+| `editor` | buffers, tabs, rendering, undo, find, word wrap, marks, merge conflicts |
+| `filetree` | the sidebar tree, gitignore filtering, identity-preserving refresh |
+| `lsp` | the hand-rolled LSP client: protocol, stdio transport, server registry |
+| `dap` | the debug-adapter client — a deliberate SIBLING of `lsp`'s transport, not shared |
+| `langconf` | per-language editing behaviour, GENERATED from VS Code's MIT data (see NOTICE) |
+| `toolpath` | where developer tools actually live when PATH cannot be trusted |
+| `search` | workspace search, reusing `editor.Matches` so there is one matcher |
+| `state` | the `active.json` / `open-request.json` / `debug-session.json` contracts |
+| `finder` | the background file index and fuzzy scorer |
+| supporting | `clipboard`, `customactions`, `format`, `icons`, `spiceconfig`, `theme`, `version` |
+
+Tests sit beside source files as `*_test.go`, in the SAME package. (Upstream's `website/` Hugo site and `Formula/spice-edit.rb` were removed in this fork — they belong to cloudmanic/spice-edit.)
 
 ## Build, Test, and Development Commands
 
 - `make run`: run the editor in the current directory with `go run .`.
-- `make build`: compile `./bin/spiceedit`.
+- `make build`: compile `./bin/herdr-edit`.
 - `make build-linux`: cross-compile a static `linux/amd64` binary.
 - `make test`: run `go test -race ./...`; use before PRs.
 - `make test-short`: quick `go test -short ./...` loop while iterating.
 - `make coverage`: write `coverage.out` and `coverage.html`.
 - `make tidy`: sync `go.mod` and `go.sum`.
-- `make site-install`, `make site-dev`, `make site-build`: manage website deps, local Hugo, and production builds.
+- `make install`: install `./bin/herdr-edit` into `/usr/local/bin`.
+
+There are no `site-*` targets — the Hugo site left with the fork.
+
+🔴 The live oracles are not part of `make test`'s default reachability: they `t.Skip` when their
+binary is absent, and a skip reads as a pass. Run them deliberately, with the anti-skip gate on:
+
+```sh
+HERDR_REQUIRE_DAP=1 go test ./internal/dap -run TestLive   # delve, debugpy, js-debug, Chrome
+go test ./internal/lsp -run TestLive                        # a real gopls
+```
 
 ## Coding Style & Naming Conventions
 
