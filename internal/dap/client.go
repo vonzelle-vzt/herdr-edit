@@ -74,6 +74,13 @@ const writeTimeout = 5 * time.Second
 // the socket underneath it.
 const disconnectTimeout = 2 * time.Second
 
+// stderrDrainGrace bounds how long the read loop waits for the adapter process
+// to be reaped before reporting its death. cmd.Wait() waits for the stderr
+// copying, so this is what makes "adapter said: ..." reliable rather than
+// racy — but it is bounded, because a death reported without its reason still
+// beats a death never reported.
+const stderrDrainGrace = 500 * time.Millisecond
+
 // Handlers are the callbacks a Client delivers adapter traffic through.
 //
 // 🔴 These are constructor PARAMETERS, not settable fields — and that is the
@@ -1479,6 +1486,23 @@ func (c *Client) handleDisconnect(err error) {
 	c.seenEvents[EventTerminated] = true
 	closed := c.closed
 	c.mu.Unlock()
+	// 🔴 Read stderr AFTER the process has been reaped, not before.
+	//
+	// cmd.Wait() waits for the stderr copying it owns, so once it returns the
+	// ring holds every line the adapter wrote. Capturing LastStderr() at the top
+	// of this path raced that: stdout reaches EOF the instant the adapter exits,
+	// so the read loop could get here before the drain goroutine had appended the
+	// one line explaining WHY it died — and then reported a death with no reason,
+	// intermittently and only under load. Bounded, because a wedged grandchild
+	// holding the inherited pipe must not stop the editor from reporting the
+	// death at all.
+	if c.exited != nil {
+		select {
+		case err := <-c.exited:
+			c.exited <- err // put it back: Stop() reads this too
+		case <-time.After(stderrDrainGrace):
+		}
+	}
 	stderr := c.LastStderr()
 
 	// Unblock every waiting caller so a dead adapter surfaces as an error
