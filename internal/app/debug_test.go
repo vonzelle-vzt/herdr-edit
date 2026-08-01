@@ -308,7 +308,7 @@ func TestBoundFromAnswersMatchesPositionally(t *testing.T) {
 		{Verified: false, Message: "no statement"},
 		{ID: 3, Verified: true, Line: 21}, // 1-based 21 -> buffer 20, unmoved
 	}
-	got := boundFromAnswers(asked, answers)
+	got := boundFromAnswers(asked, answers, false)
 	if len(got) != 3 {
 		t.Fatalf("got %d entries, want 3", len(got))
 	}
@@ -328,9 +328,25 @@ func TestBoundFromAnswersMatchesPositionally(t *testing.T) {
 
 	// A short answer array (an adapter returning fewer entries than asked) must
 	// not panic or mis-pair.
-	short := boundFromAnswers(asked, []dap.Breakpoint{{Verified: true, Line: 5}})
+	short := boundFromAnswers(asked, []dap.Breakpoint{{Verified: true, Line: 5}}, false)
 	if len(short) != 3 || short[1].Verified || short[2].Verified {
 		t.Errorf("short answer produced %+v", short)
+	}
+
+	// An adapter that binds lazily turns the SAME unverified answer into a
+	// pending one, and nothing else about the pairing changes.
+	lazy := boundFromAnswers(asked, answers, true)
+	if lazy[1].Verified {
+		t.Errorf("lazy binding must not fake verification: %+v", lazy[1])
+	}
+	if !lazy[1].Pending || !lazy[1].WillBind() {
+		t.Errorf("an unverified answer from a lazily-binding adapter is PENDING, not refused: %+v", lazy[1])
+	}
+	if lazy[0].Pending {
+		t.Errorf("a verified answer must never be marked pending: %+v", lazy[0])
+	}
+	if got[1].Pending || got[1].WillBind() {
+		t.Errorf("delve's unverified answer is a refusal and must stay one: %+v", got[1])
 	}
 }
 
@@ -1376,7 +1392,7 @@ func TestConditionRefusedWhenAdapterCannot(t *testing.T) {
 	}
 	ctx, cancel := contextWithTimeout(2 * time.Second)
 	defer cancel()
-	_, notes := pushBreakpoints(ctx, client, dap.Capabilities{}, "fake", groups)
+	_, notes := pushBreakpoints(ctx, client, breakpointPolicy{adapter: "fake"}, groups)
 
 	calls := fake2.setBreakpointCalls()
 	if len(calls) != 1 {
@@ -1401,9 +1417,9 @@ func TestConditionRefusedWhenAdapterCannot(t *testing.T) {
 	// Without this half, an implementation that never sends a condition at all
 	// would pass everything above.
 	client3, fake3 := newRecordingAdapter(t)
-	_, notes = pushBreakpoints(ctx, client3, dap.Capabilities{
+	_, notes = pushBreakpoints(ctx, client3, breakpointPolicy{adapter: "fake", caps: dap.Capabilities{
 		SupportsConditionalBreakpoints: true, SupportsLogPoints: true,
-	}, "fake", groups)
+	}}, groups)
 	if len(notes) != 0 {
 		t.Errorf("notes = %v for an adapter that supports both", notes)
 	}
@@ -2103,4 +2119,514 @@ func TestPublishDebugSurvivesNoPublisher(t *testing.T) {
 	a.debugPub = nil
 	a.publishDebug()
 	a.publishDebugIdle()
+}
+
+// -----------------------------------------------------------------------------
+// Child sessions: the coordinator/leaf split (js-debug)
+// -----------------------------------------------------------------------------
+
+// fakeCoordinator is a TCP adapter SERVER shaped like js-debug: the first
+// connection is a coordinator that debugs nothing and asks us to open a second,
+// and the second is the leaf the debuggee lives in. Every request on every
+// connection is recorded, tagged with which connection carried it.
+//
+// 🔴 A single-connection fake cannot express the bug this exists to catch.
+// Arming the coordinator is not an error at any layer — the root accepts
+// setBreakpoints and answers plausibly — so the ONLY evidence that breakpoints
+// went to the wrong place is which socket they came down. That is why this is a
+// real listener over real TCP through the real transport rather than a
+// net.Pipe: the second connection IS the thing under test.
+type fakeCoordinator struct {
+	t  *testing.T
+	ln net.Listener
+
+	mu    sync.Mutex
+	conns []*fakeCoordConn
+}
+
+// fakeCoordConn is one accepted connection and what the app said on it.
+type fakeCoordConn struct {
+	idx  int
+	mu   sync.Mutex
+	reqs []recordedRequest
+}
+
+// requests returns what this connection carried, oldest first.
+func (c *fakeCoordConn) requests() []recordedRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]recordedRequest(nil), c.reqs...)
+}
+
+// setBreakpointLines returns every line asked for on this connection, across all
+// setBreakpoints calls. The LINES rather than the call count, because the
+// coordinator legitimately receives a whole-file CLEAR (an empty list) and the
+// question is whether it was ever armed.
+func (c *fakeCoordConn) setBreakpointLines() []int {
+	var out []int
+	for _, r := range c.requests() {
+		if r.Command != "setBreakpoints" {
+			continue
+		}
+		for _, bp := range wireBreakpoints(r) {
+			if line, ok := bp["line"].(float64); ok {
+				out = append(out, int(line))
+			}
+		}
+	}
+	return out
+}
+
+// commands lists the commands this connection carried, for failure messages.
+func (c *fakeCoordConn) commands() []string {
+	reqs := c.requests()
+	out := make([]string, len(reqs))
+	for i, r := range reqs {
+		out[i] = r.Command
+	}
+	return out
+}
+
+// newFakeCoordinator starts the listener and returns it with the argv an adapter
+// should be given to reach it.
+//
+// The argv echoes the readiness line startServerCommand parses and then sleeps,
+// standing in for the adapter process. That keeps the REAL transport in the test
+// — spawn, parse the announced address, dial — while the server itself stays
+// in-process where its traffic can be read.
+func newFakeCoordinator(t *testing.T) (*fakeCoordinator, []string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeCoordinator{t: t, ln: ln}
+	t.Cleanup(func() { _ = ln.Close() })
+	go s.accept()
+
+	argv := []string{"/bin/sh", "-c",
+		fmt.Sprintf("echo 'Debug server listening at %s'; sleep 300", ln.Addr().String())}
+	return s, argv
+}
+
+// accept takes connections until the listener closes, serving each one.
+func (s *fakeCoordinator) accept() {
+	for {
+		conn, err := s.ln.Accept()
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		k := &fakeCoordConn{idx: len(s.conns)}
+		s.conns = append(s.conns, k)
+		s.mu.Unlock()
+		go s.serve(conn, k)
+	}
+}
+
+// conn returns the idx'th accepted connection, or nil when there is none yet.
+func (s *fakeCoordinator) conn(idx int) *fakeCoordConn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx >= len(s.conns) {
+		return nil
+	}
+	return s.conns[idx]
+}
+
+// connCount is how many connections have been accepted.
+func (s *fakeCoordinator) connCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
+// serve answers one connection, playing coordinator on the first and leaf on
+// every later one.
+//
+// 🔴 The ORDER mirrors what js-debug actually does, because the app's sequence
+// is shaped around it. `initialized` is sent BEFORE the launch response, and the
+// coordinator's startDebugging is withheld until its configurationDone arrives —
+// so an implementation that waits for the child before configuring the root
+// hangs here exactly as it would against the real adapter.
+func (s *fakeCoordinator) serve(conn net.Conn, k *fakeCoordConn) {
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	seq := 0
+	send := func(v interface{}) bool {
+		out, err := json.Marshal(v)
+		if err != nil {
+			return false
+		}
+		if _, err := fmt.Fprintf(conn, "Content-Length: %d\r\n\r\n", len(out)); err != nil {
+			return false
+		}
+		_, err = conn.Write(out)
+		return err == nil
+	}
+	respond := func(req dap.Request, body interface{}) bool {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return false
+		}
+		seq++
+		return send(dap.Response{
+			Seq: seq, Type: dap.TypeResponse, RequestSeq: req.Seq,
+			Success: true, Command: req.Command, Body: raw,
+		})
+	}
+	event := func(name string, body interface{}) bool {
+		var raw json.RawMessage
+		if body != nil {
+			b, err := json.Marshal(body)
+			if err != nil {
+				return false
+			}
+			raw = b
+		}
+		seq++
+		return send(dap.Event{Seq: seq, Type: dap.TypeEvent, Event: name, Body: raw})
+	}
+
+	for {
+		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+		body, err := readFramed(r)
+		if err != nil {
+			return
+		}
+		var req dap.Request
+		if json.Unmarshal(body, &req) != nil {
+			return
+		}
+		rec := recordedRequest{Command: req.Command, Args: map[string]interface{}{}}
+		if raw, err := json.Marshal(req.Arguments); err == nil {
+			_ = json.Unmarshal(raw, &rec.Args)
+		}
+		k.mu.Lock()
+		k.reqs = append(k.reqs, rec)
+		k.mu.Unlock()
+
+		switch req.Command {
+		case "initialize":
+			if !respond(req, map[string]interface{}{
+				"supportsConfigurationDoneRequest": true,
+				"supportsConditionalBreakpoints":   true,
+				"supportsLogPoints":                true,
+				"supportsTerminateRequest":         false,
+			}) {
+				return
+			}
+			// Before the launch response, as the protocol permits and js-debug does.
+			if !event(dap.EventInitialized, map[string]interface{}{}) {
+				return
+			}
+
+		case "setBreakpoints":
+			// Provisional, exactly like js-debug: unverified, no line, and it
+			// works anyway.
+			answers := make([]map[string]interface{}, 0)
+			for range wireBreakpoints(rec) {
+				answers = append(answers, map[string]interface{}{
+					"id": 1, "verified": false, "message": "breakpoint.provisionalBreakpoint",
+				})
+			}
+			if !respond(req, map[string]interface{}{"breakpoints": answers}) {
+				return
+			}
+
+		case "configurationDone":
+			if !respond(req, struct{}{}) {
+				return
+			}
+			if k.idx == 0 {
+				// 🔴 Only NOW, and only on the coordinator. Withholding it until
+				// configurationDone is what makes "await the child first" a hang
+				// rather than a slow start.
+				seq++
+				if !send(dap.Request{
+					Seq: seq, Type: dap.TypeRequest, Command: dap.CommandStartDebugging,
+					Arguments: map[string]interface{}{
+						"request": "launch",
+						"configuration": map[string]interface{}{
+							"type": "pwa-node", "name": "fixture.js [4242]",
+							"__pendingTargetId": "the-child-target",
+						},
+					},
+				}) {
+					return
+				}
+			}
+
+		default:
+			if !respond(req, struct{}{}) {
+				return
+			}
+		}
+	}
+}
+
+// withFakeJsDebugAdapter registers an adapter for JavaScript that resolves to a
+// fake coordinator, and restores the real table afterwards.
+//
+// 🔴 PREPENDED, not appended. AdapterFor returns the FIRST entry claiming a
+// language, so appending would leave the real js-debug in charge and this test
+// would silently be measuring whatever is installed on the machine — or skipping
+// on a machine with nothing installed, which reads as a pass.
+//
+// lazyBind is a parameter rather than a constant so the SAME fake can be run
+// both ways. Running it with lazyBind false is what proved
+// TestProvisionalBreakpointsAreNotReportedAsFailures is not vacuous: the editor
+// announced "1 breakpoint(s) could not be set on an executable line", drew a
+// hollow circle on it, and published it to the panel as unverified — three
+// visible claims, all false, about a breakpoint that binds.
+func withFakeJsDebugAdapter(t *testing.T, argv []string, lazyBind bool) {
+	t.Helper()
+	saved := dap.DefaultAdapters
+	dap.DefaultAdapters = append([]dap.Adapter{{
+		Name:                  "fake-js-debug",
+		AdapterID:             "pwa-node",
+		Locate:                func(string) *dap.Command { return &dap.Command{Argv: argv, Origin: "test"} },
+		Transport:             dap.TransportServer,
+		Languages:             []string{"javascript"},
+		UsesChildSessions:     true,
+		BreakpointsBindLazily: lazyBind,
+		Launch:                map[string]interface{}{"request": "launch", "type": "pwa-node"},
+	}}, saved...)
+	t.Cleanup(func() { dap.DefaultAdapters = saved })
+}
+
+// jsAppFixture writes a small JavaScript file and opens it.
+func jsAppFixture(t *testing.T) (*App, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fixture.js")
+	src := "function add(a, b) {\n  const total = a + b;\n  return total;\n}\nconsole.log(add(2, 3));\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestApp(t, dir)
+	a.openFile(path)
+	if a.activeTabPtr() == nil {
+		t.Fatal("fixture file did not open")
+	}
+	return a, path
+}
+
+// TestStartDebuggingOpensAChildAndRoutesBreakpointsToIt is the single most
+// load-bearing test for the third adapter.
+//
+// 🔴 It asserts on the RECORDED WIRE TRAFFIC that the user's breakpoint went
+// down the CHILD connection, and never down the coordinator's. Nothing else can
+// see that difference. js-debug's root accepts setBreakpoints and answers
+// plausibly; it simply never binds them, so an editor that arms the root
+// initialises cleanly, reports "js-debug running", paints the breakpoint, and
+// then lets the program run to completion. Every layer is green and the feature
+// does not exist — which is exactly the failure mode this fork has shipped
+// three times before.
+//
+// The negative half is what makes it an oracle: asserting only that the child
+// received the breakpoint would also pass for an implementation that armed BOTH,
+// and arming both would have masked the bug on the real adapter.
+func TestStartDebuggingOpensAChildAndRoutesBreakpointsToIt(t *testing.T) {
+	server, argv := newFakeCoordinator(t)
+	withFakeJsDebugAdapter(t, argv, true)
+
+	a, _ := jsAppFixture(t)
+	t.Cleanup(a.stopDebugSession)
+
+	// Buffer line 1 is `const total = a + b`. Checked by TEXT: a hardcoded line
+	// that happens to match proves nothing about the conversion.
+	const bpLine = 1
+	if got := a.activeTabPtr().LineText(bpLine); !strings.Contains(got, "const total = a + b") {
+		t.Fatalf("fixture line %d is %q, not the line meant to be marked", bpLine, got)
+	}
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: bpLine, Col: 0}, false)
+	a.handleKey(tcell.NewEventKey(tcell.KeyF9, 0, tcell.ModNone))
+	a.syncBreakpoints()
+	if len(a.breakpoints) != 1 {
+		t.Fatalf("F9 did not register a breakpoint: %v", a.breakpoints)
+	}
+
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+	if a.debug == nil {
+		t.Fatal("F5 did not start a debug session")
+	}
+
+	if !pumpEvents(t, a, 60*time.Second, func() bool {
+		return a.debug != nil && a.debug.running && a.debug.root != nil
+	}) {
+		state := "no session"
+		if a.debug != nil {
+			state = fmt.Sprintf("starting=%v running=%v root=%v", a.debug.starting, a.debug.running, a.debug.root != nil)
+		}
+		t.Fatalf("the session never came up through a child (%s). connections accepted: %d. "+
+			"last status: %q", state, server.connCount(), a.statusMsg)
+	}
+
+	// TWO connections: a coordinator and a leaf.
+	if got := server.connCount(); got != 2 {
+		t.Fatalf("the adapter server accepted %d connection(s), want 2 — a coordinator and a child", got)
+	}
+	root, child := server.conn(0), server.conn(1)
+
+	// The 1-based line the adapter should have been told about.
+	wantLine := bpLine + 1
+
+	// --- the negative half --------------------------------------------------
+	if lines := root.setBreakpointLines(); len(lines) != 0 {
+		t.Errorf("🔴 the COORDINATOR was armed with breakpoints on lines %v. js-debug's root "+
+			"session debugs nothing: it accepts these, answers plausibly, and never binds them, "+
+			"so the program runs straight past every breakpoint while the editor reports a "+
+			"healthy session. Requests seen on the root: %v", lines, root.commands())
+	}
+
+	// --- the positive half --------------------------------------------------
+	if child == nil {
+		t.Fatal("no child connection was opened")
+	}
+	childLines := child.setBreakpointLines()
+	if len(childLines) == 0 {
+		t.Fatalf("the CHILD was never sent any breakpoints; requests seen on it: %v", child.commands())
+	}
+	found := false
+	for _, l := range childLines {
+		if l == wantLine {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the child was armed on lines %v, which does not include the marked line %d",
+			childLines, wantLine)
+	}
+
+	// The child must also have been configured, or it never runs.
+	if !containsCommand(child.commands(), "configurationDone") {
+		t.Errorf("the child never received configurationDone; requests: %v", child.commands())
+	}
+	// And the ROOT must have been, or js-debug never launches and startDebugging
+	// never arrives — which is the hang the sequence is ordered to avoid.
+	if !containsCommand(root.commands(), "configurationDone") {
+		t.Errorf("the coordinator never received configurationDone; requests: %v", root.commands())
+	}
+
+	// The UI talks to the LEAF, and the coordinator is held only to be stopped
+	// last. A session whose client is the root is the bug this whole test is for.
+	if a.debug.client == a.debug.root {
+		t.Error("the session's client IS the coordinator; every later request would go to the " +
+			"connection that debugs nothing")
+	}
+	t.Logf("root saw %v · child saw %v", root.commands(), child.commands())
+}
+
+// containsCommand reports whether a recorded command list holds one.
+func containsCommand(cmds []string, want string) bool {
+	for _, c := range cmds {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestProvisionalBreakpointsAreNotReportedAsFailures is the UI half of
+// Adapter.BreakpointsBindLazily.
+//
+// 🔴 js-debug answers every setBreakpoints unverified. Read the way delve's
+// answers are read, the gutter paints a hollow ○ on a breakpoint that works and
+// the status line announces it "could not be set on an executable line" — about
+// a program that is about to stop on it. Both claims are visible to the user and
+// both are false, which is worse than a missing feature: it sends someone
+// looking for a bug in their own code.
+func TestProvisionalBreakpointsAreNotReportedAsFailures(t *testing.T) {
+	_, argv := newFakeCoordinator(t)
+	withFakeJsDebugAdapter(t, argv, true)
+
+	a, _ := jsAppFixture(t)
+	t.Cleanup(a.stopDebugSession)
+
+	const bpLine = 1
+	a.activeTabPtr().MoveCursorTo(editor.Position{Line: bpLine, Col: 0}, false)
+	a.handleKey(tcell.NewEventKey(tcell.KeyF9, 0, tcell.ModNone))
+	a.syncBreakpoints()
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+
+	if !pumpEvents(t, a, 60*time.Second, func() bool {
+		return a.debug != nil && a.debug.running
+	}) {
+		t.Fatalf("the session never came up; last status %q", a.statusMsg)
+	}
+
+	if strings.Contains(a.statusMsg, "could not be set") {
+		t.Errorf("🔴 the editor announced %q for a provisionally-bound breakpoint that will "+
+			"actually be hit", a.statusMsg)
+	}
+
+	a.draw()
+	if got := gutterRuneAt(t, a, bpLine); got == '○' {
+		t.Error("🔴 the gutter drew ○ (\"the adapter refused to bind this\") on a working " +
+			"js-debug breakpoint")
+	}
+
+	// And the panel must agree with the gutter, or one breakpoint is drawn two
+	// ways with nothing to say which is right.
+	snap := a.debugSnapshot()
+	if len(snap.Breakpoints) != 1 {
+		t.Fatalf("published %d breakpoints, want 1: %+v", len(snap.Breakpoints), snap.Breakpoints)
+	}
+	if !snap.Breakpoints[0].Verified {
+		t.Error("the Debug panel is told this breakpoint is unverified while the gutter draws " +
+			"it as one that will bind")
+	}
+}
+
+// TestStopClosesTheLeafBeforeTheCoordinator pins the teardown order.
+//
+// 🔴 The coordinator owns the adapter SERVER and the leaf is a second connection
+// into it. Stopping the root first kills the server out from under the leaf's
+// disconnect — and disconnect{terminateDebuggee:true} is the only thing that
+// ends the debugged node process, since js-debug reports
+// supportsTerminateRequest:false. Getting the order wrong leaks a live process
+// every time the user presses stop, with nothing on screen to report it.
+func TestStopClosesTheLeafBeforeTheCoordinator(t *testing.T) {
+	server, argv := newFakeCoordinator(t)
+	withFakeJsDebugAdapter(t, argv, true)
+
+	a, _ := jsAppFixture(t)
+	t.Cleanup(a.stopDebugSession)
+
+	a.handleKey(tcell.NewEventKey(tcell.KeyF5, 0, tcell.ModNone))
+	if !pumpEvents(t, a, 60*time.Second, func() bool {
+		return a.debug != nil && a.debug.running && a.debug.root != nil
+	}) {
+		t.Fatalf("the session never came up; last status %q", a.statusMsg)
+	}
+	child := server.conn(1)
+	if child == nil {
+		t.Fatal("no child connection")
+	}
+
+	a.menuDebugStop()
+	if a.debug != nil {
+		t.Fatal("the session was not cleared from the UI")
+	}
+
+	// The leaf must be told to disconnect-and-terminate. Without it the debuggee
+	// outlives the editor, and js-debug offers no `terminate` to fall back on.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if containsCommand(child.commands(), "disconnect") {
+			for _, r := range child.requests() {
+				if r.Command != "disconnect" {
+					continue
+				}
+				if kill, _ := r.Args["terminateDebuggee"].(bool); !kill {
+					t.Errorf("the leaf was disconnected WITHOUT terminateDebuggee (%v); the "+
+						"debugged process would be left running", r.Args)
+				}
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the leaf session was never disconnected; requests seen on it: %v", child.commands())
 }

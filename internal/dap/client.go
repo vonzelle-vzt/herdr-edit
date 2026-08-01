@@ -110,6 +110,11 @@ type Client struct {
 	sock   string       // unix socket path to unlink on Stop
 	r      *bufio.Reader
 
+	// dialAddr is the host:port of an adapter SERVER we dialed, and "" for the
+	// two transports that cannot carry a second connection. DialChild is the
+	// only reader; it is what makes a child session reachable at all.
+	dialAddr string
+
 	handlers Handlers
 
 	mu      sync.Mutex
@@ -117,6 +122,17 @@ type Client struct {
 	pending map[int]chan Response // keyed by REQUEST_SEQ — see Response's doc
 	caps    Capabilities
 	closed  bool
+
+	// childReq carries the FIRST startDebugging the adapter asks for. Buffered
+	// so the read loop never blocks on a caller that is not waiting yet — the
+	// request can and does arrive before AwaitChildSession is called.
+	//
+	// childClaimed is what makes a SECOND one a refusal rather than a queue. See
+	// handleStartDebugging: silently accepting the second would leave the editor
+	// debugging whichever process happened to arrive first, with the other one
+	// running unobserved.
+	childReq     chan ChildSession
+	childClaimed bool
 
 	// seenEvents and waiters implement the "buffer events seen before anyone
 	// waits" rule. See waitEvent.
@@ -129,17 +145,30 @@ type Client struct {
 // StartCommand ends up in — a test that exercised a different one would prove
 // nothing about the real thing.
 func StartConn(name string, rw io.ReadWriteCloser, h Handlers) *Client {
-	c := &Client{
+	c := newClient(name, rw, h)
+	go c.readLoop()
+	return c
+}
+
+// newClient builds the parts every transport shares, and exists so that there
+// is ONE place the internal channels and maps are created.
+//
+// 🔴 There were four struct literals doing this by hand, which is three chances
+// to forget a field. Forgetting childReq in particular is not a nil-map panic
+// but something quieter: the read loop would block forever on a send to a nil
+// channel the first time an adapter asked for a child session, and the symptom
+// would be a debugger that stops answering with no error anywhere.
+func newClient(name string, conn io.ReadWriteCloser, h Handlers) *Client {
+	return &Client{
 		name:       name,
-		conn:       rw,
-		r:          bufio.NewReaderSize(rw, 64*1024),
+		conn:       conn,
+		r:          bufio.NewReaderSize(conn, 64*1024),
 		handlers:   h,
 		pending:    make(map[int]chan Response),
+		childReq:   make(chan ChildSession, 1),
 		seenEvents: make(map[string]bool),
 		waiters:    make(map[string][]chan struct{}),
 	}
-	go c.readLoop()
-	return c
 }
 
 // Transport is how a client reaches an adapter's protocol stream.
@@ -162,6 +191,22 @@ const (
 	// The debuggee's output must NOT come back the same way — see
 	// startStdioCommand.
 	TransportStdio
+
+	// TransportServer spawns a TCP SERVER and dials it — js-debug's shape, and
+	// the third distinct answer to "how do I reach this adapter" in three
+	// adapters.
+	//
+	// 🔴 It is not TransportSocket with a different address family. In
+	// TransportSocket WE listen and the adapter dials in; here the ADAPTER
+	// listens and we dial. That inversion is what makes a readiness race
+	// possible again, and startServerCommand is shaped entirely around removing
+	// it — see there.
+	//
+	// It is also the transport that can carry more than one connection, which is
+	// the whole reason child sessions are reachable at all: DialChild opens a
+	// SECOND connection to the same server. Neither of the other two transports
+	// could express that — a stdio adapter has exactly one stdin.
+	TransportServer
 )
 
 // Command is one adapter resolved down to something that can be executed: what
@@ -202,10 +247,14 @@ func StartCommand(ctx context.Context, name string, spec Command, dir string, h 
 	if len(spec.Argv) == 0 {
 		return nil, fmt.Errorf("%s: no command configured", name)
 	}
-	if spec.Transport == TransportStdio {
+	switch spec.Transport {
+	case TransportStdio:
 		return startStdioCommand(name, spec, dir, h)
+	case TransportServer:
+		return startServerCommand(ctx, name, spec, dir, h)
+	default:
+		return startSocketCommand(ctx, name, spec, dir, h)
 	}
-	return startSocketCommand(ctx, name, spec, dir, h)
 }
 
 // newAdapterCmd builds the exec.Cmd both transports spawn, with the stderr ring
@@ -265,18 +314,8 @@ func startStdioCommand(name string, spec Command, dir string, h Handlers) (*Clie
 	go func() { exited <- cmd.Wait() }()
 
 	conn := &stdioConn{in: stdin, out: stdout}
-	c := &Client{
-		name:       name,
-		cmd:        cmd,
-		exited:     exited,
-		stderr:     ring,
-		conn:       conn,
-		r:          bufio.NewReaderSize(conn, 64*1024),
-		handlers:   h,
-		pending:    make(map[int]chan Response),
-		seenEvents: make(map[string]bool),
-		waiters:    make(map[string][]chan struct{}),
-	}
+	c := newClient(name, conn, h)
+	c.cmd, c.exited, c.stderr = cmd, exited, ring
 	go c.readLoop()
 	return c, nil
 }
@@ -430,20 +469,103 @@ func startSocketCommand(ctx context.Context, name string, spec Command, dir stri
 		return nil, ctx.Err()
 	}
 
-	c := &Client{
-		name:       name,
-		cmd:        cmd,
-		exited:     exited,
-		stderr:     ring,
-		conn:       conn,
-		ln:         ln,
-		sock:       sock,
-		r:          bufio.NewReaderSize(conn, 64*1024),
-		handlers:   h,
-		pending:    make(map[int]chan Response),
-		seenEvents: make(map[string]bool),
-		waiters:    make(map[string][]chan struct{}),
+	c := newClient(name, conn, h)
+	c.cmd, c.exited, c.stderr, c.ln, c.sock = cmd, exited, ring, ln, sock
+	go c.readLoop()
+	return c, nil
+}
+
+// serverListenPattern is what a dialable adapter server prints on stdout to say
+// it is ready. Measured against js-debug 1.117.0:
+//
+//	Debug server listening at 127.0.0.1:61739
+const serverListenPattern = "listening at "
+
+// startServerCommand spawns an adapter that LISTENS, waits for it to say where,
+// and dials it.
+//
+// 🔴 The port is read from the adapter's own stdout rather than chosen by us,
+// and that is what makes this transport race-free despite inverting
+// TransportSocket's direction. The obvious implementation — pick a free port,
+// pass it, then dial — loses twice: the port can be taken between our probe and
+// the adapter's bind, and dialing before the listener exists fails as
+// "connection refused", which is indistinguishable from the adapter not being
+// installed. Passing port 0 and reading back the real one means the line we
+// parse is itself the readiness signal: it cannot be printed before the socket
+// can be accepted on.
+//
+// The stdout pipe stays drained afterwards. js-debug keeps writing to it, and a
+// child process whose stdout pipe fills up blocks in write() — which would look
+// like a debugger that hangs after a few minutes of use.
+func startServerCommand(ctx context.Context, name string, spec Command, dir string, h Handlers) (*Client, error) {
+	ring := &lineRing{max: maxStderrLines}
+	cmd := newAdapterCmd(spec, dir, ring)
+	cmd.Stdin = nil
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("%s: stdout: %w", name, err)
 	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	abort := func() {
+		_ = cmd.Process.Kill()
+		<-exited
+	}
+
+	type addrResult struct {
+		addr string
+		err  error
+	}
+	announced := make(chan addrResult, 1)
+	br := bufio.NewReader(stdout)
+	go func() {
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				announced <- addrResult{err: fmt.Errorf("adapter stdout ended before it announced an address: %w", err)}
+				return
+			}
+			if i := strings.Index(line, serverListenPattern); i >= 0 {
+				announced <- addrResult{addr: strings.TrimSpace(line[i+len(serverListenPattern):])}
+				break
+			}
+		}
+		// Keep draining so the adapter never blocks writing to a full pipe.
+		_, _ = io.Copy(io.Discard, br)
+	}()
+
+	var addr string
+	select {
+	case res := <-announced:
+		if res.err != nil {
+			abort()
+			return nil, fmt.Errorf("%s: %v%s", name, res.err, ring.suffix())
+		}
+		addr = res.addr
+	case err := <-exited:
+		return nil, fmt.Errorf("%s: adapter exited before listening: %v%s", name, err, ring.suffix())
+	case <-time.After(dialTimeout):
+		abort()
+		return nil, fmt.Errorf("%s: adapter did not announce an address within %s%s", name, dialTimeout, ring.suffix())
+	case <-ctx.Done():
+		abort()
+		return nil, ctx.Err()
+	}
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		abort()
+		return nil, fmt.Errorf("%s: dial %s: %w%s", name, addr, err, ring.suffix())
+	}
+
+	c := newClient(name, conn, h)
+	c.cmd, c.exited, c.stderr, c.dialAddr = cmd, exited, ring, addr
 	go c.readLoop()
 	return c, nil
 }
@@ -576,6 +698,10 @@ func initializeArgsForClient(adapterID string) initializeArgs {
 		// the adapter says it can page. See initializeArgs' comment.
 		SupportsVariableType:   true,
 		SupportsVariablePaging: true,
+
+		// Honoured by readLoop → answerReverseRequest, and by the app's
+		// AwaitChildSession/DialChild sequence. See initializeArgs.
+		SupportsStartDebuggingRequest: true,
 	}
 }
 
@@ -833,11 +959,17 @@ func (c *Client) Variables(ctx context.Context, ref, start, count int) ([]Variab
 // something both delve and debugpy accept and answer — from another scope,
 // with no error to say so. Pass 0 for frameID when there is no stop.
 func (c *Client) Evaluate(ctx context.Context, expr string, frameID int, evalContext string) (EvaluateResult, error) {
-	raw, err := c.call(ctx, "evaluate", evaluateArgs{
-		Expression: expr,
-		FrameID:    frameID,
-		Context:    evalContext,
-	})
+	args := evaluateArgs{Expression: expr, Context: evalContext}
+	// 🔴 The frame is sent whenever there IS one, and "frameID != 0" is not that
+	// test — js-debug numbers its innermost frame 0. EvalContextWatch means "in
+	// the frame the user is looking at", so it always carries the id, including
+	// zero; EvalContextRepl with no frame is the one case where the field must be
+	// absent. See evaluateArgs.
+	if frameID != 0 || evalContext == EvalContextWatch {
+		id := frameID
+		args.FrameID = &id
+	}
+	raw, err := c.call(ctx, "evaluate", args)
 	if err != nil {
 		return EvaluateResult{}, err
 	}
@@ -934,7 +1066,29 @@ func (c *Client) Stop() {
 		case <-c.exited:
 		case <-time.After(disconnectTimeout):
 			_ = c.cmd.Process.Kill()
-			<-c.exited
+			// 🔴 The wait after the KILL is bounded too, and an unbounded one
+			// here hangs the EDITOR. cmd.Stderr is a lineRing rather than a
+			// *os.File, so exec.Cmd makes a pipe and a copying goroutine for it,
+			// and cmd.Wait does not return until that goroutine sees EOF. EOF
+			// needs every holder of the write end to close it — and an adapter's
+			// GRANDCHILDREN inherit it. js-debug spawns the debuggee, which
+			// spawns node; killing the adapter leaves node holding that pipe, so
+			// Wait blocks forever on a process we have already killed.
+			//
+			// Observed as a 45-second test timeout with cmd.Wait parked in
+			// awaitGoroutines. It matters far beyond a test: stopDebugSession
+			// runs SYNCHRONOUSLY on the way out of Run, so this is the editor
+			// refusing to quit — the exact failure writeTimeout exists to
+			// prevent, arrived at from a different direction.
+			//
+			// Abandoning the wait leaks a goroutine and a pipe until the process
+			// exits, which is the cheaper of the two: the adapter is dead, and a
+			// debugger that will not exit must never keep the editor from
+			// exiting.
+			select {
+			case <-c.exited:
+			case <-time.After(disconnectTimeout):
+			}
 		}
 	}
 	if c.sock != "" {
@@ -1039,8 +1193,13 @@ func (c *Client) responseError(command string, resp Response) error {
 
 // write frames one message with the Content-Length header the protocol
 // requires — byte-for-byte the same framing as LSP.
-func (c *Client) write(req Request) error {
-	body, err := json.Marshal(req)
+//
+// It takes an interface rather than a Request because outgoing traffic is no
+// longer only requests: a reverse request has to be ANSWERED, and an answer is
+// a Response. One framing path for both is the point — two would be two places
+// for the deadline and the nil-connection check to drift.
+func (c *Client) write(msg interface{}) error {
+	body, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
@@ -1089,8 +1248,17 @@ func (c *Client) readLoop() {
 			c.dispatchEvent(ev)
 			continue
 		}
+		if resp.Type == TypeRequest {
+			var rr ReverseRequest
+			if err := json.Unmarshal(body, &rr); err != nil {
+				c.log("malformed reverse request: " + err.Error())
+				continue
+			}
+			c.handleReverseRequest(rr)
+			continue
+		}
 		if resp.Type != TypeResponse {
-			continue // reverse requests: nothing in stage 2 answers one
+			continue
 		}
 
 		// 🔴 request_seq, NOT seq. Both are 1 on a session's first response
@@ -1103,6 +1271,147 @@ func (c *Client) readLoop() {
 			ch <- resp
 		}
 	}
+}
+
+// handleReverseRequest answers a request the ADAPTER sent us.
+//
+// 🔴 EVERY reverse request is answered, including the ones we refuse. An
+// adapter blocks on a reverse request until it gets a response, so ignoring one
+// is not a graceful decline — it is a session that stops making progress with
+// nothing logged. That is what the old `continue` in readLoop did, and it was
+// correct only for as long as we declared no capability that could produce one.
+func (c *Client) handleReverseRequest(rr ReverseRequest) {
+	if rr.Command == CommandStartDebugging {
+		c.handleStartDebugging(rr)
+		return
+	}
+	c.answerReverseRequest(rr, false, "herdr-edit does not implement the "+rr.Command+" request")
+	c.log("declined the adapter's " + rr.Command + " request")
+}
+
+// handleStartDebugging accepts the FIRST child session an adapter asks for and
+// refuses every later one out loud.
+//
+// 🔴 The refusal is the designed behaviour, not a limitation being papered
+// over. This client tracks ONE active leaf session, so a second startDebugging
+// — a browser next to a server, a worker thread, a forked process — has nowhere
+// to go. The two ways to get that wrong are both silent: dropping it leaves the
+// adapter blocked forever, and accepting it would REPLACE the session the user
+// is looking at, so they would step through one process while the one they set
+// a breakpoint in ran to completion unobserved. Refusing and saying which
+// configuration was declined is the only version where what is on screen and
+// what is running agree.
+func (c *Client) handleStartDebugging(rr ReverseRequest) {
+	var cs ChildSession
+	if len(rr.Arguments) > 0 {
+		if err := json.Unmarshal(rr.Arguments, &cs); err != nil {
+			c.answerReverseRequest(rr, false, "unreadable startDebugging arguments")
+			c.log("startDebugging: unreadable arguments: " + err.Error())
+			return
+		}
+	}
+	if cs.Request == "" {
+		cs.Request = "launch" // the protocol's default, and what js-debug means
+	}
+
+	c.mu.Lock()
+	first := !c.childClaimed
+	if first {
+		c.childClaimed = true
+	}
+	c.mu.Unlock()
+
+	if !first {
+		c.answerReverseRequest(rr, false,
+			"herdr-edit debugs one session at a time; this child session was declined")
+		c.log("declined a second debug session (" + describeChild(cs) + ") — " +
+			"only one is debugged at a time, and the first one is still active")
+		return
+	}
+
+	c.answerReverseRequest(rr, true, "")
+	select {
+	case c.childReq <- cs:
+	default:
+		// Unreachable while childClaimed gates entry, but a send to a full
+		// buffered channel would block the read loop and take the whole session
+		// down, so it is a default rather than a comment saying it cannot happen.
+		c.log("startDebugging arrived twice past the claim guard; ignoring the second")
+	}
+}
+
+// describeChild names a child session in a way a user can act on. The `name`
+// js-debug puts in the configuration is the readable one ("fixture.js [96905]");
+// the type is the fallback for an adapter that does not set one.
+func describeChild(cs ChildSession) string {
+	if cs.Configuration != nil {
+		if n, ok := cs.Configuration["name"].(string); ok && n != "" {
+			return n
+		}
+		if t, ok := cs.Configuration["type"].(string); ok && t != "" {
+			return t
+		}
+	}
+	return cs.Request
+}
+
+// answerReverseRequest writes the response an adapter is blocked on.
+//
+// A write failure is logged rather than returned: this runs on the read loop,
+// there is no caller to hand an error to, and a connection too broken to answer
+// on is about to surface as a read error anyway.
+func (c *Client) answerReverseRequest(rr ReverseRequest, success bool, message string) {
+	c.mu.Lock()
+	c.nextSeq++
+	seq := c.nextSeq
+	c.mu.Unlock()
+
+	if err := c.write(Response{
+		Seq: seq, Type: TypeResponse, RequestSeq: rr.Seq,
+		Success: success, Command: rr.Command, Message: message,
+	}); err != nil {
+		c.log("could not answer the adapter's " + rr.Command + " request: " + err.Error())
+	}
+}
+
+// AwaitChildSession blocks until the adapter asks us to start a leaf session.
+//
+// 🔴 It may return IMMEDIATELY, and that is required rather than an
+// optimisation: measured against js-debug, startDebugging arrives ~80ms after
+// the launch response, which is well before the caller finishes the root's
+// configuration sequence. The request is buffered by handleStartDebugging for
+// exactly the same reason WaitEvent buffers `initialized` — a handshake step
+// that can be overtaken by the thing it waits for is a hang.
+func (c *Client) AwaitChildSession(ctx context.Context) (ChildSession, error) {
+	select {
+	case cs := <-c.childReq:
+		return cs, nil
+	case <-ctx.Done():
+		return ChildSession{}, fmt.Errorf("%s: no child debug session was started: %w", c.name, ctx.Err())
+	}
+}
+
+// DialChild opens a SECOND connection to the same adapter server, for the leaf
+// session AwaitChildSession described.
+//
+// 🔴 Only TransportServer can do this. A stdio adapter has one stdin and a
+// dialed-in socket adapter has one accepted connection, so dialAddr being empty
+// is a programming error rather than a runtime condition — an adapter table
+// entry that asked for child sessions on the wrong transport.
+//
+// The returned client owns no process: the root spawned the server and the root
+// is what must outlive it. See Stop.
+func (c *Client) DialChild(name string, h Handlers) (*Client, error) {
+	if c.dialAddr == "" {
+		return nil, fmt.Errorf("%s: this adapter's transport cannot carry a child session", c.name)
+	}
+	conn, err := net.Dial("tcp", c.dialAddr)
+	if err != nil {
+		return nil, fmt.Errorf("%s: dialing the child session at %s: %w", name, c.dialAddr, err)
+	}
+	child := newClient(name, conn, h)
+	go child.readLoop()
+	return child, nil
 }
 
 // dispatchEvent records that an event was seen, wakes anyone waiting on it, and
@@ -1153,10 +1462,31 @@ func (c *Client) handleDisconnect(err error) {
 
 	// Unblock every waiting caller so a dead adapter surfaces as an error
 	// rather than as a request that never returns.
+	//
+	// 🔴 The send is NON-BLOCKING, and a plain send here deadlocks the read
+	// goroutine for the rest of the process. Every pending channel is buffered
+	// for one, and `call` removes its entry once answered — but `send`, which is
+	// what Launch and Attach use, deliberately does NOT: the caller may read the
+	// launch response long afterwards, or (as internal/app does) never. So by
+	// the time a session ends, `pending` still holds the launch entry with its
+	// one slot ALREADY FULL, and a blocking send stops right here — before the
+	// waiters are closed and before the synthetic `terminated` event that tells
+	// the UI the adapter is gone.
+	//
+	// The symptom is not a crash: the read goroutine simply never returns, so an
+	// adapter that dies mid-session leaves the editor painting ▶ over a program
+	// that no longer exists, with F5 bound to a dead client. Observed as a
+	// 600-second test timeout with the goroutine parked on this line.
+	//
+	// A full buffer means the caller's answer is already waiting for it, so
+	// there is nothing to deliver and nothing to report.
 	for seq, ch := range pending {
-		ch <- Response{
+		select {
+		case ch <- Response{
 			Type: TypeResponse, RequestSeq: seq, Success: false,
 			Message: "adapter connection lost: " + err.Error(),
+		}:
+		default:
 		}
 	}
 	for _, list := range waiters {

@@ -346,3 +346,128 @@ func TestEvaluateContextsAreTheProtocolSpellings(t *testing.T) {
 		t.Errorf("EvalContextRepl = %q, want repl", EvalContextRepl)
 	}
 }
+
+// TestChildSessionDecodesTheRealStartDebuggingArguments pins the reverse
+// request's shape against bytes copied off the wire from js-debug 1.117.0.
+//
+// 🔴 The configuration is carried as a map and forwarded VERBATIM, and
+// __pendingTargetId is why. It is the only thing tying the child connection to
+// the process the root already spawned; everything else in there is cosmetic.
+// The tempting "surely the child needs to know what to run" instinct — merging
+// our own launch keys back in, re-adding `program` — asks the child to launch a
+// SECOND copy of the program, so the user would step through one process while
+// another ran unobserved. A struct with named fields would quietly drop the one
+// key that matters, since it is not in any published schema.
+func TestChildSessionDecodesTheRealStartDebuggingArguments(t *testing.T) {
+	const wire = `{"request":"launch","configuration":{"type":"pwa-node",` +
+		`"name":"fixture.js [96905]","__pendingTargetId":"956ef4f0d34f26a8ac05ac1b"}}`
+
+	var cs ChildSession
+	if err := json.Unmarshal([]byte(wire), &cs); err != nil {
+		t.Fatalf("decoding js-debug's startDebugging arguments: %v", err)
+	}
+	if cs.Request != "launch" {
+		t.Errorf("request = %q, want launch", cs.Request)
+	}
+	if got := cs.Configuration["__pendingTargetId"]; got != "956ef4f0d34f26a8ac05ac1b" {
+		t.Fatalf("__pendingTargetId = %v; without it the child attaches to nothing", got)
+	}
+	if got := cs.Configuration["type"]; got != "pwa-node" {
+		t.Errorf("type = %v, want pwa-node", got)
+	}
+
+	// Re-marshalling must round-trip every key, because the configuration is
+	// sent back out as the launch arguments unchanged.
+	out, err := json.Marshal(cs.Configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back map[string]interface{}
+	if err := json.Unmarshal(out, &back); err != nil {
+		t.Fatal(err)
+	}
+	if len(back) != 3 {
+		t.Errorf("the configuration lost keys on the way back out: %v", back)
+	}
+	if _, ok := back["program"]; ok {
+		t.Error("the child configuration carries `program`; that would launch a SECOND copy " +
+			"of the debuggee alongside the one the root already started")
+	}
+}
+
+// TestReverseRequestKeepsArgumentsRaw pins the one decision in ReverseRequest.
+//
+// Arguments stays json.RawMessage because the only reverse request this client
+// acts on is startDebugging. Decoding an unknown one into a concrete type would
+// mean inventing a shape in order to throw it away — and the answer to an
+// unknown reverse request is a refusal, which needs nothing from its body.
+func TestReverseRequestKeepsArgumentsRaw(t *testing.T) {
+	const wire = `{"seq":8,"type":"request","command":"runInTerminal",` +
+		`"arguments":{"kind":"integrated","args":["node","app.js"]}}`
+
+	var rr ReverseRequest
+	if err := json.Unmarshal([]byte(wire), &rr); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Seq != 8 {
+		t.Errorf("seq = %d, want 8 — the answer must name the request the adapter is blocked on", rr.Seq)
+	}
+	if rr.Type != TypeRequest {
+		t.Errorf("type = %q, want %q", rr.Type, TypeRequest)
+	}
+	if rr.Command != "runInTerminal" {
+		t.Errorf("command = %q", rr.Command)
+	}
+	if len(rr.Arguments) == 0 {
+		t.Error("arguments were dropped")
+	}
+}
+
+// TestChildSessionToleratesAnAbsentConfiguration is the failure path: an adapter
+// that asks for a child session without saying what to run.
+//
+// A nil map is what an absent configuration must decode to, so the caller can
+// tell "nothing to launch" from "launch with no options" — the second would be
+// sent as `{}` and answered by the adapter with something unhelpful.
+func TestChildSessionToleratesAnAbsentConfiguration(t *testing.T) {
+	var cs ChildSession
+	if err := json.Unmarshal([]byte(`{"request":"attach"}`), &cs); err != nil {
+		t.Fatal(err)
+	}
+	if cs.Request != "attach" {
+		t.Errorf("request = %q, want attach", cs.Request)
+	}
+	if cs.Configuration != nil {
+		t.Errorf("configuration = %v, want nil for an absent one", cs.Configuration)
+	}
+}
+
+// TestEvaluateArgsDistinguishFrameZeroFromNoFrame is the type-level guard for
+// the assumption js-debug falsified.
+//
+// 🔴 FrameID was an int with omitempty, on the stated grounds that frame 0 is
+// not a valid frame id. That is true of delve and FALSE of js-debug, whose
+// innermost frame is {"id":0} — so omitempty dropped the field and the
+// expression was evaluated globally instead of in the frame on screen. A
+// pointer is what keeps "frame zero" and "no frame" from marshalling
+// identically.
+func TestEvaluateArgsDistinguishFrameZeroFromNoFrame(t *testing.T) {
+	zero := 0
+	withFrame, err := json.Marshal(evaluateArgs{Expression: "a", FrameID: &zero, Context: EvalContextWatch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(withFrame), `"frameId":0`) {
+		t.Fatalf("frame zero marshalled as %s — it was dropped, so the expression is answered "+
+			"from another scope with no error", withFrame)
+	}
+
+	noFrame, err := json.Marshal(evaluateArgs{Expression: "a", Context: EvalContextRepl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(noFrame), `"frameId"`) {
+		t.Fatalf("no-frame marshalled as %s — `\"frameId\":0` is a question ABOUT frame zero, "+
+			"not the absence of a question", noFrame)
+	}
+}

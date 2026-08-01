@@ -104,8 +104,9 @@ internal/app/searchpanel.go   Esc F -> internal/search -> a jumpable synthetic t
 internal/app/problems.go      Diagnostics list + next/prev problem (Esc ; . , and F8)
 internal/app/dochighlight.go  Tint other occurrences of the symbol under the cursor
 internal/app/breakpoints.go   Breakpoints: conditions, logpoints, persistence, dlv/pdb/gdb export
-internal/dap/                 DAP client (delve over a socket, debugpy over stdio) — a deliberate
-                              SIBLING of internal/lsp's transport, not a shared abstraction
+internal/dap/                 DAP client (delve over a socket, debugpy over stdio, js-debug over a
+                              TCP server we dial) — a deliberate SIBLING of internal/lsp's
+                              transport, not a shared abstraction
 internal/app/debug.go         Debug session, DAP events, stopped marker overlay, status
 internal/app/debugview.go     Stepping, call stack, threads, variables, evaluate, debug console
 internal/toolpath/            Where developer tools ACTUALLY live when PATH cannot be trusted
@@ -187,6 +188,83 @@ darwin and the weaker-but-real one elsewhere (output events arrived AND the
 program terminated), logging loudly what was not observed. Do not "fix" it by
 skipping: a silent skip leaves a linux user with an empty console and nothing to
 explain it.
+
+### js-debug: the session is NOT the connection you launched on (fork)
+
+🔴 **js-debug's root session debugs NOTHING.** It is a coordinator: it launches
+the program and then sends a **`startDebugging` reverse request** asking us to
+open a SECOND session, and the debuggee lives only in that child. There is no
+single-session mode — declaring `supportsStartDebuggingRequest: false` does not
+stop it, measured. Four things follow, and each one ships broken while looking
+fine:
+
+- 🔴 **Breakpoints go on the CHILD.** The root ACCEPTS `setBreakpoints` and
+  answers plausibly; nothing binds, and the program runs straight past every
+  one of them while the editor reports a healthy session. `Adapter.UsesChildSessions`
+  is what routes them, and `TestStartDebuggingOpensAChildAndRoutesBreakpointsToIt`
+  asserts on recorded wire traffic which SOCKET carried them — the only evidence
+  that exists, since arming the root is not an error at any layer. Confirmed RED
+  against the naive version, on both the fake and the real adapter.
+- 🔴 **The root still needs its own `configurationDone`.** It will not launch
+  the program without one, so `startDebugging` never arrives and F5 hangs until
+  the start timeout. "Wait for the child, then configure everything" is the
+  obvious order and it deadlocks.
+- 🔴 **The child's configuration is sent VERBATIM.** It is just
+  `{type, name, __pendingTargetId}`, and that pending-target id is the only
+  thing tying the connection to the process the root already spawned. Merging
+  our launch keys back in — re-adding `program` — launches a SECOND copy, so the
+  user debugs one process while another runs unobserved.
+- 🔴 **Every `setBreakpoints` answer is `verified:false`**
+  (`"breakpoint.provisionalBreakpoint"`), no line, no later `breakpoint` event
+  to upgrade it — **and it then hits**. Read the way delve's answers are read,
+  the gutter paints ○ on a working breakpoint and the status bar announces "N
+  breakpoint(s) could not be set on an executable line". `Adapter.BreakpointsBindLazily`
+  → `boundBreakpoint.Pending` → `WillBind()` is the fix, and the gutter and the
+  published panel payload BOTH read `WillBind` so they cannot disagree.
+
+⚠️ **SCOPE: ONE ACTIVE LEAF SESSION, and it is enforced out loud.** A second
+`startDebugging` — a browser beside a server, a worker thread, a forked process
+— is **refused** with `success:false` and a log line naming the declined
+configuration. There is no session tree, no compound configuration, and no
+browser+server pair. Dropping it instead would leave the adapter BLOCKED (a
+reverse request is a request), and accepting it would replace the session on
+screen. **A real Next.js `next dev` will therefore debug only its first target**
+— that limit is a deliberate cut, not an oversight, and it is what
+`TestSecondStartDebuggingIsRefusedLoudly` pins.
+
+⚠️ **A mid-session re-send answers with an EMPTY array while the breakpoints
+stay bound.** `resendBreakpoints` is safe on js-debug (measured: it stops again
+after a re-send), but its ANSWER is not a description of state, and
+`boundFromAnswers` pairs positionally — so the editor records nothing about
+breakpoints that are working. Judge by behaviour, never by re-asking.
+
+**The VS Code copy is NOT usable**, and this one is technical rather than a
+licence problem. `ms-vscode.js-debug` declares MIT and would pass the OSI
+allow-list — but it ships only `extension.js`, hosted by the extension host,
+with no `dapDebugServer.js` anywhere (1.131.0). `LocateJsDebug` probes for the
+FILE for exactly that reason. The standalone release tarball is the only route,
+we ship no copy of it, and `NOTICE` records that as a separate second entry.
+
+**Two bugs the third adapter exposed in code that already shipped:**
+
+- 🔴 `evaluateArgs.FrameID` was an int with `omitempty`, justified by a comment
+  saying frame 0 is not a valid frame id. True of delve, FALSE of js-debug,
+  whose innermost frame is `{"id":0}` — so the field was DROPPED and the
+  expression was answered globally. It is a `*int` now. The live oracle read
+  `Uncaught ReferenceError: a is not defined` for a variable in scope on the
+  stopped line; against a name that exists at both scopes it would have answered
+  the wrong one with no error at all.
+- 🔴 `Stop()` could hang the EDITOR FOREVER. `cmd.Stderr` is a `lineRing`, so
+  exec.Cmd makes a pipe and a copying goroutine, and `cmd.Wait` does not return
+  until that goroutine sees EOF — which needs every holder of the write end to
+  close it, and an adapter's GRANDCHILDREN inherit it. Killing js-debug leaves
+  node holding the pipe. `stopDebugSession` runs synchronously on the way out of
+  `Run`, so this was the editor refusing to quit. The post-kill wait is bounded
+  now. `handleDisconnect` had the same shape: a blocking send onto the launch
+  channel, whose one buffered slot is ALREADY FULL because `send` (unlike
+  `call`) never removes its pending entry — parking the read goroutine before it
+  could post the synthetic `terminated`. Both are non-obvious and neither was
+  reachable through delve or debugpy.
 
 🔴 **`ScreenPos` is the overlay contract and it has now shipped wrong TWICE.** First
 `dx = gutter + col` (rune index treated as a screen cell); then `contentStart = GutterWidth()` when

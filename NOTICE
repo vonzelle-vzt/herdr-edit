@@ -6,6 +6,10 @@ herdr-edit is distributed under the MIT License; see LICENSE.
 This file records third-party material included in herdr-edit and the
 attribution its licence requires to be preserved.
 
+There are two entries, and they are different KINDS of thing. The first is data
+that was COPIED INTO this repository, so its licence travels with our source.
+The second is a program we merely RUN, shipping no copy of it at all.
+
 
 -------------------------------------------------------------------------------
 Microsoft Corporation — Visual Studio Code language configuration data
@@ -89,3 +93,94 @@ Re-running the generator against a newer Visual Studio Code updates both the
 data and the `Extracted from` version above. If you bump it, update the version
 and language count in this file too — `langconf.SourceVersion` is the checkable
 copy, this one is the human-readable claim, and they are meant to agree.
+
+
+-------------------------------------------------------------------------------
+Microsoft Corporation — vscode-js-debug (the JavaScript/Node debug adapter)
+-------------------------------------------------------------------------------
+
+What is used, and what is NOT shipped
+-------------------------------------
+herdr-edit can debug JavaScript and Node programs by RUNNING a js-debug debug
+adapter that the USER has installed. No part of vscode-js-debug is copied,
+vendored, bundled, linked or redistributed by this project. Nothing from it
+appears in the herdr-edit binary, the release archives or the brew formula.
+
+This is a different relationship from the entry above, and the distinction is
+the point of listing it separately:
+
+  * the language configuration DATA was copied into `internal/langconf/data.go`,
+    so MIT's notice-preservation requirement applies to our source tree;
+
+  * js-debug is a separate program invoked over a socket, exactly as `dlv` and
+    `debugpy` are. herdr-edit contains the knowledge of how to LAUNCH and SPEAK
+    to it — a file path, an argv, and the Debug Adapter Protocol — and none of
+    its code.
+
+It is recorded here anyway because a user reasonably wants to know what the
+editor will execute on their machine and under what terms, and because the
+choice to resolve a user-installed copy rather than ship one is a licensing
+decision worth stating rather than inferring.
+
+How it is resolved
+------------------
+`internal/dap/registry.go` (`LocateJsDebug`) looks for `dapDebugServer.js` in,
+in order:
+
+  1. the project's own `node_modules/@vscode/js-debug` or `node_modules/js-debug`
+  2. `$XDG_DATA_HOME/js-debug`
+  3. `~/.local/share/js-debug`
+
+and reports the adapter as not installed when there is none, with an install
+hint naming the release. It is run with the user's own `node`.
+
+🔴 The copy inside a Visual Studio Code installation is deliberately NOT used,
+and the reason is technical rather than legal. `ms-vscode.js-debug` declares
+`"license": "MIT"` and would pass the OSI allow-list in `registry.go` that keeps
+this editor out of proprietary extension directories — but that build ships only
+`extension.js` and is hosted by the VS Code extension host, with no
+`dapDebugServer.js` anywhere (verified against Visual Studio Code 1.131.0). It
+is not a standalone DAP server and could not be run as one. The standalone
+release is the only route.
+
+Provenance
+----------
+  Upstream project : vscode-js-debug (github.com/microsoft/vscode-js-debug)
+  Upstream licence : MIT
+  Version measured : 1.117.0 (js-debug-dap-v1.117.0.tar.gz)
+  Distributed here : NOTHING — resolved from a user install at run time
+  Recorded in code : the `js-debug` entry in `dap.DefaultAdapters`, whose
+                     InstallHint names the release
+
+The release tarball carries its own `LICENSE` file, which stays with the user's
+installed copy where MIT requires it to be.
+
+Copyright notice (preserved as MIT requires)
+--------------------------------------------
+
+  Copyright (c) Microsoft Corporation. All rights reserved.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
+Installing it
+-------------
+    curl -fsSL -o js-debug.tar.gz \
+      https://github.com/microsoft/vscode-js-debug/releases/download/v1.117.0/js-debug-dap-v1.117.0.tar.gz
+    mkdir -p ~/.local/share/js-debug
+    tar -xzf js-debug.tar.gz -C ~/.local/share/js-debug

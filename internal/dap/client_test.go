@@ -957,14 +957,17 @@ func TestTerminateRefusalStillKillsTheDebuggee(t *testing.T) {
 	stopFake(c, f)
 }
 
-// TestInitializeClaimsOnlyWhatWeHonour pins the capability declaration.
+// TestInitializeClaimsOnlyWhatWeHonour pins the capability declaration: exactly
+// what this client does, and nothing it does not.
 //
-// Claiming supportsRunInTerminalRequest would make an adapter send US a request
-// it then blocks on, and nothing here answers a reverse request. The other two
-// are claimed because stage 3 genuinely reads them — and NOT claiming
-// supportsVariableType would entitle an adapter to omit the type attribute, so
-// the variables picker would show no types and look like the adapter did not
-// know them.
+// 🔴 The two reverse-request capabilities go OPPOSITE ways, and each direction
+// is the correct one for a different reason. runInTerminal stays false because
+// this editor owns the only terminal there is and genuinely cannot run a
+// debuggee in another — claiming it would make an adapter send a request it then
+// blocks on, for something we would have to refuse anyway. startDebugging is
+// true because the handler is real: js-debug's session only exists once it has
+// been honoured. Leaving THAT one false while implementing it is the mirror
+// mistake, and the quieter of the two.
 func TestInitializeClaimsOnlyWhatWeHonour(t *testing.T) {
 	args := initializeArgsForClient("go")
 	if !args.SupportsVariableType {
@@ -974,7 +977,11 @@ func TestInitializeClaimsOnlyWhatWeHonour(t *testing.T) {
 		t.Error("supportsVariablePaging is not claimed, but Variables sends start/count")
 	}
 	if args.SupportsRunInTerminalRequest {
-		t.Error("supportsRunInTerminalRequest is claimed; nothing here answers a reverse request")
+		t.Error("supportsRunInTerminalRequest is claimed; nothing here runs a debuggee in a terminal")
+	}
+	if !args.SupportsStartDebuggingRequest {
+		t.Error("supportsStartDebuggingRequest is not claimed, but readLoop answers one and " +
+			"AwaitChildSession is what makes js-debug's session exist at all")
 	}
 	if !args.LinesStartAt1 || !args.ColumnsStartAt1 {
 		t.Error("the 1-based declaration this package's whole coordinate contract rests on is missing")
@@ -1234,4 +1241,296 @@ func TestStdioAdapterDeathIsReported(t *testing.T) {
 	t.Fatalf("the adapter's stderr never reached the log; logs %v", logs)
 
 	_ = c
+}
+
+// -----------------------------------------------------------------------------
+// Reverse requests and child sessions (js-debug)
+// -----------------------------------------------------------------------------
+
+// reverseRequest sends a request FROM the fake adapter TO the client and returns
+// the seq it used, so a test can prove the answer is addressed to this request
+// and not to some other traffic in flight.
+func (f *fakeAdapter) reverseRequest(command string, args interface{}) int {
+	f.t.Helper()
+	f.seq++
+	seq := f.seq
+	f.write(Request{Seq: seq, Type: TypeRequest, Command: command, Arguments: args})
+	return seq
+}
+
+// readResponse reads one framed RESPONSE from the client.
+//
+// A sibling of readRequest rather than a reuse of it: Request has no Success
+// field, so decoding an answer as one would silently discard the very thing a
+// refusal test is about.
+func (f *fakeAdapter) readResponse() Response {
+	f.t.Helper()
+	body, err := readMessage(f.r)
+	if err != nil {
+		f.t.Fatalf("fake adapter read: %v", err)
+	}
+	var resp Response
+	if err := json.Unmarshal(body, &resp); err != nil {
+		f.t.Fatalf("fake adapter decode: %v", err)
+	}
+	return resp
+}
+
+// TestSecondStartDebuggingIsRefusedLoudly pins the scope decision: this client
+// tracks ONE active leaf session, and an adapter asking for a second is told no
+// in a way the user can see.
+//
+// 🔴 Both quiet alternatives are worse than the refusal. Dropping the request
+// leaves the adapter BLOCKED on it forever — a reverse request is a request, and
+// js-debug waits for its answer — so the session stops making progress with
+// nothing logged. Accepting it would REPLACE the session on screen: the user
+// would step through a browser while the server they set a breakpoint in ran to
+// completion unobserved, which is the failure that renders as a plausible,
+// wrong debugger.
+//
+// The first request must still be honoured, which is why this drives both: a
+// guard that refused everything would pass a test that only sent one.
+func TestSecondStartDebuggingIsRefusedLoudly(t *testing.T) {
+	var col collector
+	c, f := newFakePair(t, col.handlers())
+	defer stopFake(c, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	firstSeq := f.reverseRequest(CommandStartDebugging, map[string]interface{}{
+		"request": "launch",
+		"configuration": map[string]interface{}{
+			"type": "pwa-node", "name": "server.js [4242]", "__pendingTargetId": "aaa",
+		},
+	})
+	first := f.readResponse()
+	if !first.Success {
+		t.Fatalf("the FIRST startDebugging was refused (%+v); the leaf session would never exist", first)
+	}
+	if first.RequestSeq != firstSeq {
+		t.Errorf("answered request_seq %d, want %d — the adapter is waiting on a different request",
+			first.RequestSeq, firstSeq)
+	}
+	if first.Command != CommandStartDebugging {
+		t.Errorf("answer names command %q, want %q", first.Command, CommandStartDebugging)
+	}
+
+	cs, err := c.AwaitChildSession(ctx)
+	if err != nil {
+		t.Fatalf("the accepted child session was never delivered: %v", err)
+	}
+	if cs.Request != "launch" || cs.Configuration["__pendingTargetId"] != "aaa" {
+		t.Fatalf("the delivered child session is not the one asked for: %+v", cs)
+	}
+
+	// --- the second one -----------------------------------------------------
+	const declined = "localhost:3000"
+	secondSeq := f.reverseRequest(CommandStartDebugging, map[string]interface{}{
+		"request": "launch",
+		"configuration": map[string]interface{}{
+			"type": "pwa-chrome", "name": declined, "__pendingTargetId": "bbb",
+		},
+	})
+	second := f.readResponse()
+	if second.RequestSeq != secondSeq {
+		t.Fatalf("answered request_seq %d, want %d", second.RequestSeq, secondSeq)
+	}
+	if second.Success {
+		t.Fatal("the SECOND startDebugging was ACCEPTED. Only one leaf session is tracked, so " +
+			"this either replaces the session the user is looking at or is dropped on the floor; " +
+			"both leave a live process nobody is debugging.")
+	}
+	if second.Message == "" {
+		t.Error("the refusal carries no message, so the adapter is told no for no stated reason")
+	}
+
+	// Refused is not the same as swallowed: the user has to be able to see WHICH
+	// session was declined, or a browser silently failing to attach looks like a
+	// broken debugger rather than a deliberate limit.
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		col.mu.Lock()
+		joined := strings.Join(col.logs, " | ")
+		col.mu.Unlock()
+		if strings.Contains(joined, declined) {
+			t.Logf("the declined session was surfaced: %s", joined)
+			// And nothing was queued behind it: a refused request must not be
+			// delivered as if it had been accepted.
+			short, cancelShort := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancelShort()
+			if extra, err := c.AwaitChildSession(short); err == nil {
+				t.Fatalf("a refused child session was delivered anyway: %+v", extra)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	col.mu.Lock()
+	logs := append([]string(nil), col.logs...)
+	col.mu.Unlock()
+	t.Fatalf("the second startDebugging was refused SILENTLY — no log names %q. logs: %v",
+		declined, logs)
+}
+
+// TestUnknownReverseRequestIsAnsweredNotIgnored is the other half of the reverse
+// request contract.
+//
+// 🔴 readLoop used to `continue` past every reverse request with a comment
+// saying nothing answers one. That is not a decline, it is a HANG: the adapter
+// is blocked until it gets a response, so a request we never intend to honour
+// still has to be answered. runInTerminal is the realistic one — this editor
+// owns the only terminal there is and genuinely cannot run a debuggee in
+// another, so refusing it is correct and staying silent is not.
+func TestUnknownReverseRequestIsAnsweredNotIgnored(t *testing.T) {
+	var col collector
+	c, f := newFakePair(t, col.handlers())
+	defer stopFake(c, f)
+
+	seq := f.reverseRequest("runInTerminal", map[string]interface{}{
+		"kind": "integrated", "args": []string{"node", "app.js"},
+	})
+	resp := f.readResponse()
+	if resp.RequestSeq != seq {
+		t.Fatalf("answered request_seq %d, want %d", resp.RequestSeq, seq)
+	}
+	if resp.Success {
+		t.Error("runInTerminal was ACCEPTED; nothing here runs a debuggee in a terminal")
+	}
+	if resp.Message == "" {
+		t.Error("the refusal carries no message")
+	}
+	if resp.Command != "runInTerminal" {
+		t.Errorf("answer names command %q, want runInTerminal", resp.Command)
+	}
+}
+
+// jsDebugCapabilitiesBody is js-debug 1.117.0's initialize body, copied from the
+// wire. Trimmed to the keys this client reads, plus the two that make the
+// terminate decision a real choice rather than a default.
+//
+// 🔴 supportsTerminateRequest is present and FALSE here, where delve OMITS it —
+// and `supportTerminateDebuggee` (no "s", a different key meaning something
+// else) is true right beside it. That pair is the whole reason this fixture is
+// spelled out rather than reusing the delve-shaped "no capabilities at all"
+// case: a client that read the wrong key, or that treated present-and-false
+// differently from absent, would pass the existing test and send a `terminate`
+// this adapter does not implement.
+const jsDebugCapabilitiesBody = `{
+  "supportsConfigurationDoneRequest": true,
+  "supportsConditionalBreakpoints": true,
+  "supportsHitConditionalBreakpoints": true,
+  "supportsLogPoints": true,
+  "supportsFunctionBreakpoints": false,
+  "supportsEvaluateForHovers": true,
+  "supportsTerminateRequest": false,
+  "supportTerminateDebuggee": true,
+  "exceptionBreakpointFilters": [
+    {"filter": "all", "label": "Caught Exceptions", "default": false},
+    {"filter": "uncaught", "label": "Uncaught Exceptions", "default": false}
+  ]
+}`
+
+// TestJsDebugFallsBackToDisconnectWhenTerminateUnsupported drives js-debug's real
+// capability answer through Initialize and proves the shutdown route it forces.
+//
+// 🔴 The capabilities come through the REAL Initialize rather than being poked
+// into c.caps, because the claim is about what this client concludes from what
+// js-debug actually says — including that `supportTerminateDebuggee: true`
+// sitting next to it does NOT make `terminate` available. Sending terminate to
+// an adapter that never claimed it comes back as an unknown command, the editor
+// drops the session, and the node process keeps running with nothing on screen
+// to say so.
+func TestJsDebugFallsBackToDisconnectWhenTerminateUnsupported(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	caps := make(chan Capabilities, 1)
+	go func() {
+		got, err := c.Initialize(ctx, "pwa-node")
+		if err != nil {
+			t.Errorf("initialize: %v", err)
+		}
+		caps <- got
+	}()
+
+	req := f.readRequest()
+	if req.Command != "initialize" {
+		t.Fatalf("first request = %q, want initialize", req.Command)
+	}
+	f.seq++
+	f.write(Response{
+		Seq: f.seq, Type: TypeResponse, RequestSeq: req.Seq, Success: true,
+		Command: "initialize", Body: json.RawMessage(jsDebugCapabilitiesBody),
+	})
+
+	got := <-caps
+	if got.SupportsTerminateRequest {
+		t.Fatal("read supportsTerminateRequest as true from js-debug's answer, where it is false")
+	}
+	if !got.SupportsConditionalBreakpoints || !got.SupportsLogPoints {
+		t.Errorf("js-debug's conditional/logpoint support was lost in decoding: %+v", got)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.TerminateOrDisconnect(ctx) }()
+
+	req = f.readRequest()
+	if req.Command == "terminate" {
+		t.Fatal("sent `terminate` to js-debug, which reports supportsTerminateRequest:false. " +
+			"It answers with an unknown-command error, the editor drops the session, and the " +
+			"debugged node process is left running.")
+	}
+	if req.Command != "disconnect" {
+		t.Fatalf("request = %q, want disconnect", req.Command)
+	}
+	raw, _ := json.Marshal(req.Arguments)
+	if !contains(string(raw), `"terminateDebuggee":true`) {
+		t.Errorf("disconnect arguments = %s, want terminateDebuggee true or the debuggee outlives us", raw)
+	}
+	f.respond(req, struct{}{})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestEvaluateSendsFrameZero is the guard for the assumption js-debug falsified.
+//
+// 🔴 evaluateArgs.FrameID was an int with omitempty, justified by a comment
+// stating that frame 0 is not a valid frame id. That was true of delve and false
+// of js-debug, whose innermost frame is {"id":0}. omitempty dropped the field,
+// so an evaluate meant for the frame the user was looking at was answered
+// globally — the live oracle read `Uncaught ReferenceError: a is not defined`
+// for a variable in scope on the stopped line.
+//
+// A fixture-only test cannot catch that on its own, which is why this asserts on
+// the WIRE: the field has to be present and zero, not absent.
+func TestEvaluateSendsFrameZero(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	go func() { _, _ = c.Evaluate(ctx, "a", 0, EvalContextWatch) }()
+	req := f.readRequest()
+	raw, _ := json.Marshal(req.Arguments)
+	if !contains(string(raw), `"frameId":0`) {
+		t.Fatalf("evaluate arguments = %s — frame 0 was DROPPED, so the expression is evaluated "+
+			"globally instead of in the frame the user is looking at", raw)
+	}
+	f.respond(req, EvaluateResult{Result: "2"})
+
+	// The other half: with no frame to evaluate in, the field must be ABSENT
+	// rather than sent as zero, which would ask about frame zero instead.
+	go func() { _, _ = c.Evaluate(ctx, "a", 0, EvalContextRepl) }()
+	req = f.readRequest()
+	raw, _ = json.Marshal(req.Arguments)
+	if contains(string(raw), `"frameId"`) {
+		t.Fatalf("evaluate arguments = %s — a repl evaluate with no stop must not name a frame", raw)
+	}
+	f.respond(req, EvaluateResult{Result: "2"})
 }

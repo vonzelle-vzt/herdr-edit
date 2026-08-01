@@ -126,6 +126,40 @@ jobs:
           python3 -c "import debugpy; print('debugpy', debugpy.__version__)" \
             || { echo "debugpy is not importable — the live debugpy oracles would fail under HERDR_REQUIRE_DAP=1" >&2; exit 1; }
 
+      # The THIRD adapter. internal/dap/live_jsdebug_test.go drives a real js-debug, and the
+      # app-level child-session oracles drive the routing it forces. Same anti-skip reasoning as
+      # debugpy — installing the dependency is the fix, and relaxing the gate would restore a green
+      # badge over oracles that never execute.
+      #
+      # 🔴 js-debug is NOT on npm as a runnable adapter and it is NOT usable out of a VS Code
+      # install: the copy inside VS Code.app ships only extension.js and is hosted by the extension
+      # host, with no dapDebugServer.js anywhere. The standalone release tarball is the only route,
+      # which is why this curls a pinned version rather than installing a package.
+      #
+      # The version is PINNED deliberately. An oracle that silently follows `latest` stops being a
+      # measurement: the day js-debug changes its handshake, CI would go red on a commit that
+      # touched nothing, and the reason would look like our bug. Bump it on purpose.
+      - name: Install js-debug (for the live DAP oracle)
+        env:
+          JS_DEBUG_VERSION: "1.117.0"
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/share/js-debug"
+          curl -fsSL -o /tmp/js-debug.tar.gz \
+            "https://github.com/microsoft/vscode-js-debug/releases/download/v${JS_DEBUG_VERSION}/js-debug-dap-v${JS_DEBUG_VERSION}.tar.gz"
+          tar -xzf /tmp/js-debug.tar.gz -C "$HOME/.local/share/js-debug"
+
+      # Two things have to be true, and only the second is what the oracle needs. A resolvable
+      # dapDebugServer.js is useless without a `node` to run it with, and LocateJsDebug answers nil
+      # for BOTH causes — so checking only the file would let a missing node turn into a skip, which
+      # HERDR_REQUIRE_DAP=1 would then report as a failure inside internal/dap rather than here.
+      - name: Verify js-debug is reachable
+        run: |
+          command -v node || { echo "node is not on PATH — js-debug cannot be run at all" >&2; exit 1; }
+          node --version
+          test -f "$HOME/.local/share/js-debug/js-debug/src/dapDebugServer.js" \
+            || { echo "dapDebugServer.js is not where LocateJsDebug looks — the live js-debug oracles would fail under HERDR_REQUIRE_DAP=1" >&2; ls -R "$HOME/.local/share/js-debug" | head -50; exit 1; }
+
       - name: Test
         env:
           # Fail rather than skip if either live oracle cannot run. Both binaries

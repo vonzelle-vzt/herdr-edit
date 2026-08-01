@@ -456,3 +456,223 @@ func TestNotInstalledErrorCarriesAHint(t *testing.T) {
 		t.Errorf("error = %q, want the binary-not-on-PATH wording", got)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// js-debug resolution
+// -----------------------------------------------------------------------------
+
+// writeJsDebugServer creates a fake dapDebugServer.js at rel inside dir, so a
+// resolution test asserts on the FILE the adapter actually needs rather than on
+// a directory that happens to exist.
+func writeJsDebugServer(t *testing.T, dir, rel string) string {
+	t.Helper()
+	full := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("// fake\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return full
+}
+
+// TestAdapterForJavaScript pins the third adapter's table entry, including the
+// two flags that have no other visible effect until a session is live.
+//
+// 🔴 UsesChildSessions and BreakpointsBindLazily are DATA, and a session with
+// either one wrong looks healthy. Without the first the editor talks to a
+// coordinator that debugs nothing, so the program runs past every breakpoint;
+// without the second every working breakpoint is drawn as one the adapter
+// refused. Neither can be discovered at runtime, so both are asserted here.
+func TestAdapterForJavaScript(t *testing.T) {
+	a, ok := AdapterFor("javascript")
+	if !ok {
+		t.Fatal("no adapter registered for javascript")
+	}
+	if a.Name != "js-debug" {
+		t.Fatalf("javascript resolves to %q, want js-debug", a.Name)
+	}
+	if a.Transport != TransportServer {
+		t.Errorf("transport = %v, want TransportServer — js-debug is a server we dial, and only "+
+			"that transport can carry the second connection a child session needs", a.Transport)
+	}
+	if !a.UsesChildSessions {
+		t.Error("UsesChildSessions is false; the editor would arm the coordinator and the " +
+			"program would run past every breakpoint")
+	}
+	if !a.BreakpointsBindLazily {
+		t.Error("BreakpointsBindLazily is false; js-debug answers every setBreakpoints " +
+			"unverified, so every working breakpoint would be drawn as a refused one")
+	}
+	if a.ProgramIsDir {
+		t.Error("ProgramIsDir is true; node runs a FILE, not a directory")
+	}
+	if a.AdapterID != "pwa-node" {
+		t.Errorf("adapterID = %q, want pwa-node", a.AdapterID)
+	}
+	if a.Launch["console"] != "internalConsole" {
+		t.Errorf("launch console = %v, want internalConsole or the debuggee's output never "+
+			"comes back as events", a.Launch["console"])
+	}
+	// The install hint has to say how to GET it: js-debug is a tarball, not a
+	// binary on PATH, so "js-debug not found" would be unactionable on its own.
+	if !strings.Contains(a.InstallHint, "vscode-js-debug") {
+		t.Errorf("install hint %q does not name where to download the adapter", a.InstallHint)
+	}
+}
+
+// TestJsDebugLanguagesAreOnlyWhatIsProven pins the language claim to what a live
+// oracle actually drives.
+//
+// 🔴 A row in a table is a claim, and this fork has shipped three features whose
+// only caller was a test. `pwa-node` will happily be handed a .ts file and node
+// 24 can even strip the types — but nothing here proves a TypeScript breakpoint
+// binds through a source map, so claiming typescript would advertise a feature
+// no oracle covers. Add the language when an oracle covers it, not before.
+func TestJsDebugLanguagesAreOnlyWhatIsProven(t *testing.T) {
+	a, _ := AdapterFor("javascript")
+	for _, lang := range a.Languages {
+		switch lang {
+		case "javascript", "javascriptreact":
+		default:
+			t.Errorf("js-debug claims language %q, which no live oracle exercises", lang)
+		}
+	}
+	if _, ok := AdapterFor("typescript"); ok {
+		t.Error("typescript resolves to a debug adapter, but no oracle proves a TypeScript " +
+			"breakpoint binds through a source map — see this test's comment before adding it")
+	}
+}
+
+// TestLocateJsDebugPrefersTheProjectCopy is the same project-first rule
+// node_modules/.bin and the debugpy virtualenv follow: a repo that pins its own
+// debugger means the pinned one.
+func TestLocateJsDebugPrefersTheProjectCopy(t *testing.T) {
+	if findExecutable("node") == "" {
+		t.Skip("no node on this machine; js-debug cannot be resolved at all")
+	}
+	root := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", home)
+	writeJsDebugServer(t, home, filepath.Join("js-debug", "js-debug", "src", "dapDebugServer.js"))
+
+	// With only the user install present, that is what answers.
+	cmd := LocateJsDebug(root)
+	if cmd == nil {
+		t.Fatal("a user install was not found")
+	}
+	if !strings.Contains(cmd.Origin, "XDG_DATA_HOME") {
+		t.Errorf("origin = %q, want the user install", cmd.Origin)
+	}
+
+	// Add a project copy and it must win.
+	local := writeJsDebugServer(t, root, filepath.Join("node_modules", "@vscode", "js-debug", "src", "dapDebugServer.js"))
+	cmd = LocateJsDebug(root)
+	if cmd == nil {
+		t.Fatal("a project copy was not found")
+	}
+	if len(cmd.Argv) < 2 || cmd.Argv[1] != local {
+		t.Fatalf("argv = %v, want the project's own %s — a global copy silently beating a "+
+			"pinned one is how a project's version gets bypassed with nothing on screen",
+			cmd.Argv, local)
+	}
+}
+
+// TestLocateJsDebugAcceptsBothTarballLayouts covers the two shapes the same
+// release arrives in: extracted into ~/.local/share/js-debug (which keeps the
+// tarball's own js-debug/ wrapper) and moved up a level. Probing for the FILE is
+// what makes both work without this code having to be right about which the user
+// chose.
+func TestLocateJsDebugAcceptsBothTarballLayouts(t *testing.T) {
+	if findExecutable("node") == "" {
+		t.Skip("no node on this machine; js-debug cannot be resolved at all")
+	}
+	for _, rel := range []string{
+		filepath.Join("js-debug", "js-debug", "src", "dapDebugServer.js"),
+		filepath.Join("js-debug", "src", "dapDebugServer.js"),
+	} {
+		t.Run(rel, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("XDG_DATA_HOME", home)
+			want := writeJsDebugServer(t, home, rel)
+			cmd := LocateJsDebug(t.TempDir())
+			if cmd == nil {
+				t.Fatalf("layout %s was not found", rel)
+			}
+			if len(cmd.Argv) < 2 || cmd.Argv[1] != want {
+				t.Fatalf("argv = %v, want to run %s", cmd.Argv, want)
+			}
+		})
+	}
+}
+
+// TestLocateJsDebugArgvAsksForAnEphemeralPort pins the readiness contract.
+//
+// 🔴 Port 0 is what makes TransportServer race-free. The adapter picks a free
+// port and PRINTS it, and that printed line is itself the readiness signal —
+// it cannot appear before the socket can be accepted on. Choosing a port here
+// instead reintroduces both halves of the race the transport removes: the port
+// can be taken between the probe and the bind, and dialing early fails as
+// "connection refused", which is indistinguishable from a missing adapter.
+func TestLocateJsDebugArgvAsksForAnEphemeralPort(t *testing.T) {
+	if findExecutable("node") == "" {
+		t.Skip("no node on this machine; js-debug cannot be resolved at all")
+	}
+	home := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", home)
+	writeJsDebugServer(t, home, filepath.Join("js-debug", "src", "dapDebugServer.js"))
+
+	cmd := LocateJsDebug(t.TempDir())
+	if cmd == nil {
+		t.Fatal("js-debug was not resolved")
+	}
+	if len(cmd.Argv) != 4 {
+		t.Fatalf("argv = %v, want node, the server, a port and a host", cmd.Argv)
+	}
+	if cmd.Argv[2] != "0" {
+		t.Errorf("argv asks for port %q, want \"0\" — a chosen port can be taken between the "+
+			"choice and the bind", cmd.Argv[2])
+	}
+	if cmd.Argv[3] != "127.0.0.1" {
+		t.Errorf("argv listens on %q; the adapter must not be reachable off this machine", cmd.Argv[3])
+	}
+}
+
+// TestJsDebugServerInRefusesTheVSCodeShape is the negative case, and it is
+// asserted on the probe rather than on LocateJsDebug so it is HERMETIC.
+//
+// 🔴 Driving LocateJsDebug here would be a test of the developer's machine:
+// it also searches ~/.local/share/js-debug, so a real install makes it answer
+// and no amount of XDG_DATA_HOME juggling hides that. Faking HOME instead would
+// make it return nil for the WRONG reason — no node — which is a vacuous pass.
+//
+// The shape being refused is the real one. ms-vscode.js-debug is MIT and would
+// pass the licence allow-list, and its directory looks exactly right, but its
+// src/ holds extension.js and no dapDebugServer.js anywhere (verified against
+// VS Code 1.131.0) because that build is hosted by the extension host.
+// Resolving on the directory would find it, run nothing, and report a missing
+// adapter as a launch failure.
+func TestJsDebugServerInRefusesTheVSCodeShape(t *testing.T) {
+	dir := t.TempDir()
+	writeJsDebugServer(t, dir, filepath.Join("src", "extension.js"))
+	writeJsDebugServer(t, dir, filepath.Join("src", "bootloader.js"))
+	if got := jsDebugServerIn(dir); got != "" {
+		t.Fatalf("accepted %q out of a directory with no dapDebugServer.js", got)
+	}
+
+	// The positive control, or an implementation that never accepts anything
+	// would pass the half above.
+	want := writeJsDebugServer(t, dir, filepath.Join("src", "dapDebugServer.js"))
+	if got := jsDebugServerIn(dir); got != want {
+		t.Fatalf("jsDebugServerIn = %q, want %q", got, want)
+	}
+
+	// A DIRECTORY named like the server is not the server.
+	other := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(other, "src", "dapDebugServer.js"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := jsDebugServerIn(other); got != "" {
+		t.Fatalf("accepted the directory %q as the adapter server", got)
+	}
+}

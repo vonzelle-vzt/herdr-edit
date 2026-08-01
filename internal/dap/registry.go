@@ -61,6 +61,35 @@ type Adapter struct {
 	// Languages this adapter debugs, as internal/lsp LanguageID values.
 	Languages []string
 
+	// UsesChildSessions says this adapter's root connection is a COORDINATOR
+	// that debugs nothing itself, and that the session the user interacts with
+	// only exists after a startDebugging reverse request has been honoured.
+	//
+	// 🔴 It is data rather than a check on the reverse request arriving,
+	// because the two failures it guards are opposite and both silent. For
+	// js-debug, NOT waiting for the child means the editor talks to the
+	// coordinator: breakpoints are accepted, nothing ever binds, and the
+	// program runs to completion looking like a debugger that works. For delve
+	// and debugpy, WAITING would hang every F5 on a request that is never sent.
+	// Neither can be discovered at runtime without already knowing the answer.
+	UsesChildSessions bool
+
+	// BreakpointsBindLazily says this adapter answers setBreakpoints BEFORE it
+	// can know whether the breakpoint is reachable, so an unverified answer
+	// means "pending", not "refused".
+	//
+	// 🔴 MEASURED against js-debug 1.117.0, and the editor lies without it.
+	// Every setBreakpoints answer comes back
+	// {"id":1,"verified":false,"message":"breakpoint.provisionalBreakpoint"} —
+	// and the breakpoint then HITS. No `breakpoint` event ever arrives to
+	// upgrade it, and re-sending the file while stopped answers with an EMPTY
+	// array. So with delve's reading of `verified` the gutter paints a hollow ○
+	// on a breakpoint that works and the status bar reports "N breakpoint(s)
+	// could not be set on an executable line" about a program that is about to
+	// stop on all of them. Delve and debugpy both answer verified:true, so
+	// nothing existing changes.
+	BreakpointsBindLazily bool
+
 	// ProgramIsDir says the `program` launch key names a DIRECTORY rather than
 	// the file the user pressed F5 on.
 	//
@@ -153,6 +182,33 @@ var DefaultAdapters = []Adapter{
 		},
 		InstallHint: "run `pip install debugpy` in the project's virtualenv, " +
 			"or install the MIT-licensed ms-python.debugpy VS Code extension",
+	},
+	{
+		Name:      "js-debug",
+		AdapterID: "pwa-node",
+		Locate:    LocateJsDebug,
+		// 🔴 A THIRD transport shape. delve is a socket we listen on, debugpy
+		// speaks stdio, and js-debug is a TCP server we dial — and only the
+		// third can carry the second connection a child session needs.
+		Transport:             TransportServer,
+		Languages:             []string{"javascript", "javascriptreact"},
+		ProgramIsDir:          false, // node runs the FILE
+		UsesChildSessions:     true,
+		BreakpointsBindLazily: true,
+		Launch: map[string]interface{}{
+			"request": "launch",
+			"type":    "pwa-node",
+
+			// The sibling of delve's outputMode:remote and debugpy's console
+			// key: what makes the debuggee's console.log come back as `output`
+			// events instead of being handed a terminal this editor owns.
+			// Measured: the program's stdout arrives on the CHILD connection as
+			// {"category":"stdout","output":"SENTINEL 5\n"}.
+			"console": "internalConsole",
+		},
+		InstallHint: "download js-debug-dap-v1.117.0.tar.gz from " +
+			"https://github.com/microsoft/vscode-js-debug/releases and extract it into " +
+			"~/.local/share/js-debug/ (node is also required)",
 	},
 }
 
@@ -533,6 +589,109 @@ func findDebugpyInVSCodeExtensions(roots []string) string {
 		}
 	}
 	return found
+}
+
+// -----------------------------------------------------------------------------
+// js-debug resolution
+// -----------------------------------------------------------------------------
+
+// jsDebugServerRelPaths are the places dapDebugServer.js sits inside an install
+// root, tried in order.
+//
+// Three spellings rather than one because the same artifact arrives three ways:
+// `tar -xzf` inside ~/.local/share/js-debug leaves the tarball's own `js-debug/`
+// wrapper in place, moving the contents up removes it, and an npm package puts
+// its build output under dist/. Probing for the FILE covers all three without
+// this code having to be right about which one the user chose.
+var jsDebugServerRelPaths = []string{
+	filepath.Join("js-debug", "src", "dapDebugServer.js"),
+	filepath.Join("src", "dapDebugServer.js"),
+	filepath.Join("dist", "src", "dapDebugServer.js"),
+}
+
+// LocateJsDebug finds a standalone js-debug DAP server, project-local first.
+//
+//  1. the project's own node_modules — the same reasoning as lsp's
+//     node_modules/.bin rule and debugpy's virtualenv rule: a repo that pins its
+//     debugger means the pinned one;
+//  2. a user install under $XDG_DATA_HOME/js-debug or ~/.local/share/js-debug.
+//
+// Returns nil when there is no server or no node to run it with.
+//
+// 🔴 There is deliberately NO VS Code extension route, and this is the one
+// adapter where the licence allow-list is not what rules it out. The copy inside
+// Visual Studio Code.app IS MIT and would pass vscodeExtensionIsOSILicensed —
+// it is simply not a DAP server. Verified against 1.131.0: its `src/` holds
+// extension.js, bootloader.js and targets/, and no dapDebugServer.js anywhere,
+// because that build is hosted by the extension host and speaks to it in
+// process. Adding the lookup would find a directory, run nothing, and report a
+// missing adapter as a launch failure. The standalone release is the only route.
+func LocateJsDebug(root string) *Command {
+	node := findExecutable("node")
+	if node == "" {
+		return nil
+	}
+	for _, cand := range jsDebugRoots(root) {
+		if server := jsDebugServerIn(cand.dir); server != "" {
+			// Port 0 and the loopback host: the adapter picks a free port and
+			// prints it, which is what startServerCommand reads back. Choosing
+			// one here would reintroduce the race that removes.
+			return &Command{
+				Argv:   []string{node, server, "0", "127.0.0.1"},
+				Origin: cand.origin,
+			}
+		}
+	}
+	return nil
+}
+
+// jsDebugServerIn returns the dapDebugServer.js inside one install root, or ""
+// when that directory is not a js-debug install.
+//
+// 🔴 It probes for the FILE, never for the directory, and that distinction is
+// what keeps the VS Code copy out. ms-vscode.js-debug is MIT — it would pass the
+// licence allow-list — and its directory looks exactly right, but its src/ holds
+// extension.js and no dapDebugServer.js anywhere, because that build is hosted
+// by the extension host and speaks to it in process. Verified against VS Code
+// 1.131.0. Resolving on the directory would find it, run nothing, and report a
+// missing adapter as a launch failure.
+func jsDebugServerIn(dir string) string {
+	for _, rel := range jsDebugServerRelPaths {
+		server := filepath.Join(dir, rel)
+		if fi, err := os.Stat(server); err == nil && !fi.IsDir() {
+			return server
+		}
+	}
+	return ""
+}
+
+// jsDebugRoot is one candidate install directory and how to describe where it
+// came from, because "js-debug started" means something different depending on
+// whether it was the repo's pinned copy or a global one.
+type jsDebugRoot struct {
+	dir    string
+	origin string
+}
+
+// jsDebugRoots lists the install directories to probe, project-local first.
+func jsDebugRoots(root string) []jsDebugRoot {
+	var out []jsDebugRoot
+	if root != "" {
+		out = append(out,
+			jsDebugRoot{filepath.Join(root, "node_modules", "@vscode", "js-debug"), "node_modules/@vscode/js-debug"},
+			jsDebugRoot{filepath.Join(root, "node_modules", "js-debug"), "node_modules/js-debug"},
+		)
+	}
+	// $XDG_DATA_HOME is honoured before the hardcoded default so a machine that
+	// moved its data directory is not told the adapter is missing while it sits
+	// where that machine puts things.
+	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+		out = append(out, jsDebugRoot{filepath.Join(xdg, "js-debug"), "$XDG_DATA_HOME/js-debug"})
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		out = append(out, jsDebugRoot{filepath.Join(home, ".local", "share", "js-debug"), "~/.local/share/js-debug"})
+	}
+	return out
 }
 
 // Describe summarises registry state in one line for the status bar.

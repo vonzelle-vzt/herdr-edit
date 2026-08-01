@@ -107,6 +107,39 @@ type boundBreakpoint struct {
 	Bound     int // where the adapter will actually stop; == Requested when unmoved
 	Verified  bool
 	Message   string
+
+	// Pending is an unverified answer from an adapter that BINDS LAZILY, which
+	// means "not resolved yet", not "refused".
+	//
+	// 🔴 Without this the editor calls a working breakpoint broken. js-debug
+	// answers every setBreakpoints with verified:false and
+	// message:"breakpoint.provisionalBreakpoint", never sends a `breakpoint`
+	// event to upgrade it, and then stops on it — all measured. Reading that
+	// answer the way delve's is read paints a hollow ○ in the gutter and
+	// announces "N breakpoint(s) could not be set on an executable line" about
+	// breakpoints the program is about to hit. See Adapter.BreakpointsBindLazily.
+	Pending bool
+}
+
+// WillBind reports whether the debugger is expected to stop here — either the
+// adapter confirmed it, or it is an adapter that confirms nothing up front.
+//
+// 🔴 The gutter and the published panel payload BOTH go through this. Two
+// readings of the same three fields would eventually disagree, and the symptom
+// would be a breakpoint drawn hollow in the editor and solid in the panel beside
+// it, with nothing to say which one is right.
+func (b boundBreakpoint) WillBind() bool { return b.Verified || b.Pending }
+
+// breakpointPolicy is what ONE adapter's setBreakpoints answers mean, gathered
+// so the push path takes a single argument rather than accumulating one
+// parameter per adapter quirk.
+type breakpointPolicy struct {
+	// adapter names the adapter in anything shown to the user.
+	adapter string
+	// caps decides which breakpoint fields may be sent at all.
+	caps dap.Capabilities
+	// lazyBind maps Adapter.BreakpointsBindLazily onto the answers.
+	lazyBind bool
 }
 
 // debugFrame is one stack frame in BUFFER coordinates.
@@ -128,6 +161,22 @@ type debugFrame struct {
 type debugSession struct {
 	client  *dap.Client
 	adapter string
+
+	// root is the COORDINATOR connection for an adapter that debugs through
+	// child sessions, and nil for the two that do not.
+	//
+	// 🔴 It is held only so it can be stopped LAST. js-debug's root owns the
+	// server process and the child connection is a second socket into it, so
+	// killing the root first takes the leaf down mid-disconnect and the debuggee
+	// outlives both — the exact process leak TerminateOrDisconnect exists to
+	// prevent, arrived at from the other direction. Nothing in the UI ever talks
+	// to it: every request goes to client, which IS the leaf.
+	root *dap.Client
+
+	// lazyBind mirrors Adapter.BreakpointsBindLazily for this session, so the
+	// meaning of an unverified answer travels with the session that produced it
+	// rather than being looked up again by whoever is drawing.
+	lazyBind bool
 
 	// config names what this session is running, for the panels that mirror it.
 	// The editor has no launch.json reader — F5 debugs the active file — so it
@@ -197,6 +246,14 @@ type debugSession struct {
 	lastErr string
 }
 
+// policy gathers how this session's adapter answers setBreakpoints. Computed on
+// demand rather than stored, because a `capabilities` event can revise caps
+// mid-session and a cached policy would keep refusing a condition the adapter
+// has since said it supports.
+func (s *debugSession) policy() breakpointPolicy {
+	return breakpointPolicy{adapter: s.adapter, caps: s.caps, lazyBind: s.lazyBind}
+}
+
 // dropVariableCache invalidates every cached variables reference, leaving the
 // frame list alone. Used when the stop is still valid but what the user is
 // looking at within it has changed — selecting another frame.
@@ -246,8 +303,12 @@ func (e *debugEvent) When() time.Time { return e.when }
 // debugStartedEvent reports the outcome of bringing a session up, with the
 // breakpoints the adapter bound along the way.
 type debugStartedEvent struct {
-	when    time.Time
-	client  *dap.Client
+	when time.Time
+	// client is the LEAF: the connection the UI talks to. For an adapter with
+	// child sessions that is the child, never the coordinator.
+	client *dap.Client
+	// root is the coordinator to shut down last, and nil when there is none.
+	root    *dap.Client
 	adapter string
 	caps    dap.Capabilities
 	bound   map[string][]boundBreakpoint
@@ -419,7 +480,8 @@ func (a *App) menuStartDebug() {
 
 	a.debug = &debugSession{
 		adapter: adapter.Name, config: program, starting: true,
-		bound: map[string][]boundBreakpoint{},
+		lazyBind: adapter.BreakpointsBindLazily,
+		bound:    map[string][]boundBreakpoint{},
 	}
 	go a.runDebugSession(adapter, program, bps)
 
@@ -507,21 +569,141 @@ func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpo
 		return
 	}
 
-	bound, notes := pushBreakpoints(ctx, client, caps, adapter.Name, groupBreakpointsByPath(bps))
+	groups := groupBreakpointsByPath(bps)
+	pol := breakpointPolicy{adapter: adapter.Name, caps: caps, lazyBind: adapter.BreakpointsBindLazily}
 
-	if err := client.SetExceptionBreakpoints(ctx, caps.DefaultFilters()); err != nil {
-		a.post(&debugLogEvent{when: time.Now(), msg: "exception breakpoints: " + err.Error()})
+	if !adapter.UsesChildSessions {
+		bound, notes, err := a.configureSession(ctx, client, pol, groups)
+		if err != nil {
+			client.Stop()
+			fail(err)
+			return
+		}
+		a.post(&debugStartedEvent{
+			when: time.Now(), client: client, adapter: adapter.Name,
+			caps: caps, bound: bound, notes: notes,
+		})
+		return
 	}
-	if err := client.ConfigurationDone(ctx); err != nil {
+
+	// 🔴 The coordinator is configured with NO BREAKPOINTS. This is the single
+	// most likely way this ships broken while looking fine: js-debug's root
+	// session accepts setBreakpoints and answers plausibly, nothing ever binds
+	// there, and the program runs straight past every one of them. VS Code arms
+	// each session individually for the same reason. The root still needs its
+	// configurationDone — measured, it will not launch the program without one,
+	// so startDebugging never arrives and F5 hangs until the start timeout.
+	if _, _, err := a.configureSession(ctx, client, pol, nil); err != nil {
 		client.Stop()
 		fail(err)
 		return
 	}
 
+	root := client
+	leaf, leafCaps, err := a.adoptChildSession(ctx, adapter, root)
+	if err != nil {
+		root.Stop()
+		fail(withAdapterStderr(err, root))
+		return
+	}
+
+	leafPol := breakpointPolicy{adapter: adapter.Name, caps: leafCaps, lazyBind: adapter.BreakpointsBindLazily}
+	bound, notes, err := a.configureSession(ctx, leaf, leafPol, groups)
+	if err != nil {
+		leaf.Stop()
+		root.Stop()
+		fail(err)
+		return
+	}
+
 	a.post(&debugStartedEvent{
-		when: time.Now(), client: client, adapter: adapter.Name,
-		caps: caps, bound: bound, notes: notes,
+		when: time.Now(), client: leaf, root: root, adapter: adapter.Name,
+		caps: leafCaps, bound: bound, notes: notes,
 	})
+}
+
+// configureSession runs the half of the handshake that follows `initialized`:
+// arm the breakpoints, select the exception filters, and say the configuration
+// is complete.
+//
+// Shared by the root and the leaf on purpose. The child's sequence is not
+// "similar to" the root's — it is the same sequence against a second
+// connection, and writing it twice would leave two places for the
+// configurationDone that must not be skipped.
+//
+// A nil groups map sends no breakpoints at all, which is what the coordinator
+// gets.
+func (a *App) configureSession(ctx context.Context, client *dap.Client, pol breakpointPolicy,
+	groups map[string][]Breakpoint) (map[string][]boundBreakpoint, []string, error) {
+
+	bound, notes := pushBreakpoints(ctx, client, pol, groups)
+
+	if err := client.SetExceptionBreakpoints(ctx, pol.caps.DefaultFilters()); err != nil {
+		a.post(&debugLogEvent{when: time.Now(), msg: "exception breakpoints: " + err.Error()})
+	}
+	if err := client.ConfigurationDone(ctx); err != nil {
+		return nil, nil, err
+	}
+	return bound, notes, nil
+}
+
+// adoptChildSession waits for the coordinator to hand over a leaf session, dials
+// it, and gets it as far as `initialized`.
+//
+// 🔴 The ordering trap is the same one debugpy proved real, on a second
+// connection: launch is SENT and never awaited. Measured against js-debug, the
+// child's launch response arrives only AFTER its configurationDone — 1989ms
+// against a launch sent at 1932ms, with setBreakpoints and configurationDone in
+// between — so a caller that waited here would hang having armed nothing.
+//
+// It returns before configuring the leaf because the caller owns what goes in
+// the middle of that gap, which is the whole reason Launch hands back a channel.
+func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *dap.Client) (*dap.Client, dap.Capabilities, error) {
+	cs, err := root.AwaitChildSession(ctx)
+	if err != nil {
+		return nil, dap.Capabilities{}, err
+	}
+
+	handlers := dap.Handlers{
+		OnEvent: func(e dap.Event) { a.post(&debugEvent{when: time.Now(), ev: e}) },
+		OnLog:   func(s string) { a.post(&debugLogEvent{when: time.Now(), msg: s}) },
+	}
+	leaf, err := root.DialChild(adapter.Name, handlers)
+	if err != nil {
+		return nil, dap.Capabilities{}, err
+	}
+
+	caps, err := leaf.Initialize(ctx, adapter.AdapterID)
+	if err != nil {
+		leaf.Stop()
+		return nil, dap.Capabilities{}, err
+	}
+
+	// 🔴 The configuration goes over VERBATIM. It is not merged with
+	// adapter.Launch and `program` is not re-added: the child's config carries a
+	// __pendingTargetId naming the process the root ALREADY started, and adding
+	// program back asks it to launch a second copy — so the user would step
+	// through one process while another ran unobserved.
+	if _, err := launchOrAttach(leaf, cs); err != nil {
+		leaf.Stop()
+		return nil, dap.Capabilities{}, err
+	}
+	if err := leaf.WaitEvent(ctx, dap.EventInitialized); err != nil {
+		leaf.Stop()
+		return nil, dap.Capabilities{}, err
+	}
+	return leaf, caps, nil
+}
+
+// launchOrAttach starts a child session the way its parent asked for it. A
+// coordinator that spawned a process wants `launch`; one that found an existing
+// target wants `attach`, and sending the wrong verb is refused rather than
+// silently reinterpreted.
+func launchOrAttach(client *dap.Client, cs dap.ChildSession) (<-chan dap.Response, error) {
+	if cs.Request == "attach" {
+		return client.Attach(cs.Configuration)
+	}
+	return client.Launch(cs.Configuration)
 }
 
 // pushBreakpoints sends each file's COMPLETE breakpoint set and reports what the
@@ -536,7 +718,7 @@ func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpo
 //
 // A file the adapter refuses is not fatal: the others may still bind, and
 // abandoning the run over one bad path throws away a working debug session.
-func pushBreakpoints(ctx context.Context, client *dap.Client, caps dap.Capabilities, adapter string,
+func pushBreakpoints(ctx context.Context, client *dap.Client, pol breakpointPolicy,
 	groups map[string][]Breakpoint) (map[string][]boundBreakpoint, []string) {
 
 	bound := make(map[string][]boundBreakpoint, len(groups))
@@ -544,7 +726,7 @@ func pushBreakpoints(ctx context.Context, client *dap.Client, caps dap.Capabilit
 	droppedConditions, droppedLogpoints := 0, 0
 
 	for path, list := range groups {
-		sbps, nCond, nLog := sourceBreakpointsFor(caps, list)
+		sbps, nCond, nLog := sourceBreakpointsFor(pol.caps, list)
 		droppedConditions += nCond
 		droppedLogpoints += nLog
 
@@ -553,12 +735,12 @@ func pushBreakpoints(ctx context.Context, client *dap.Client, caps dap.Capabilit
 			notes = append(notes, "breakpoints in "+filepath.Base(path)+": "+err.Error())
 			continue
 		}
-		bound[path] = boundFromAnswers(list, answers)
+		bound[path] = boundFromAnswers(list, answers, pol.lazyBind)
 	}
 	// Counted across every file and reported ONCE. Per-file messages would say
 	// the same sentence three times for a project with breakpoints in three
 	// files, and the status bar shows one line.
-	notes = append(capabilityRefusals(adapter, droppedConditions, droppedLogpoints), notes...)
+	notes = append(capabilityRefusals(pol.adapter, droppedConditions, droppedLogpoints), notes...)
 	return bound, notes
 }
 
@@ -673,11 +855,16 @@ func (a *App) resendBreakpoints() {
 		}
 	}
 
-	client, caps, adapter := a.debug.client, a.debug.caps, a.debug.adapter
+	// 🔴 a.debug.client is the LEAF for a coordinating adapter, so a mid-session
+	// edit lands on the connection that actually holds the breakpoints. Reaching
+	// for the root here would arm the coordinator, which is the same bug the
+	// start path guards against and would be much quieter: the session already
+	// works, so only the breakpoint edited after F5 would fail to fire.
+	client, pol := a.debug.client, a.debug.policy()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), debugRequestTimeout)
 		defer cancel()
-		bound, notes := pushBreakpoints(ctx, client, caps, adapter, groups)
+		bound, notes := pushBreakpoints(ctx, client, pol, groups)
 		a.post(&debugRebindEvent{when: time.Now(), bound: bound, notes: notes})
 	}()
 }
@@ -705,7 +892,9 @@ func (a *App) handleDebugRebind(e *debugRebindEvent) {
 // to the request other than its index — so this walks both together. An
 // unverified breakpoint has no line at all (HasLine is false), and its Bound
 // stays at the requested line rather than becoming line 1 of the file.
-func boundFromAnswers(asked []Breakpoint, answers []dap.Breakpoint) []boundBreakpoint {
+// lazyBind marks an unverified answer as pending rather than refused, for the
+// adapters that answer before they can know. See boundBreakpoint.Pending.
+func boundFromAnswers(asked []Breakpoint, answers []dap.Breakpoint, lazyBind bool) []boundBreakpoint {
 	out := make([]boundBreakpoint, 0, len(asked))
 	for i, b := range asked {
 		bb := boundBreakpoint{Requested: b.Line, Bound: b.Line}
@@ -714,6 +903,7 @@ func boundFromAnswers(asked []Breakpoint, answers []dap.Breakpoint) []boundBreak
 			bb.ID = ans.ID
 			bb.Verified = ans.Verified
 			bb.Message = ans.Message
+			bb.Pending = lazyBind && !ans.Verified
 			if ans.HasLine() {
 				bb.Bound = bufLineFromAdapter(ans.Line)
 			}
@@ -762,12 +952,31 @@ func (a *App) menuDebugStop() {
 	// Keep the output, exactly as handleDAPTerminated does: a run the user
 	// ended by hand is still a run whose output they may want to read.
 	a.lastDebugOutput = a.debug.output
-	client := a.debug.client
+	client, root := a.debug.client, a.debug.root
 	a.debug = nil
-	if client != nil {
-		go client.Stop()
-	}
+	go stopDebugClients(client, root)
 	a.flash("Debug session stopped")
+}
+
+// stopDebugClients shuts a session down leaf FIRST, coordinator LAST.
+//
+// 🔴 The order is the whole function. For js-debug the root owns the server
+// process and the leaf is a second connection into it, so stopping the root
+// first kills the server out from under the leaf's disconnect — and
+// disconnect{terminateDebuggee:true} is the only thing that stops the debugged
+// node process. It would be left running with nothing on screen to say so,
+// which is exactly the leak TerminateOrDisconnect exists to prevent, reached
+// from the other direction.
+//
+// Both may be nil: a session can be stopped before it ever had a client, and
+// only a coordinating adapter has a root at all.
+func stopDebugClients(leaf, root *dap.Client) {
+	if leaf != nil {
+		leaf.Stop()
+	}
+	if root != nil {
+		root.Stop()
+	}
 }
 
 // stopDebugSession tears the session down on quit. Called from Run alongside
@@ -776,11 +985,12 @@ func (a *App) stopDebugSession() {
 	if a.debug == nil {
 		return
 	}
-	client := a.debug.client
+	client, root := a.debug.client, a.debug.root
 	a.debug = nil
-	if client != nil {
-		client.Stop()
-	}
+	// Synchronous, unlike the other two teardown paths: this one runs on the way
+	// out of Run, and a goroutine started here would be killed by the process
+	// exiting before it had disconnected anything.
+	stopDebugClients(client, root)
 }
 
 // handleDebugStarted records the outcome of a start attempt.
@@ -793,10 +1003,11 @@ func (a *App) handleDebugStarted(e *debugStartedEvent) {
 	if a.debug == nil {
 		// The user stopped the session while it was still coming up. Shut the
 		// adapter down rather than adopting a session nobody asked for any more.
-		go e.client.Stop()
+		go stopDebugClients(e.client, e.root)
 		return
 	}
 	a.debug.client = e.client
+	a.debug.root = e.root
 	a.debug.starting = false
 	a.debug.running = true
 	a.debug.caps = e.caps
@@ -818,10 +1029,14 @@ func (a *App) handleDebugStarted(e *debugStartedEvent) {
 		return
 	}
 
+	// Counted with WillBind, not with Verified: an adapter that binds lazily
+	// answers every breakpoint unverified, so counting refusals by the raw flag
+	// would announce that none of them could be set on an executable line —
+	// about breakpoints the program is about to stop on.
 	unverified := 0
 	for _, list := range e.bound {
 		for _, b := range list {
-			if !b.Verified {
+			if !b.WillBind() {
 				unverified++
 			}
 		}
@@ -1050,6 +1265,16 @@ func (a *App) handleDAPOutput(ev dap.Event) {
 	if err := decodeBody(ev.Body, &oe); err != nil {
 		return
 	}
+	// 🔴 Telemetry is the adapter talking to its VENDOR, not to the user, and it
+	// is not small: js-debug emits several hundred-character JSON blobs
+	// ("js-debug/launch", "js-debug/cdp/operation") around every launch and
+	// every exit. Left in, they are the first and last thing in the debug
+	// console and they push the program's own output out of a window capped at
+	// maxDebugOutput lines. Filtered here rather than per-adapter because no
+	// adapter's telemetry belongs in a console a user reads.
+	if oe.Category == dap.OutputCategoryTelemetry {
+		return
+	}
 	text := strings.TrimRight(oe.Output, "\r\n")
 	if text == "" {
 		return
@@ -1071,7 +1296,7 @@ func (a *App) handleDAPTerminated(exitCode int, haveCode bool) {
 		return
 	}
 	last := a.lastProgramOutput()
-	client := a.debug.client
+	client, root := a.debug.client, a.debug.root
 
 	// Keep the program's output alive past the session that produced it. The
 	// debug console is the only place a run's output can be READ, and a console
@@ -1080,9 +1305,7 @@ func (a *App) handleDAPTerminated(exitCode int, haveCode bool) {
 	a.lastDebugOutput = a.debug.output
 
 	a.debug = nil // clears the ▶ by construction: drawDebugGutter reads this
-	if client != nil {
-		go client.Stop()
-	}
+	go stopDebugClients(client, root)
 
 	msg := "Debug session ended"
 	if haveCode {
@@ -1200,9 +1423,13 @@ func (a *App) drawDebugGutter() {
 
 	for _, b := range a.debug.bound[tab.Path] {
 		switch {
-		case !b.Verified:
+		case !b.WillBind():
 			// A hollow dot where the adapter refused to bind, so the user can
 			// see the breakpoint will not be hit rather than wondering why.
+			//
+			// WillBind, not Verified: a pending answer from an adapter that
+			// resolves breakpoints when the script loads is not a refusal, and
+			// drawing ○ on one would mark every js-debug breakpoint broken.
 			paint(b.Requested, '○', a.theme.Muted)
 		case b.Bound != b.Requested:
 			// The adapter snapped it forward to the next real statement. Show
@@ -1313,7 +1540,11 @@ func (a *App) breakpointVerified(b Breakpoint) bool {
 	}
 	for _, bb := range a.debug.bound[b.Path] {
 		if bb.Requested == b.Line {
-			return bb.Verified
+			// The SAME reading the gutter uses. A panel drawing a hollow dot
+			// beside an editor drawing a solid one, for one breakpoint, is worse
+			// than either answer alone — there would be nothing to say which is
+			// right. See boundBreakpoint.WillBind.
+			return bb.WillBind()
 		}
 	}
 	return false

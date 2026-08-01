@@ -33,6 +33,18 @@ const (
 	TypeEvent    = "event"
 )
 
+// Reverse-request commands — requests the ADAPTER sends to US.
+//
+// 🔴 There is exactly one this client answers, and answering it is not
+// optional: js-debug is a COORDINATOR that debugs nothing itself, so the
+// session the user cares about only exists once startDebugging has been
+// honoured. Every other reverse request is refused explicitly rather than
+// ignored — an adapter blocks on a reverse request it sent, so silence is a
+// hang, not a graceful decline. See Client.answerReverseRequest.
+const (
+	CommandStartDebugging = "startDebugging"
+)
+
 // Event names this client understands. Stage 2 handles every one of them:
 // an event nobody reads is how a session hangs with nothing on screen to
 // explain it.
@@ -90,6 +102,40 @@ type Event struct {
 	Type  string          `json:"type"`
 	Event string          `json:"event"`
 	Body  json.RawMessage `json:"body,omitempty"`
+}
+
+// ReverseRequest is a request the ADAPTER sends to US, decoded far enough to
+// answer it.
+//
+// Arguments stays raw because the only one this client acts on is
+// startDebugging, and decoding an unknown reverse request's arguments into a
+// concrete type would be inventing a shape in order to throw it away.
+type ReverseRequest struct {
+	Seq       int             `json:"seq"`
+	Type      string          `json:"type"`
+	Command   string          `json:"command"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
+}
+
+// ChildSession is a leaf session a coordinating adapter has asked us to start.
+//
+// 🔴 Configuration is passed to launch/attach VERBATIM and must not be merged
+// with our own launch keys. Measured against js-debug 1.117.0, the whole of it
+// is:
+//
+//	{"type":"pwa-node","name":"fixture.js [96905]",
+//	 "__pendingTargetId":"956ef4f0d34f26a8ac05ac1b"}
+//
+// The pending-target id is the ONLY thing that attaches this connection to the
+// process the root already spawned. Re-adding `program` — the obvious "surely
+// the child needs to know what to run" instinct — asks the child to launch a
+// SECOND copy of the program, so the user would debug one process while another
+// ran unobserved.
+type ChildSession struct {
+	// Request is "launch" or "attach", as the root asked for it.
+	Request string `json:"request"`
+	// Configuration is the child's launch configuration, sent unmodified.
+	Configuration map[string]interface{} `json:"configuration"`
 }
 
 // errorBody is the shape an adapter puts in a failed response's body. Delve
@@ -198,13 +244,24 @@ type EvaluateResult struct {
 
 // evaluateArgs asks the adapter to evaluate an expression.
 //
-// FrameID carries omitempty deliberately: frame 0 is not a valid frame id, and
-// an absent field is how "evaluate outside any frame" is spelled. Sending
-// `"frameId": 0` instead asks a question about frame zero, which some adapters
-// answer and others refuse.
+// 🔴 FrameID is a POINTER, and it used to be an int with omitempty. That was a
+// delve-shaped assumption written down as a fact — "frame 0 is not a valid frame
+// id" — and js-debug falsified it: its innermost frame is literally
+// {"id":0,"name":"global.add"}. omitempty then DROPPED the field, so an evaluate
+// meant for the frame the user was looking at was answered globally, and the
+// live oracle read `Uncaught ReferenceError: a is not defined` for a variable
+// sitting in scope on the stopped line.
+//
+// That failure is loud here only because the fixture's variable happens not to
+// exist globally. Evaluate a name that DOES exist at both scopes — a module
+// constant shadowed by a local, the common case in real code — and the adapter
+// answers the wrong one with no error at all.
+//
+// A pointer keeps both meanings distinct: nil is "evaluate outside any frame",
+// and &0 is "evaluate in frame zero".
 type evaluateArgs struct {
 	Expression string `json:"expression"`
-	FrameID    int    `json:"frameId,omitempty"`
+	FrameID    *int   `json:"frameId,omitempty"`
 	Context    string `json:"context,omitempty"`
 }
 
@@ -303,10 +360,23 @@ type initializeArgs struct {
 	// would simply show no types and look like the adapter did not know them.
 	//
 	// supportsRunInTerminalRequest stays false: it makes an adapter send US a
-	// request it then BLOCKS on, and nothing here answers a reverse request.
-	SupportsVariableType         bool `json:"supportsVariableType"`
-	SupportsVariablePaging       bool `json:"supportsVariablePaging"`
-	SupportsRunInTerminalRequest bool `json:"supportsRunInTerminalRequest"`
+	// request it then BLOCKS on, and running the debuggee in a terminal is
+	// something this editor genuinely cannot do — it owns the only one there is.
+	//
+	// SupportsStartDebuggingRequest is the opposite case and became true when
+	// js-debug arrived, because we now really do answer it. Leaving it false
+	// while implementing the handler would be the mirror mistake this comment
+	// block already warns about, and the quieter one.
+	//
+	// 🔴 Declaring it false does NOT stop js-debug asking. Measured: with
+	// supportsStartDebuggingRequest absent the root sent startDebugging anyway,
+	// because its root session is a coordinator that has no other way to hand
+	// over a debuggee. So the choice was never "opt in to child sessions or
+	// don't" — it was "answer the request or hang".
+	SupportsVariableType          bool `json:"supportsVariableType"`
+	SupportsVariablePaging        bool `json:"supportsVariablePaging"`
+	SupportsRunInTerminalRequest  bool `json:"supportsRunInTerminalRequest"`
+	SupportsStartDebuggingRequest bool `json:"supportsStartDebuggingRequest"`
 }
 
 // setExceptionBreakpointsArgs toggles which exception classes stop the program.
@@ -344,6 +414,11 @@ type OutputEvent struct {
 	Category string `json:"category,omitempty"`
 	Output   string `json:"output"`
 }
+
+// OutputCategoryTelemetry is the category an adapter uses to report usage data
+// to its own vendor. It is protocol traffic that happens to travel as output,
+// and it is never something a user asked to read — see handleDAPOutput.
+const OutputCategoryTelemetry = "telemetry"
 
 // ExitedEvent carries the debuggee's exit code. Distinct from TerminatedEvent:
 // the program can exit while the adapter stays up.
