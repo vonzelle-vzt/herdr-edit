@@ -179,8 +179,28 @@ func parsePorcelain(out []byte, toplevel string) map[string]filetree.GitChangeKi
 	return dirty
 }
 
+// unmergedCodes is the COMPLETE set of porcelain-v1 XY pairs meaning "unmerged",
+// taken from git-status(1).
+//
+// 🔴 An exact-set match, not strings.Contains(code, "U"), because AA (both added)
+// and DD (both deleted) carry no U at all. Before this existed every conflicted
+// path was mis-described and two of the three ways were actively misleading: UU
+// fell through to Modified, AA/AU/UA matched the "A" test and reported Added, and
+// DU/UD/DD matched the "D" test and reported DELETED — a file that very much
+// exists, drawn in the tree as though it were gone. The exact match is also safe:
+// neither AA nor DD is reachable for a path that is not in conflict.
+var unmergedCodes = map[string]bool{
+	"DD": true, "AU": true, "UD": true,
+	"UA": true, "DU": true, "AA": true, "UU": true,
+}
+
 // porcelainKind maps git porcelain's XY status pair to the tree status kind.
 func porcelainKind(code string) filetree.GitChangeKind {
+	// Tested FIRST: several unmerged codes contain A or D and would otherwise be
+	// swallowed by the branches below.
+	if unmergedCodes[code] {
+		return filetree.GitChangeConflict
+	}
 	if strings.Contains(code, "?") || strings.Contains(code, "A") {
 		return filetree.GitChangeAdded
 	}

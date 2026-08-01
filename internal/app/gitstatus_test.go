@@ -558,3 +558,149 @@ func sortedKeys[K comparable](m map[string]K) []string {
 	sort.Strings(out)
 	return out
 }
+
+// makeConflictedRepo builds a real git repo whose only file is genuinely
+// unmerged, and returns (root, file). The conflict style is pinned with -c
+// rather than left to the environment: a developer with merge.conflictStyle =
+// diff3 set globally would otherwise build a different fixture than CI, and the
+// two would disagree about what the file even contains.
+func makeConflictedRepo(t *testing.T, style string) (string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed; this oracle asserts on REAL git output and has nothing to read")
+	}
+	// 🔴 EvalSymlinks, not the raw TempDir. On macOS $TMPDIR is /var/..., a symlink
+	// to /private/var/..., and loadGitStatus keys its map on `rev-parse
+	// --show-toplevel`, which resolves it. Comparing the unresolved path finds
+	// nothing and reads as "git reported no change", not as a path mismatch.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+root)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	file := filepath.Join(root, "main.go")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "t@example.com")
+	run("config", "user.name", "T")
+	// Tab-indented, because every geometry bug this repo has shipped hid behind a
+	// fixture where a rune index and a screen column coincided.
+	write("package main\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n")
+	run("add", "main.go")
+	run("commit", "-qm", "base")
+
+	run("checkout", "-qb", "feature")
+	write("package main\n\nfunc add(a, b int) int {\n\treturn b + a // THEIRS\n}\n")
+	run("commit", "-qam", "theirs")
+
+	run("checkout", "-q", "main")
+	write("package main\n\nfunc add(a, b int) int {\n\treturn a + b // OURS\n}\n")
+	run("commit", "-qam", "ours")
+
+	// Expected to fail — that is the point.
+	cmd := exec.Command("git", "-C", root, "-c", "merge.conflictStyle="+style, "merge", "feature")
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+root)
+	_ = cmd.Run()
+
+	body, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "<<<<<<<") {
+		t.Fatalf("fixture is not actually conflicted; file reads:\n%s", body)
+	}
+	return root, file
+}
+
+// TestConflictedFileIsNotDescribedAsSomethingElse pins the bug that made the
+// tree lie about a merge. porcelainKind tested for A before U and D before U,
+// so of the seven unmerged codes UU reported Modified, AA/AU/UA reported Added,
+// and DU/UD/DD reported DELETED — a file that very much exists, drawn as gone.
+// The function had no test at all.
+//
+// Everything here is derived from REAL git output on a REAL conflict rather
+// than a hand-typed status code, so it also proves the codes are what this
+// version of git actually emits.
+func TestConflictedFileIsNotDescribedAsSomethingElse(t *testing.T) {
+	for _, style := range []string{"merge", "diff3"} {
+		t.Run(style, func(t *testing.T) {
+			root, file := makeConflictedRepo(t, style)
+			got := loadGitStatus(root)
+			if got.DirtyFiles[file] != filetree.GitChangeConflict {
+				t.Fatalf("a conflicted file is reported as %v, want GitChangeConflict",
+					got.DirtyFiles[file])
+			}
+			if gitMark(got.DirtyFiles[file]) != 'U' {
+				t.Errorf("start page marks a conflict as %q, want 'U'", gitMark(got.DirtyFiles[file]))
+			}
+		})
+	}
+}
+
+// TestPorcelainKindClassifiesEveryUnmergedCode covers the four codes a
+// single-file fixture cannot produce (AA, DD, AU, UA and friends need
+// add/add and delete/delete merges), and pins the neighbours that must NOT
+// be swallowed by the new branch.
+func TestPorcelainKindClassifiesEveryUnmergedCode(t *testing.T) {
+	for _, code := range []string{"DD", "AU", "UD", "UA", "DU", "AA", "UU"} {
+		if got := porcelainKind(code); got != filetree.GitChangeConflict {
+			t.Errorf("porcelainKind(%q) = %v, want GitChangeConflict", code, got)
+		}
+	}
+	for code, want := range map[string]filetree.GitChangeKind{
+		"??": filetree.GitChangeAdded,
+		"A ": filetree.GitChangeAdded,
+		" D": filetree.GitChangeDeleted,
+		"R ": filetree.GitChangeRenamed,
+		" M": filetree.GitChangeModified,
+	} {
+		if got := porcelainKind(code); got != want {
+			t.Errorf("porcelainKind(%q) = %v, want %v — the unmerged branch swallowed a normal code",
+				code, got, want)
+		}
+	}
+}
+
+// TestGitLineChangesStillParseOnAConflictedFile is the guard that keeps the
+// combined-diff form unreachable.
+//
+// 🔴 Background, measured rather than assumed: during a merge, a BARE `git diff`
+// emits a combined diff ("diff --cc", "@@@ -a,b -c,d +e,f @@@") whose body lines
+// carry one prefix column per parent. Every parser here would misread it —
+// parseHunkHeader would take a second OLD range as the new one, and the body
+// scan would advance the line counter on a line deleted in another parent.
+//
+// It cannot happen, because every git-diff invocation in this package passes an
+// explicit rev, and an explicit rev makes git produce an ordinary two-way diff.
+// This test pins that by BEHAVIOUR rather than by restating the command strings:
+// it calls the real functions on a real conflicted file and requires them to
+// return something. A combined diff would parse to nothing, so dropping HEAD
+// from one of those commands fails here instead of silently emptying the gutter.
+func TestGitLineChangesStillParseOnAConflictedFile(t *testing.T) {
+	root, file := makeConflictedRepo(t, "merge")
+
+	changes := loadGitLineChanges(root, file)
+	if len(changes) == 0 {
+		t.Fatal("no gutter change bars on a conflicted file — a git diff invocation " +
+			"probably lost its explicit rev and is now emitting a combined diff, which " +
+			"parseGitDiffLines cannot read")
+	}
+
+	// The hunk preview reads the same command family, so it must survive too.
+	if preview := loadGitHunkPreview(root, file, 0); len(preview) == 0 {
+		t.Error("no hunk preview on a conflicted file — same cause as above")
+	}
+}

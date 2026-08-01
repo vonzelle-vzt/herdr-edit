@@ -70,6 +70,10 @@ func gitMark(k filetree.GitChangeKind) rune {
 		return 'R'
 	case filetree.GitChangeMixed:
 		return '*'
+	case filetree.GitChangeConflict:
+		// 'U' is git status --short's own vocabulary for unmerged, which this
+		// function's doc promises to mirror.
+		return 'U'
 	case filetree.GitChangeModified:
 		return 'M'
 	}

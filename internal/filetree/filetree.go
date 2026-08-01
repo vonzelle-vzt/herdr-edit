@@ -51,6 +51,13 @@ const (
 	GitChangeDeleted
 	GitChangeRenamed
 	GitChangeMixed
+	// GitChangeConflict is an UNMERGED path — a merge, rebase, cherry-pick or
+	// revert left conflict markers in it.
+	//
+	// 🔴 Appended after GitChangeMixed on purpose. These are ordinals, and moving
+	// an existing one silently reinterprets anything that stored or published a
+	// number rather than a name.
+	GitChangeConflict
 )
 
 // Tree owns the root node and the most recently rendered flat list of
@@ -483,6 +490,10 @@ func gitChangeColor(th theme.Theme, change GitChangeKind) tcell.Color {
 		return th.GitRenamed
 	case GitChangeMixed:
 		return th.GitMixed
+	case GitChangeConflict:
+		// Error, not GitModified: an unresolved conflict is a thing that BLOCKS
+		// work, and it should not read as an ordinary edit at a glance.
+		return th.Error
 	case GitChangeModified:
 		return th.GitModified
 	}
