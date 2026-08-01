@@ -1452,7 +1452,11 @@ func (a *App) drawDebugGutter() {
 			return // scrolled out of view, or not a line in this buffer
 		}
 		_, _, existing, _ := a.screen.GetContent(ex, ey+row)
-		bg, _, _ := existing.Decompose()
+		// 🔴 Decompose returns (fg, bg, attr) IN THAT ORDER. Taking the first
+		// return as the background painted every debug glyph on the previous
+		// cell's FOREGROUND colour — a wrong-but-plausible block behind the dot,
+		// which reads as a theme quirk rather than a bug.
+		_, bg, _ := existing.Decompose()
 		a.screen.SetContent(ex, ey+row, glyph, nil,
 			tcell.StyleDefault.Background(bg).Foreground(color))
 	}

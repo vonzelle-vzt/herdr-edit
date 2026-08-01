@@ -44,6 +44,9 @@ func TestDefault_AllColorsSet(t *testing.T) {
 		{"Selection", th.Selection},
 		{"Modified", th.Modified},
 		{"Error", th.Error},
+		{"ConflictOurs", th.ConflictOurs},
+		{"ConflictBase", th.ConflictBase},
+		{"ConflictTheirs", th.ConflictTheirs},
 		{"FolderColor", th.FolderColor},
 		{"FileColor", th.FileColor},
 		{"SynKeyword", th.SynKeyword},
@@ -84,6 +87,14 @@ func TestDefault_ContrastInvariants(t *testing.T) {
 		{"BG vs SidebarBG", th.BG, th.SidebarBG},
 		// Selection block must stand out against the unselected background.
 		{"Selection vs BG", th.Selection, th.BG},
+		// The three conflict tints must be tellable apart from each other and
+		// from the plain editor surface, or "which side is this" is a guess.
+		{"ConflictOurs vs BG", th.ConflictOurs, th.BG},
+		{"ConflictTheirs vs BG", th.ConflictTheirs, th.BG},
+		{"ConflictBase vs BG", th.ConflictBase, th.BG},
+		{"ConflictOurs vs ConflictTheirs", th.ConflictOurs, th.ConflictTheirs},
+		{"ConflictOurs vs ConflictBase", th.ConflictOurs, th.ConflictBase},
+		{"ConflictTheirs vs ConflictBase", th.ConflictTheirs, th.ConflictBase},
 	}
 
 	for _, c := range cases {

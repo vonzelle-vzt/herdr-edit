@@ -185,17 +185,31 @@ func markColor(th theme.Theme, m Mark) tcell.Color {
 }
 
 // gutterMarker resolves what belongs in the leftmost gutter cell for a
-// buffer line: a mark's glyph when one is set (marks take priority over the
-// git change bar), the git bar's glyph otherwise, or nothing at all.
+// buffer line: a mark's glyph when one is set, a conflict marker line's glyph
+// next, the git bar's glyph otherwise, or nothing at all.
+//
+// The priority is mark > conflict > git bar, and the first two are that way
+// round deliberately. A breakpoint is something the user DELIBERATELY placed
+// and expects to see; a conflict is already shouting from the body of the file
+// — the `<<<<<<<` text is literally on screen and the region is tinted — so
+// losing its gutter cell on one line out of four costs nothing, while losing a
+// breakpoint dot reads as the breakpoint having been cleared.
 //
 // Shared by Render (tab.go) and renderWrapped (wrap.go) on purpose. The two
 // render paths already diverge in their innermost loop — wrap.go's own doc
 // comment explains why — and a priority rule resolved twice is exactly the
 // kind of drift this fork has shipped before: patch one copy, and the other
-// silently falls back to git-bar-only behaviour with no error anywhere.
+// silently falls back to git-bar-only behaviour with no error anywhere. It is
+// also why a wrapped tab gets the conflict glyph for free, on each region's
+// first segment row, with no second painter to keep in step.
 func (t *Tab) gutterMarker(th theme.Theme, lineIdx int) (r rune, color tcell.Color, ok bool) {
 	if m, mok := t.Marks[lineIdx]; mok && m.Kind != MarkNone {
 		return markGlyph(m), markColor(th, m), true
+	}
+	if t.conflictMarkerLine(lineIdx) {
+		// Error, matching filetree's gitChangeColor for GitChangeConflict: an
+		// unresolved conflict BLOCKS work and must not read as an ordinary edit.
+		return conflictGlyph, th.Error, true
 	}
 	if marker, gok := t.GitLines[lineIdx]; gok && marker != GitLineNone {
 		return gitLineMarkerRune(marker), gitLineMarkerColor(th, marker), true

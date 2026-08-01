@@ -2701,3 +2701,52 @@ func stoppedEventFor(t *testing.T, threadID int, reason string) dap.Event {
 	}
 	return dap.Event{Type: dap.TypeEvent, Event: dap.EventStopped, Body: body}
 }
+
+// TestDebugGutterKeepsTheLineBackground pins an argument-order bug that was
+// invisible by construction.
+//
+// 🔴 tcell's Style.Decompose returns (fg, bg, attr) IN THAT ORDER. The gutter
+// painter took the FIRST return into a variable named bg and used it as the
+// background, so every breakpoint dot and stopped arrow was drawn on the
+// previous cell's FOREGROUND colour. It reads as a theme quirk — a coloured
+// block behind the glyph — rather than as a bug, and no test could see it
+// because the assertions all checked which RUNE landed, never its style.
+func TestDebugGutterKeepsTheLineBackground(t *testing.T) {
+	a, path := debugFixture(t)
+	a.debug = &debugSession{
+		adapter: "delve", running: true,
+		bound: map[string][]boundBreakpoint{},
+	}
+	a.handleDebugStopped(&debugStoppedEvent{
+		when: time.Now(), path: path, line: 5, reason: "breakpoint",
+	})
+
+	a.draw()
+	a.screen.Show()
+	scr := a.screen.(tcell.SimulationScreen)
+	ex, ey, ew, eh := a.editorRect()
+
+	tab := a.activeTabPtr()
+	row, ok := tab.GutterRowFor(5, ew, eh)
+	if !ok {
+		t.Fatal("the stopped line is not on screen; the fixture cannot prove anything")
+	}
+
+	// The glyph cell and its NEIGHBOUR ON THE SAME ROW. Comparing against another
+	// row would fail honestly: the stopped line carries the cursor-line
+	// background, so a different row differs for a legitimate reason.
+	_, _, glyphStyle, _ := scr.GetContent(ex, ey+row)
+	_, _, plainStyle, _ := scr.GetContent(ex+1, ey+row)
+
+	_, glyphBG, _ := glyphStyle.Decompose()
+	plainFG, plainBG, _ := plainStyle.Decompose()
+
+	if glyphBG == plainFG && plainFG != plainBG {
+		t.Fatalf("the glyph's background is the line's FOREGROUND (%v) — Decompose's "+
+			"return order was misread", glyphBG)
+	}
+	if glyphBG != plainBG {
+		t.Errorf("glyph background %v does not match the surrounding gutter background %v",
+			glyphBG, plainBG)
+	}
+}

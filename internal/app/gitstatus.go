@@ -266,6 +266,59 @@ func dirtyFolderSet(dirtyFiles map[string]filetree.GitChangeKind, root string) m
 	return folders
 }
 
+// gitUnmergedPaths returns the absolute path of every file git currently has
+// in an UNMERGED state, or nil when there is no repo, no conflict, or any
+// failure at all — best-effort, exactly like the rest of this file.
+//
+// 🔴 `ls-files -u`, NOT the presence of MERGE_HEAD. A merge is only one of the
+// five ways to end up with conflict markers in a file: rebase, cherry-pick,
+// revert and `git stash pop` all produce them too, and MERGE_HEAD does not
+// exist for any of those. Keying off it would mean the editor sees conflicts
+// during a merge and is blind during a rebase — the case where a user is most
+// likely to be staring at a conflict they did not expect.
+//
+// This reads the INDEX, not the worktree: git already knows which paths have
+// stage 1/2/3 entries, so there is no directory walk here regardless of how
+// large the repo is.
+//
+// -z rather than plain output sidesteps core.quotePath entirely — with it, git
+// emits raw bytes and NUL terminators, so a path with a space, a quote or a
+// non-ASCII name needs no unquoting and cannot be truncated by one. Each
+// record is `<mode> <sha> <stage>\t<path>`, and a conflicted path appears once
+// per stage, so the map deduplicates as a side effect of being a map.
+func gitUnmergedPaths(rootDir string) map[string]bool {
+	if rootDir == "" {
+		return nil
+	}
+	topBytes, err := exec.Command("git", "-C", rootDir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return nil
+	}
+	toplevel := strings.TrimRight(string(topBytes), "\n\r")
+	if toplevel == "" {
+		return nil
+	}
+	// Run from the TOPLEVEL, not rootDir: ls-files restricts itself to the
+	// current directory's subtree, and --full-name only changes how the paths
+	// are PRINTED. Rooted at a subdirectory, an editor asking from rootDir
+	// would report no conflict for an open tab that lives above it.
+	out, err := exec.Command("git", "-C", toplevel, "ls-files", "-u", "--full-name", "-z").Output()
+	if err != nil {
+		return nil
+	}
+	paths := map[string]bool{}
+	for _, record := range strings.Split(string(out), "\x00") {
+		tab := strings.IndexByte(record, '\t')
+		if tab < 0 {
+			continue // the trailing empty record, or output we don't recognise
+		}
+		if name := record[tab+1:]; name != "" {
+			paths[filepath.Join(toplevel, name)] = true
+		}
+	}
+	return paths
+}
+
 // loadGitLineChanges returns line-level worktree changes for path.
 func loadGitLineChanges(rootDir, path string) map[int]editor.GitLineChange {
 	if rootDir == "" || path == "" {

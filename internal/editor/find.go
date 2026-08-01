@@ -351,8 +351,13 @@ func (t *Tab) Replace(replacement string) bool {
 	t.pushUndo(undoGroupStructural)
 	start := MatchPosition(m)
 	end := MatchEndPosition(m)
-	t.Buffer.DeleteRange(start, end)
-	pos := t.Buffer.InsertString(start, replacement)
+	// bufDelete / bufInsert, not the raw buffer methods. This shipped calling
+	// Buffer.DeleteRange + Buffer.InsertString directly, which is the one
+	// documented way to drift every mark below the edit: replacing a
+	// multi-line match, or replacing with text containing a newline, moves
+	// lines without renumbering a single breakpoint.
+	t.bufDelete(start, end)
+	pos := t.bufInsert(start, replacement)
 	t.Cursor = pos
 	t.Anchor = pos
 	t.Dirty = true
@@ -385,8 +390,11 @@ func (t *Tab) ReplaceAll(replacement string) int {
 		m := t.FindMatches[i]
 		start := MatchPosition(m)
 		end := MatchEndPosition(m)
-		t.Buffer.DeleteRange(start, end)
-		pos := t.Buffer.InsertString(start, replacement)
+		// Same mark-tracking reason as Replace above: this is the fork's one
+		// existing "rewrite N regions as one undo step", and it was the
+		// counter-example rather than the template until this line changed.
+		t.bufDelete(start, end)
+		pos := t.bufInsert(start, replacement)
 		if i == 0 {
 			cursorAfter = pos
 		}

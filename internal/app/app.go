@@ -282,6 +282,11 @@ func builtinMenuGroups() [][]menuItemDef {
 		{
 			{shortcut: "Esc t", action: (*App).menuToggleSidebar, enabled: alwaysTrue, labelFor: (*App).sidebarToggleLabel, visible: (*App).hasTree},
 		},
+		// Merge conflicts (fork). Every row is `visible`-gated on the active
+		// tab actually being unmerged according to git, so this whole group —
+		// divider included — is absent from the menu of a normal file. See
+		// conflictMenuGroup (conflictview.go) for why that is not `enabled`.
+		conflictMenuGroup(),
 		// Debug (fork, Lane B stages 1-3) — edit-tracking breakpoint marks, a
 		// real adapter that runs the program and stops on them, and everything
 		// you do once it has stopped. Export still renders `break file:line`
@@ -875,14 +880,36 @@ func (a *App) refreshGitStatus() {
 	a.refreshGitLineChanges()
 }
 
-// refreshGitLineChanges refreshes gutter markers for every open text tab.
+// refreshGitLineChanges refreshes git state for every open text tab.
 func (a *App) refreshGitLineChanges() {
 	for _, tab := range a.tabs {
-		if tab == nil || tab.Path == "" || tab.IsImage() {
-			continue
-		}
-		tab.GitLines = loadGitLineChanges(a.rootDir, tab.Path)
+		a.refreshTabGitState(tab)
 	}
+}
+
+// refreshTabGitState re-reads everything this tab knows about git: the
+// line-level change bars, and whether git considers the file unmerged (which
+// is what authorises the conflict scan).
+//
+// 🔴 One function, called from every site that used to assign GitLines by
+// hand. There were three of them, and two facts about the same tab kept in
+// step by three separate call sites is two facts that will eventually
+// disagree: the gutter would say "modified" while the conflict overlay said
+// "clean", or vice versa, and nothing on screen would explain which was right.
+//
+// Deliberately not called for image or synthetic tabs — neither has a path git
+// has an opinion about.
+func (a *App) refreshTabGitState(t *editor.Tab) {
+	if t == nil || t.Path == "" || t.IsImage() || t.Synthetic {
+		return
+	}
+	t.GitLines = loadGitLineChanges(a.rootDir, t.Path)
+	// 🔴 git is the authority on WHETHER; the scanner only says WHERE. Without
+	// this line any file containing a well-formed marker sequence — a test
+	// fixture, a merge-tool README, this editor's own conflict_test.go — would
+	// light up as conflicted in a perfectly clean checkout.
+	t.GitUnmerged = gitUnmergedPaths(a.rootDir)[t.Path]
+	t.RescanConflicts()
 }
 
 // startTreeRefresh launches a goroutine that posts a treeRefreshEvent every
@@ -2246,7 +2273,7 @@ func (a *App) openFile(path string) {
 	for i, t := range a.tabs {
 		if t.Path == path {
 			a.activeTab = i
-			t.GitLines = loadGitLineChanges(a.rootDir, t.Path)
+			a.refreshTabGitState(t)
 			return
 		}
 	}
@@ -2257,7 +2284,7 @@ func (a *App) openFile(path string) {
 	}
 	a.tabs = append(a.tabs, t)
 	a.activeTab = len(a.tabs) - 1
-	t.GitLines = loadGitLineChanges(a.rootDir, t.Path)
+	a.refreshTabGitState(t)
 	// Diagnostics generally do not arrive for a file the server has not been told about, so this
 	// is what actually starts the flow. It also spawns the server on the first file of a language.
 	a.lspDidOpen(t.Path, t.Buffer.String())
@@ -2915,6 +2942,11 @@ func (a *App) draw() {
 		// mistake must always win the eye over a tint that's just saying "this word
 		// again".
 		a.drawDocumentHighlights()
+		// Conflict tints sit between the two for the same reason: a region
+		// tint says "this block is contested", which must not out-shout a
+		// squiggle under an actual mistake. Backgrounds only, so the syntax
+		// foreground under it survives.
+		a.drawConflictRegions()
 		// After Render, so the underline sits on top of the syntax colours rather than being
 		// overwritten by them.
 		a.drawDiagnostics()

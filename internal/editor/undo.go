@@ -99,6 +99,14 @@ func (t *Tab) applySnapshot(s snapshot) {
 	t.Marks = copyMarks(s.Marks)
 	t.cursorMoved = true
 	t.StyleStale = true
+	// 🔴 Conflicts is DERIVED from the restored lines, not carried in the
+	// snapshot — GitUnmerged is git's verdict and an undo cannot change it.
+	// Without this line, undoing a resolution puts the markers back in the
+	// buffer while the region cache stays empty, so the gutter glyphs, the
+	// body tint and the entire conflict menu group disappear until the next
+	// ten-second git tick happens to rebuild them. A no-op on every tab git
+	// has not called unmerged.
+	t.RescanConflicts()
 }
 
 // initUndo seeds the original-state snapshot used by RevertFile. Called

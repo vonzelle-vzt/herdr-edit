@@ -704,3 +704,128 @@ func TestGitLineChangesStillParseOnAConflictedFile(t *testing.T) {
 		t.Error("no hunk preview on a conflicted file — same cause as above")
 	}
 }
+
+// makeRebaseConflictedRepo builds a repo stopped mid-REBASE on a real
+// conflict, and returns (root, file). Deliberately a rebase and not a merge:
+// it is the cheapest way to produce a conflicted index with no MERGE_HEAD at
+// all, which is the whole claim gitUnmergedPaths rests on.
+func makeRebaseConflictedRepo(t *testing.T) (string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed; this oracle asserts on REAL git output and has nothing to read")
+	}
+	// EvalSymlinks for the same reason makeConflictedRepo does it: on macOS
+	// $TMPDIR is a symlink and rev-parse --show-toplevel resolves it, so an
+	// unresolved path silently matches nothing.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+root)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	file := filepath.Join(root, "main.go")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "t@example.com")
+	run("config", "user.name", "T")
+	write("package main\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n")
+	run("add", "main.go")
+	run("commit", "-qm", "base")
+
+	run("checkout", "-qb", "feature")
+	write("package main\n\nfunc add(a, b int) int {\n\treturn b + a // THEIRS\n}\n")
+	run("commit", "-qam", "theirs")
+
+	run("checkout", "-q", "main")
+	write("package main\n\nfunc add(a, b int) int {\n\treturn a + b // OURS\n}\n")
+	run("commit", "-qam", "ours")
+
+	run("checkout", "-q", "feature")
+	// Expected to fail — that is the point.
+	cmd := exec.Command("git", "-C", root, "rebase", "main")
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+root)
+	_ = cmd.Run()
+
+	body, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "<<<<<<<") {
+		t.Fatalf("fixture is not actually conflicted; file reads:\n%s", body)
+	}
+	return root, file
+}
+
+// TestUnmergedPathsSeeARebaseWhereMergeHeadDoesNotExist is the reason
+// gitUnmergedPaths asks `ls-files -u` instead of looking for MERGE_HEAD.
+//
+// 🔴 A merge is only one of the ways to end up staring at conflict markers.
+// Rebase, cherry-pick, revert and `stash pop` all produce them and NONE of
+// them writes MERGE_HEAD — this test asserts the file is missing, so the
+// cheaper implementation cannot pass by accident. A MERGE_HEAD-based detector
+// would leave the editor blind during exactly the operation where an
+// unexpected conflict is most likely.
+func TestUnmergedPathsSeeARebaseWhereMergeHeadDoesNotExist(t *testing.T) {
+	root, file := makeRebaseConflictedRepo(t)
+
+	if _, err := os.Stat(filepath.Join(root, ".git", "MERGE_HEAD")); err == nil {
+		t.Fatal("fixture drifted: MERGE_HEAD exists, so this no longer tests anything")
+	}
+	got := gitUnmergedPaths(root)
+	if !got[file] {
+		t.Fatalf("a file conflicted by a REBASE is not reported as unmerged; got %v", got)
+	}
+}
+
+// TestUnmergedPathsReportEveryStyleOfMergeConflict pins the ordinary path and
+// the deduplication: `ls-files -u` emits one record per stage, so a conflicted
+// path arrives three times and must come back as one entry.
+func TestUnmergedPathsReportEveryStyleOfMergeConflict(t *testing.T) {
+	for _, style := range []string{"merge", "diff3"} {
+		t.Run(style, func(t *testing.T) {
+			root, file := makeConflictedRepo(t, style)
+			got := gitUnmergedPaths(root)
+			if len(got) != 1 || !got[file] {
+				t.Fatalf("gitUnmergedPaths = %v, want exactly {%s}", got, file)
+			}
+		})
+	}
+}
+
+// TestUnmergedPathsAreEmptyWithoutAConflict covers the two quiet cases the
+// editor spends almost all of its life in: a clean repo, and a directory git
+// knows nothing about. Both must yield nothing rather than an error the UI
+// would have to handle.
+func TestUnmergedPathsAreEmptyWithoutAConflict(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	root, _ := makeConflictedRepo(t, "merge")
+	cmd := exec.Command("git", "-C", root, "merge", "--abort")
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+root)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("merge --abort: %v\n%s", err, out)
+	}
+	if got := gitUnmergedPaths(root); len(got) != 0 {
+		t.Errorf("after merge --abort, gitUnmergedPaths = %v, want empty", got)
+	}
+
+	if got := gitUnmergedPaths(t.TempDir()); got != nil {
+		t.Errorf("outside a repo, gitUnmergedPaths = %v, want nil", got)
+	}
+	if got := gitUnmergedPaths(""); got != nil {
+		t.Errorf(`gitUnmergedPaths("") = %v, want nil`, got)
+	}
+}

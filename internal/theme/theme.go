@@ -47,6 +47,17 @@ type Theme struct {
 	FindMatch   tcell.Color
 	FindCurrent tcell.Color
 
+	// ConflictOurs / ConflictBase / ConflictTheirs tint the body of an
+	// unresolved merge conflict. They are BACKGROUNDS, painted under the
+	// existing syntax foreground, so all three have to stay dark enough for
+	// Text to read on top. Three rather than two because git's diff3 conflict
+	// style adds a common-ancestor section between ||||||| and =======, and a
+	// section drawn in one of the other two colours would look like content
+	// someone chose.
+	ConflictOurs   tcell.Color
+	ConflictBase   tcell.Color
+	ConflictTheirs tcell.Color
+
 	// --- File tree ---
 	FolderColor tcell.Color
 	FileColor   tcell.Color
@@ -97,6 +108,15 @@ func Default() Theme {
 		// so the active match jumps off the page.
 		FindMatch:   tcell.NewRGBColor(0x6f, 0x52, 0x1f),
 		FindCurrent: tcell.NewRGBColor(0xe0, 0xaf, 0x68),
+
+		// Conflict tints. Green for ours / blue for theirs is the convention
+		// every merge tool since diff3 has used and the one people arrive
+		// with; the ancestor section is a neutral slate so it reads as
+		// context rather than as a third candidate. All three are darker
+		// than Selection so a selection inside a conflict still stands out.
+		ConflictOurs:   tcell.NewRGBColor(0x24, 0x3a, 0x28),
+		ConflictBase:   tcell.NewRGBColor(0x2b, 0x2c, 0x3a),
+		ConflictTheirs: tcell.NewRGBColor(0x25, 0x33, 0x4f),
 
 		// Tree.
 		FolderColor: tcell.NewRGBColor(0x7a, 0xa2, 0xf7),

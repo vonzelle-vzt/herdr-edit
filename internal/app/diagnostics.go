@@ -294,9 +294,7 @@ func (a *App) drawDiagnostics() {
 				// Repaint the existing rune with the diagnostic style so the
 				// syntax highlighting underneath survives; only the underline
 				// and its colour are ours.
-				mainc, combc, existing, _ := a.screen.GetContent(sx, sy)
-				bg, _, _ := existing.Decompose()
-				_ = bg
+				mainc, combc, _, _ := a.screen.GetContent(sx, sy)
 				a.screen.SetContent(sx, sy, mainc, combc, style)
 			}
 		}

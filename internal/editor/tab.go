@@ -160,6 +160,18 @@ type Tab struct {
 	StyleStale bool
 	GitLines   map[int]GitLineChange
 
+	// GitUnmerged is git's verdict — `git ls-files -u` listed this path — and
+	// it is the ONLY thing that authorises conflict detection on this buffer.
+	// 🔴 A `<<<<<<<` inside a string literal is byte-for-byte a real marker, so
+	// no test on the buffer can tell them apart; see conflict.go's header.
+	GitUnmerged bool
+
+	// Conflicts is the RENDER CACHE of this tab's merge-conflict regions,
+	// refreshed by RescanConflicts. The gutter and the body tint read it; the
+	// resolve methods rescan rather than trusting it, because the buffer can
+	// be edited between the paint that filled it and the keystroke that acts.
+	Conflicts []ConflictRegion
+
 	// Marks holds this tab's gutter marks (breakpoints, logpoints, the
 	// future adapter's stopped line), keyed by 0-based buffer line. See
 	// marks.go — SetMark/ClearMark/MarkAt/MarkLines are the public surface,

@@ -1288,36 +1288,47 @@ func TestBreakpointGutterDrawsOverGitBar(t *testing.T) {
 	}
 }
 
-// TestAllBufferMutationsGoThroughMarkWrappers reads tab.go's OWN source and
-// fails if a raw t.Buffer.InsertString( / t.Buffer.DeleteRange( call appears
-// outside the bodies of bufInsert / bufDelete. Those two functions are the
-// only place lines actually move, and therefore the only place marks get
-// renumbered — a tenth call site that bypasses them would leave a breakpoint
-// silently pointing at the wrong line, with nothing else able to catch it,
-// because Marks itself would look perfectly fine right up until the next
-// edit above it drifted it off course. Opinionated, but it's the
+// TestAllBufferMutationsGoThroughMarkWrappers reads the mutating source files'
+// OWN text and fails if a raw t.Buffer.InsertString( / t.Buffer.DeleteRange(
+// call appears outside the bodies of bufInsert / bufDelete. Those two
+// functions are the only place lines actually move, and therefore the only
+// place marks get renumbered — a call site that bypasses them would leave a
+// breakpoint silently pointing at the wrong line, with nothing else able to
+// catch it, because Marks itself would look perfectly fine right up until the
+// next edit above it drifted it off course. Opinionated, but it's the
 // machine-checkable form of the invariant, which this repo's own culture
 // prefers over pinning the symptom instead (see CLAUDE.md's LSP-caller
 // grep).
+//
+// 🔴 The file list is the point. This test hardcoded "tab.go", so find.go
+// mutated the buffer raw for its whole life — Tab.ReplaceAll drifted every
+// mark below every replacement and no test could see it — and a raw mutation
+// in conflict.go would have been invisible the same way. A SECOND copy of this
+// test per file is not the fix: two copies of a rule that must agree is
+// exactly the drift gutterMarker's own doc comment warns about, and this one
+// would be invisible when they disagreed. Add new mutating files here.
 func TestAllBufferMutationsGoThroughMarkWrappers(t *testing.T) {
-	src, err := os.ReadFile("tab.go")
-	if err != nil {
-		t.Fatalf("read tab.go: %v", err)
-	}
+	files := []string{"tab.go", "find.go", "conflict.go"}
 	funcStart := regexp.MustCompile(`^func \(t \*Tab\) (\w+)\(`)
 	rawCall := regexp.MustCompile(`t\.Buffer\.(InsertString|DeleteRange)\(`)
 	allowed := map[string]bool{"bufInsert": true, "bufDelete": true}
 
-	current := ""
-	for i, line := range strings.Split(string(src), "\n") {
-		if m := funcStart.FindStringSubmatch(line); m != nil {
-			current = m[1]
-		} else if line == "}" {
-			current = ""
+	for _, name := range files {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
 		}
-		if rawCall.MatchString(line) && !allowed[current] {
-			t.Errorf("tab.go:%d: raw buffer mutation %q outside bufInsert/bufDelete (in func %q) — route it through the mark-tracking wrapper",
-				i+1, strings.TrimSpace(line), current)
+		current := ""
+		for i, line := range strings.Split(string(src), "\n") {
+			if m := funcStart.FindStringSubmatch(line); m != nil {
+				current = m[1]
+			} else if line == "}" {
+				current = ""
+			}
+			if rawCall.MatchString(line) && !allowed[current] {
+				t.Errorf("%s:%d: raw buffer mutation %q outside bufInsert/bufDelete (in func %q) — route it through the mark-tracking wrapper",
+					name, i+1, strings.TrimSpace(line), current)
+			}
 		}
 	}
 }
