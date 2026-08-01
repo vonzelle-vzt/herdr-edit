@@ -88,11 +88,23 @@ const disconnectTimeout = 2 * time.Second
 // convention. Both are called from the read goroutine: the app must post a
 // tcell event, never touch UI state here.
 type Handlers struct {
-	// OnEvent receives every adapter event, in arrival order.
-	OnEvent func(Event)
+	// OnEvent receives every adapter event, in arrival order, along with the
+	// client it arrived on.
+	//
+	// 🔴 The *Client argument is the whole point and it is a parameter rather
+	// than something the caller closes over. A js-debug session is a ROOT
+	// coordinator plus a LEAF that owns the program, and both are given the same
+	// handlers — so without it, events from two connections merge into one
+	// undifferentiated stream and the receiver cannot tell a stop in the debuggee
+	// from anything the coordinator said. Closing over the client instead would
+	// race: StartCommand runs `go c.readLoop()` BEFORE it returns, so the closure
+	// could fire before the variable it reads has been assigned, and -race would
+	// find it.
+	OnEvent func(*Client, Event)
 	// OnLog receives adapter stderr and protocol-level complaints, wired to
-	// the status line so a broken adapter says something.
-	OnLog func(string)
+	// the status line so a broken adapter says something. Same client argument,
+	// same reason.
+	OnLog func(*Client, string)
 }
 
 // Client is one debug adapter, spoken to over a socket.
@@ -1410,6 +1422,15 @@ func (c *Client) DialChild(name string, h Handlers) (*Client, error) {
 		return nil, fmt.Errorf("%s: dialing the child session at %s: %w", name, c.dialAddr, err)
 	}
 	child := newClient(name, conn, h)
+	// 🔴 A LEAF has no session to give away, and saying so is the fix for a real
+	// hang. newClient leaves childClaimed false, so a leaf that received its own
+	// startDebugging answered success:true, buffered the request, and dropped it —
+	// nobody calls AwaitChildSession on a leaf. The adapter then believes we
+	// opened a session we never opened, and the debuggee's worker waits for a
+	// debugger that never attaches. "One leaf session, enforced out loud" was
+	// enforced only on the root; this extends it to the leaf, where a page with a
+	// web worker makes it reachable.
+	child.childClaimed = true
 	go child.readLoop()
 	return child, nil
 }
@@ -1436,7 +1457,7 @@ func (c *Client) dispatchEvent(ev Event) {
 		close(w)
 	}
 	if c.handlers.OnEvent != nil {
-		c.handlers.OnEvent(ev)
+		c.handlers.OnEvent(c, ev)
 	}
 }
 
@@ -1505,7 +1526,7 @@ func (c *Client) handleDisconnect(err error) {
 		c.log("adapter said: " + strings.Join(stderr, " | "))
 	}
 	if !alreadyTerminated && c.handlers.OnEvent != nil {
-		c.handlers.OnEvent(Event{Type: TypeEvent, Event: EventTerminated})
+		c.handlers.OnEvent(c, Event{Type: TypeEvent, Event: EventTerminated})
 	}
 }
 
@@ -1522,7 +1543,7 @@ func (c *Client) LastStderr() []string {
 // name so a multi-adapter future stays legible.
 func (c *Client) log(msg string) {
 	if c.handlers.OnLog != nil {
-		c.handlers.OnLog(c.name + ": " + msg)
+		c.handlers.OnLog(c, c.name+": "+msg)
 	}
 }
 

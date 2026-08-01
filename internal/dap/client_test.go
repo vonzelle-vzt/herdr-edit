@@ -151,12 +151,12 @@ type collector struct {
 // handlers returns the Handlers wired to this collector.
 func (c *collector) handlers() Handlers {
 	return Handlers{
-		OnEvent: func(e Event) {
+		OnEvent: func(_ *Client, e Event) {
 			c.mu.Lock()
 			c.events = append(c.events, e)
 			c.mu.Unlock()
 		},
-		OnLog: func(s string) {
+		OnLog: func(_ *Client, s string) {
 			c.mu.Lock()
 			c.logs = append(c.logs, s)
 			c.mu.Unlock()
@@ -1533,4 +1533,64 @@ func TestEvaluateSendsFrameZero(t *testing.T) {
 		t.Fatalf("evaluate arguments = %s — a repl evaluate with no stop must not name a frame", raw)
 	}
 	f.respond(req, EvaluateResult{Result: "2"})
+}
+
+// TestAChildSessionRefusesAGrandchildLoudly pins the second half of the
+// one-leaf rule, which was enforced only on the root.
+//
+// 🔴 newClient leaves childClaimed false, so a LEAF that received its own
+// startDebugging answered success:true, buffered the request into childReq, and
+// dropped it — nothing ever calls AwaitChildSession on a leaf. The adapter then
+// believes we opened a session we never opened, and the debuggee's worker waits
+// for a debugger that never attaches. Nothing anywhere says so.
+//
+// It is unreachable while only Node is debugged, and becomes reachable the
+// moment a browser target ships: any page with a web worker or a service worker
+// nests a session under the leaf.
+func TestAChildSessionRefusesAGrandchildLoudly(t *testing.T) {
+	var col collector
+	// newFakePair gives a client built the way DialChild builds a leaf.
+	c, f := newFakePair(t, col.handlers())
+	defer stopFake(c, f)
+
+	// Claim it exactly as DialChild now does.
+	c.mu.Lock()
+	c.childClaimed = true
+	c.mu.Unlock()
+
+	seq := f.reverseRequest(CommandStartDebugging, map[string]interface{}{
+		"request": "launch",
+		"configuration": map[string]interface{}{
+			"type": "pwa-chrome", "name": "worker.js", "__pendingTargetId": "zzz",
+		},
+	})
+	got := f.readResponse()
+
+	if got.Success {
+		t.Fatal("a grandchild session was ACCEPTED — nothing dials it, so the adapter " +
+			"waits forever for a debugger that will never attach")
+	}
+	if got.RequestSeq != seq {
+		t.Errorf("answered request_seq %d, want %d", got.RequestSeq, seq)
+	}
+	if got.Message == "" {
+		t.Error("refused with no message; the adapter learns nothing about why")
+	}
+	// Refused is not the same as swallowed: the user has to be able to see WHICH
+	// session was declined, matching the root's refusal.
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		col.mu.Lock()
+		joined := strings.Join(col.logs, " | ")
+		col.mu.Unlock()
+		if strings.Contains(joined, "worker.js") {
+			t.Logf("the declined grandchild was surfaced: %s", joined)
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	col.mu.Lock()
+	logs := append([]string(nil), col.logs...)
+	col.mu.Unlock()
+	t.Fatalf("the grandchild was refused SILENTLY — no log names it. logs: %v", logs)
 }

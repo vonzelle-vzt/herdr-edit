@@ -777,7 +777,7 @@ func TestARefusedStepPutsTheSessionBack(t *testing.T) {
 	clientEnd, adapterEnd := net.Pipe()
 	t.Cleanup(func() { _ = adapterEnd.Close() })
 	client := dap.StartConn("refusing-adapter", clientEnd, dap.Handlers{
-		OnEvent: func(e dap.Event) { a.post(&debugEvent{when: time.Now(), ev: e}) },
+		OnEvent: func(c *dap.Client, e dap.Event) { a.post(&debugEvent{when: time.Now(), ev: e}) },
 	})
 
 	a.debug = &debugSession{

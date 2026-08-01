@@ -217,8 +217,8 @@ func newStoppedWaiter(t *testing.T) (*stoppedWaiter, Handlers) {
 	w := &stoppedWaiter{col: &collector{}, stopped: make(chan StoppedEvent, 4)}
 	base := w.col.handlers()
 	return w, Handlers{
-		OnEvent: func(e Event) {
-			base.OnEvent(e)
+		OnEvent: func(c *Client, e Event) {
+			base.OnEvent(c, e)
 			if e.Event == EventStopped {
 				var se StoppedEvent
 				if err := unmarshalBody(e.Body, &se); err == nil {
@@ -229,8 +229,8 @@ func newStoppedWaiter(t *testing.T) (*stoppedWaiter, Handlers) {
 				}
 			}
 		},
-		OnLog: func(s string) {
-			base.OnLog(s)
+		OnLog: func(c *Client, s string) {
+			base.OnLog(c, s)
 			t.Logf("adapter log: %s", s)
 		},
 	}

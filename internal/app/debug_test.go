@@ -2630,3 +2630,74 @@ func TestStopClosesTheLeafBeforeTheCoordinator(t *testing.T) {
 	}
 	t.Fatalf("the leaf session was never disconnected; requests seen on it: %v", child.commands())
 }
+
+// TestEventsFromAForeignClientAreIgnored pins the session discriminator.
+//
+// A js-debug session is a ROOT coordinator plus a LEAF that owns the program,
+// and both are given the same Handlers. Before the *Client argument existed the
+// two streams merged, so a stop reported by the coordinator — which debugs
+// nothing — moved the cursor and painted ▶ at a location from the wrong
+// process. A plausible location from the wrong process is the worst thing a
+// debugger can show, because nothing on screen says it is wrong.
+func TestEventsFromAForeignClientAreIgnored(t *testing.T) {
+	a, path := debugFixture(t)
+	leaf := &dap.Client{}
+	foreign := &dap.Client{}
+	a.debug = &debugSession{
+		adapter: "js-debug", running: true, client: leaf,
+		bound: map[string][]boundBreakpoint{},
+	}
+
+	// A stop from a client this session does not own must change nothing.
+	a.handleDAPEvent(&debugEvent{
+		when: time.Now(), client: foreign,
+		ev: stoppedEventFor(t, 1, "breakpoint"),
+	})
+	if a.debug.stopped {
+		t.Fatal("a stop from a foreign connection was applied — the UI would show a " +
+			"location from a process this session is not debugging")
+	}
+	if a.debug.path != "" {
+		t.Fatalf("a foreign stop set the location to %q", a.debug.path)
+	}
+	_ = path
+}
+
+// TestCoordinatorProgramEventsAreIgnored is the same rule one step in: the ROOT
+// is a connection this session DOES own, but it owns no program, so its
+// program-state events must still not move the marker. Only terminated/exited
+// are honoured from either connection, because which one ends first has not
+// been measured.
+func TestCoordinatorProgramEventsAreIgnored(t *testing.T) {
+	a, _ := debugFixture(t)
+	root := &dap.Client{}
+	leaf := &dap.Client{}
+	a.debug = &debugSession{
+		adapter: "js-debug", running: true, client: leaf, root: root,
+		bound: map[string][]boundBreakpoint{},
+	}
+
+	a.handleDAPEvent(&debugEvent{
+		when: time.Now(), client: root,
+		ev: stoppedEventFor(t, 1, "breakpoint"),
+	})
+	if a.debug.stopped {
+		t.Fatal("the coordinator's stop was applied; it has no program state to report")
+	}
+}
+
+// stoppedEventFor builds a stopped event with a body that actually DECODES.
+//
+// 🔴 This exists because the first version of the two tests above sent an empty
+// Body, decodeBody rejected it, handleDAPStopped returned before setting
+// stopped, and both assertions passed whether the routing guard was there or
+// not — an oracle that measured nothing, caught only by disabling the guard and
+// seeing them stay green.
+func stoppedEventFor(t *testing.T, threadID int, reason string) dap.Event {
+	t.Helper()
+	body, err := json.Marshal(map[string]interface{}{"reason": reason, "threadId": threadID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dap.Event{Type: dap.TypeEvent, Event: dap.EventStopped, Body: body}
+}

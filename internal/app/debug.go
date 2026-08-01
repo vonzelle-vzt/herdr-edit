@@ -295,7 +295,12 @@ func (a *App) resumeFailed(client *dap.Client, thread int, what string, err erro
 // debugEvent carries one adapter event onto the tcell queue.
 type debugEvent struct {
 	when time.Time
-	ev   dap.Event
+	// client is the connection the event arrived on. A js-debug session is a
+	// ROOT coordinator plus a LEAF that owns the program, and both post here, so
+	// without this the two streams merge and a stop in the debuggee is
+	// indistinguishable from anything the coordinator said.
+	client *dap.Client
+	ev     dap.Event
 }
 
 func (e *debugEvent) When() time.Time { return e.when }
@@ -371,8 +376,9 @@ func (e *debugStoppedEvent) When() time.Time { return e.when }
 
 // debugLogEvent surfaces an adapter complaint on the status line.
 type debugLogEvent struct {
-	when time.Time
-	msg  string
+	when   time.Time
+	client *dap.Client
+	msg    string
 }
 
 func (e *debugLogEvent) When() time.Time { return e.when }
@@ -524,8 +530,12 @@ func (a *App) runDebugSession(adapter dap.Adapter, program string, bps []Breakpo
 	defer cancel()
 
 	handlers := dap.Handlers{
-		OnEvent: func(e dap.Event) { a.post(&debugEvent{when: time.Now(), ev: e}) },
-		OnLog:   func(s string) { a.post(&debugLogEvent{when: time.Now(), msg: s}) },
+		OnEvent: func(c *dap.Client, e dap.Event) {
+			a.post(&debugEvent{when: time.Now(), client: c, ev: e})
+		},
+		OnLog: func(c *dap.Client, s string) {
+			a.post(&debugLogEvent{when: time.Now(), client: c, msg: s})
+		},
 	}
 
 	fail := func(err error) {
@@ -665,8 +675,12 @@ func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *
 	}
 
 	handlers := dap.Handlers{
-		OnEvent: func(e dap.Event) { a.post(&debugEvent{when: time.Now(), ev: e}) },
-		OnLog:   func(s string) { a.post(&debugLogEvent{when: time.Now(), msg: s}) },
+		OnEvent: func(c *dap.Client, e dap.Event) {
+			a.post(&debugEvent{when: time.Now(), client: c, ev: e})
+		},
+		OnLog: func(c *dap.Client, s string) {
+			a.post(&debugLogEvent{when: time.Now(), client: c, msg: s})
+		},
 	}
 	leaf, err := root.DialChild(adapter.Name, handlers)
 	if err != nil {
@@ -1090,6 +1104,28 @@ func (a *App) applyBoundBreakpoints() {
 func (a *App) handleDAPEvent(e *debugEvent) {
 	if a.debug == nil {
 		return // a stale event from a session the user already stopped
+	}
+	// 🔴 Route on the connection the event arrived on, not just on its name.
+	//
+	// A js-debug session is a ROOT coordinator plus a LEAF that owns the program.
+	// The root debugs nothing, so applying its stop would move ▶ for a connection
+	// with no program state — a plausible location from the wrong process, which
+	// is the worst thing a debugger can show. Program-state events are therefore
+	// honoured only from the leaf.
+	//
+	// terminated/exited are honoured from EITHER, because teardown depends on
+	// whichever connection ends first and which that is has not been measured.
+	// This does not fix the two-leaf case — that is not fixable until there are
+	// two leaves — it installs the discriminator that makes the fix possible, and
+	// stops wrong-connection stops and output today.
+	if e.client != nil && e.client != a.debug.client && e.client != a.debug.root {
+		return // a connection this session does not own
+	}
+	if e.client != nil && a.debug.client != nil && e.client != a.debug.client {
+		switch e.ev.Event {
+		case dap.EventStopped, dap.EventContinued, dap.EventOutput, dap.EventBreakpoint:
+			return // the coordinator has no program state to report
+		}
 	}
 	switch e.ev.Event {
 	case dap.EventStopped:
