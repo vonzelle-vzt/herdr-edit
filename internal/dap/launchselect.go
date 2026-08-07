@@ -405,16 +405,6 @@ func ResolveLaunchConfig(cfg LaunchConfig, ctx LaunchVarContext) (LaunchSpec, er
 		args[adapter.WorkspaceFolderKey] = ctx.WorkspaceFolder
 	}
 
-	_, hasProgram := args["program"]
-	_, hasURL := args["url"]
-	if !hasProgram && !hasURL && ctx.File != "" {
-		program := ctx.File
-		if adapter.ProgramIsDir {
-			program = filepath.Dir(ctx.File)
-		}
-		args["program"] = program
-	}
-
 	request := cfg.Request
 	if request == "" {
 		request = stringField(args, "request")
@@ -422,6 +412,17 @@ func ResolveLaunchConfig(cfg LaunchConfig, ctx LaunchVarContext) (LaunchSpec, er
 	if request == "" {
 		request = "launch"
 	}
+
+	_, hasProgram := args["program"]
+	_, hasURL := args["url"]
+	if request == "launch" && !hasProgram && !hasURL && ctx.File != "" {
+		program := ctx.File
+		if adapter.ProgramIsDir {
+			program = filepath.Dir(ctx.File)
+		}
+		args["program"] = program
+	}
+
 	args["request"] = request
 
 	name := cfg.Name

@@ -28,8 +28,9 @@ func TestAdapterForGo(t *testing.T) {
 	if a.Name != "delve" || a.AdapterID != "go" {
 		t.Errorf("adapter = %+v, want delve/go", a)
 	}
-	if _, ok := AdapterFor("typescript"); ok {
-		t.Error("an adapter answered for typescript; stage 2 ships delve only")
+	if _, ok := AdapterFor("ruby"); ok {
+		t.Error("an adapter answered for ruby, which nothing here debugs; an unrelated " +
+			"file type must never spawn a debugger")
 	}
 }
 
@@ -526,21 +527,28 @@ func TestAdapterForJavaScript(t *testing.T) {
 //
 // 🔴 A row in a table is a claim, and this fork has shipped three features whose
 // only caller was a test. `pwa-node` will happily be handed a .ts file and node
-// 24 can even strip the types — but nothing here proves a TypeScript breakpoint
-// binds through a source map, so claiming typescript would advertise a feature
-// no oracle covers. Add the language when an oracle covers it, not before.
+// 24 can even strip the types — but acceptance is not proof. Add a language when
+// an oracle covers it, not before. `typescript` is here because
+// TestLiveJsTsBreakpointBindsThroughSourceMap proves a breakpoint set on a .ts
+// file binds through a real tsc source map and stops on the .ts line — which is
+// also why this test now EXPECTS it to resolve: dropping the language after
+// claiming it in README.md would be the same lie in the other direction.
 func TestJsDebugLanguagesAreOnlyWhatIsProven(t *testing.T) {
 	a, _ := AdapterFor("javascript")
 	for _, lang := range a.Languages {
 		switch lang {
-		case "javascript", "javascriptreact":
+		case "javascript", "javascriptreact", "typescript":
 		default:
 			t.Errorf("js-debug claims language %q, which no live oracle exercises", lang)
 		}
 	}
-	if _, ok := AdapterFor("typescript"); ok {
-		t.Error("typescript resolves to a debug adapter, but no oracle proves a TypeScript " +
-			"breakpoint binds through a source map — see this test's comment before adding it")
+	ts, ok := AdapterFor("typescript")
+	if !ok {
+		t.Error("typescript does not resolve to a debug adapter, but " +
+			"TestLiveJsTsBreakpointBindsThroughSourceMap proves the binding and README.md " +
+			"claims it — the registry row lost the language")
+	} else if ts.AdapterID != "pwa-node" {
+		t.Errorf("typescript resolves to adapter %q, want the pwa-node row the oracle drives", ts.AdapterID)
 	}
 }
 

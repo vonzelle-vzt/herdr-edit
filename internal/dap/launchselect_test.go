@@ -304,7 +304,7 @@ func TestAttachRequestSurvivesResolution(t *testing.T) {
 	spec, err := ResolveLaunchConfig(
 		LaunchConfig{Name: "Attach", Type: "go", Request: "attach",
 			Args: map[string]interface{}{"name": "Attach", "type": "go", "request": "attach", "mode": "local", "processId": 1234.0}},
-		LaunchVarContext{WorkspaceFolder: t.TempDir()})
+		LaunchVarContext{WorkspaceFolder: t.TempDir(), File: filepath.Join(t.TempDir(), "main.go")})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -317,6 +317,9 @@ func TestAttachRequestSurvivesResolution(t *testing.T) {
 	// The adapter row's default is request:launch; the config has to beat it.
 	if spec.Args["mode"] != "local" {
 		t.Errorf("the user's mode was replaced by the adapter default: %v", spec.Args["mode"])
+	}
+	if _, ok := spec.Args["program"]; ok {
+		t.Errorf("attach config picked up an active-file program: %v", spec.Args["program"])
 	}
 }
 

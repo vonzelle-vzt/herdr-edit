@@ -228,7 +228,10 @@ var DefaultAdapters = []Adapter{
 		// speaks stdio, and js-debug is a TCP server we dial — and only the
 		// third can carry the second connection a child session needs.
 		Transport: TransportServer,
-		Languages: []string{"javascript", "javascriptreact"},
+		// `typescript` is claimed because a live oracle proves it, not because
+		// js-debug would accept the file: TestLiveJsTsBreakpointBindsThroughSourceMap
+		// stops on a .ts line through a real tsc source map.
+		Languages: []string{"javascript", "javascriptreact", "typescript"},
 		// `node-terminal` is VS Code's "run a command in a terminal" variant.
 		// It resolves to the same server and the same wire type; what differs
 		// is which keys the user sets, which is their file's business.
