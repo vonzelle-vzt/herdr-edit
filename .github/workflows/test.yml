@@ -115,16 +115,16 @@ jobs:
       # dependency is the fix; relaxing the gate would have restored a green badge over four
       # oracles that never execute, which is the state this whole anti-skip mechanism exists to
       # prevent.
-      - name: Install debugpy (for the live DAP oracle)
+      - name: Install debugpy and pytest (for the live DAP oracles)
         run: |
-          python3 -m pip install --user debugpy \
-            || python3 -m pip install debugpy \
-            || python3 -m pip install --break-system-packages debugpy
+          python3 -m pip install --user debugpy pytest \
+            || python3 -m pip install debugpy pytest \
+            || python3 -m pip install --break-system-packages debugpy pytest
 
       - name: Verify debugpy is reachable
         run: |
-          python3 -c "import debugpy; print('debugpy', debugpy.__version__)" \
-            || { echo "debugpy is not importable — the live debugpy oracles would fail under HERDR_REQUIRE_DAP=1" >&2; exit 1; }
+          python3 -c "import debugpy, pytest; print('debugpy', debugpy.__version__, 'pytest', pytest.__version__)" \
+            || { echo "debugpy or pytest is not importable — the live debugpy oracles (including TestLiveDebugpyDebugsAPytestTest) would fail under HERDR_REQUIRE_DAP=1" >&2; exit 1; }
 
       # The THIRD adapter. internal/dap/live_jsdebug_test.go drives a real js-debug, and the
       # app-level child-session oracles drive the routing it forces. Same anti-skip reasoning as
