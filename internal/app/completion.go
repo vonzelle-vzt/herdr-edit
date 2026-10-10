@@ -6,20 +6,39 @@
 // =============================================================================
 
 // completion.go is LSP autocomplete: a popup of suggestions anchored under the
-// cursor, opened with Esc c.
+// cursor. It opens two ways — MANUALLY with Esc SPACE (or the ≡ menu row), and
+// AUTOMATICALLY while typing, 120 ms after an identifier prefix reaches two
+// runes or a trigger character ('.') is typed.
 //
-// It is EXPLICITLY INVOKED rather than firing as you type. That is a deliberate
-// choice for this editor, not a shortcut: an as-you-type popup needs a debounce,
-// a cancellation story for in-flight requests, and a rule for when it must get
-// out of the way — and every one of those failure modes shows up as the editor
-// swallowing a keystroke, which is the worst thing a text editor can do. Esc c
-// asks for completions at a moment the user chose.
+// The automatic popup was deliberately absent for a long time, because every
+// way it can go wrong shows up as the editor swallowing a keystroke — the worst
+// thing a text editor can do. It exists now under a contract that keeps the
+// keyboard the user's:
+//
+//   - Debounce + generations. Every key event bumps completionGen. A debounce
+//     timer, or a server answer, that carries an older generation is dropped,
+//     and so is one whose cursor or file no longer matches. Scheduling a new
+//     request cancels the previous request's context. A slow server can only
+//     ever be late, never wrong.
+//   - While the popup is open, identifier keys PASS THROUGH to the buffer and
+//     the list re-filters on the new prefix (closing when nothing matches).
+//     Typing a word with the popup open leaves exactly that word in the buffer.
+//   - An automatic popup consumes ONLY Tab (accept), Esc (close), Up and Down.
+//     🔴 It does NOT consume Enter. The user did not ask for this popup; it
+//     appeared because they paused mid-line. Enter at the end of a line means
+//     "newline" to someone who never looked at the popup, and accepting a
+//     suggestion instead would rewrite their code behind their back. So Enter
+//     closes it and inserts the newline. A MANUAL (Esc SPACE) popup was asked
+//     for, so there Enter accepts, exactly as before.
+//   - No automatic request on image or synthetic tabs, with a selection, for a
+//     file with no language, or with completion.auto=false in config.json.
 //
 // 🔴 The request is the easy half. hover and definition were complete, tested
 // and advertised in initialize with ZERO callers for months; find-and-replace
-// then did the same thing. This file exists so that does not happen a fourth
-// time — completionOpen, handleCompletionKey and applyCompletion below are the
-// wiring, and completion_test.go asserts the leader binding exists.
+// then did the same thing. menuComplete (Esc SPACE) and afterTypedRune (called
+// from handleKey on every typed rune) are the real callers here, and
+// completion_test.go drives them through handleKey rather than calling the
+// internals directly.
 
 package app
 
@@ -39,6 +58,15 @@ const (
 	completionMaxWidth = 44
 )
 
+// completionDebounce is how long typing must pause before an automatic request
+// goes out. Short enough to feel immediate, long enough that a word typed at
+// speed sends one request rather than one per letter.
+const completionDebounce = 120 * time.Millisecond
+
+// completionFunc is the completion source: lsp.Manager.Completion in
+// production, a stub in tests (App.completionSource).
+type completionFunc func(ctx context.Context, path string, pos lsp.Position) ([]lsp.CompletionItem, error)
+
 // completionEvent delivers a finished request to the main loop. Like every
 // other LSP action here it arrives as a posted event: calling inline would
 // block Run's PollEvent on a language server, and an indexing server would
@@ -46,43 +74,164 @@ const (
 type completionEvent struct {
 	items  []lsp.CompletionItem
 	prefix string
+	path   string
 	at     editor.Position
+	gen    uint64
+	auto   bool
 	when   time.Time
 }
 
 // When satisfies tcell.Event.
 func (e *completionEvent) When() time.Time { return e.when }
 
-// menuComplete requests completions at the cursor. Bound to Esc c and a menu row.
+// completionTimerEvent is the debounce firing. It goes through the event queue
+// rather than requesting from the timer goroutine, so the generation check and
+// the cursor read happen on the main loop like every other UI state access.
+type completionTimerEvent struct {
+	gen  uint64
+	when time.Time
+}
+
+// When satisfies tcell.Event.
+func (e *completionTimerEvent) When() time.Time { return e.when }
+
+// completionFetcher returns the completion source: the test stub when one is
+// set, otherwise the language-server manager. nil means there is no source.
+func (a *App) completionFetcher() completionFunc {
+	if a.completionSource != nil {
+		return a.completionSource
+	}
+	if a.lsp == nil {
+		return nil
+	}
+	return a.lsp.Completion
+}
+
+// menuComplete requests completions at the cursor. Bound to Esc SPACE and a
+// menu row. The popup it opens is MANUAL, so Enter accepts.
 func (a *App) menuComplete() {
 	a.closeMenu()
 	tab := a.activeTabPtr()
 	if tab == nil || tab.IsImage() {
 		return
 	}
-	path, pos, ok := a.lspCursorPos()
-	if !ok {
+	fetch := a.completionFetcher()
+	if fetch == nil || tab.Path == "" {
 		a.flash("No language server for this file")
 		return
 	}
-	prefix := wordPrefixAt(tab.LineText(tab.Cursor.Line), tab.Cursor.Col)
-	at := tab.Cursor
-	mgr := a.lsp
+	a.requestCompletion(tab, fetch, false)
+}
+
+// requestCompletion sends a completion request for the cursor in tab, off the
+// event loop. Any earlier in-flight request is cancelled first; its answer
+// would be stale by generation anyway, and a busy server should not keep
+// working on it.
+func (a *App) requestCompletion(tab *editor.Tab, fetch completionFunc, auto bool) {
+	a.cancelCompletionRequest()
+	ctx, cancel := context.WithTimeout(context.Background(), lspRequestTimeout)
+	a.completionCancel = cancel
+
+	line := tab.LineText(tab.Cursor.Line)
+	pos := lsp.Position{Line: tab.Cursor.Line, Character: lsp.RuneColToUTF16(line, tab.Cursor.Col)}
+	ev := &completionEvent{
+		prefix: wordPrefixAt(line, tab.Cursor.Col),
+		path:   tab.Path,
+		at:     tab.Cursor,
+		gen:    a.completionGen,
+		auto:   auto,
+	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		items, err := mgr.Completion(ctx, path, pos)
+		items, err := fetch(ctx, ev.path, pos)
 		if err != nil {
 			items = nil
 		}
-		a.post(&completionEvent{items: items, prefix: prefix, at: at, when: time.Now()})
+		ev.items = items
+		ev.when = time.Now()
+		a.post(ev)
 	}()
+}
+
+// cancelCompletionRequest cancels the in-flight request's context, if any.
+func (a *App) cancelCompletionRequest() {
+	if a.completionCancel != nil {
+		a.completionCancel()
+		a.completionCancel = nil
+	}
+}
+
+// isCompletionTrigger reports whether typing r should ask for completions even
+// with no identifier prefix. The client does not surface the server's
+// completionProvider.triggerCharacters, so this is the spec's fallback: '.'.
+func isCompletionTrigger(r rune) bool {
+	return r == '.'
+}
+
+// afterTypedRune runs after handleKey inserted a typed rune. With the popup
+// open it re-filters on the new prefix (the key itself already reached the
+// buffer — the popup never eats it); otherwise it may schedule an automatic
+// request. hadSelection is whether a selection existed BEFORE the insert, since
+// typing over a selection replaces it and leaves no trace afterwards.
+func (a *App) afterTypedRune(tab *editor.Tab, r rune, hadSelection bool) {
+	if a.completionOpen {
+		a.refilterCompletion(tab)
+		if a.completionOpen {
+			return
+		}
+	}
+	if a.completionAutoOff || hadSelection || !autoCompletionTab(tab) {
+		return
+	}
+	if a.completionSource == nil && (a.lsp == nil || len(a.lsp.Running()) == 0) {
+		return
+	}
+	prefix := wordPrefixAt(tab.LineText(tab.Cursor.Line), tab.Cursor.Col)
+	if runeLen(prefix) < 2 && !isCompletionTrigger(r) {
+		return
+	}
+	a.cancelCompletionRequest()
+	gen := a.completionGen
+	time.AfterFunc(completionDebounce, func() {
+		a.post(&completionTimerEvent{gen: gen, when: time.Now()})
+	})
+}
+
+// autoCompletionTab reports whether tab may receive an AUTOMATIC request: a
+// real text file in a language a server could cover, with no selection.
+// Synthetic tabs (diffs, search results) are generated text a server has never
+// seen, and an image has no text at all.
+func autoCompletionTab(tab *editor.Tab) bool {
+	return tab != nil && !tab.IsImage() && !tab.Synthetic && tab.Path != "" &&
+		!tab.HasSelection() && lsp.LanguageID(tab.Path) != "plaintext"
+}
+
+// handleCompletionTimer fires the debounced request if nothing was typed since
+// it was scheduled.
+func (a *App) handleCompletionTimer(e *completionTimerEvent) {
+	if e.gen != a.completionGen || a.completionOpen {
+		return
+	}
+	tab := a.activeTabPtr()
+	if !autoCompletionTab(tab) {
+		return
+	}
+	fetch := a.completionFetcher()
+	if fetch == nil {
+		return
+	}
+	a.requestCompletion(tab, fetch, true)
 }
 
 // handleCompletion opens the popup with whatever came back.
 func (a *App) handleCompletion(e *completionEvent) {
+	if e.gen != a.completionGen {
+		// A key arrived after this request went out. The answer describes text
+		// the user has already changed.
+		return
+	}
 	tab := a.activeTabPtr()
-	if tab == nil || tab.Cursor != e.at {
+	if tab == nil || tab.Cursor != e.at || tab.Path != e.path {
 		// The cursor moved while the server was thinking. Showing suggestions
 		// for a position the user has left would insert text somewhere they are
 		// not looking.
@@ -90,19 +239,40 @@ func (a *App) handleCompletion(e *completionEvent) {
 	}
 	items := filterCompletions(e.items, e.prefix)
 	if len(items) == 0 {
-		a.flash("No completions")
+		if !e.auto {
+			a.flash("No completions")
+		}
 		return
 	}
 	a.completionOpen = true
+	a.completionAuto = e.auto
+	a.completionAll = e.items
 	a.completionItems = items
 	a.completionSelected = 0
 	a.completionScroll = 0
 	a.completionPrefix = e.prefix
 }
 
+// refilterCompletion narrows the open popup to the prefix now before the
+// cursor, closing it when nothing matches.
+func (a *App) refilterCompletion(tab *editor.Tab) {
+	prefix := wordPrefixAt(tab.LineText(tab.Cursor.Line), tab.Cursor.Col)
+	items := filterCompletions(a.completionAll, prefix)
+	if len(items) == 0 {
+		a.closeCompletion()
+		return
+	}
+	a.completionItems = items
+	a.completionPrefix = prefix
+	a.completionSelected = 0
+	a.completionScroll = 0
+}
+
 // closeCompletion hides the popup.
 func (a *App) closeCompletion() {
 	a.completionOpen = false
+	a.completionAuto = false
+	a.completionAll = nil
 	a.completionItems = nil
 	a.completionSelected = 0
 	a.completionScroll = 0
@@ -187,15 +357,25 @@ func (a *App) applyCompletion() {
 //
 // 🔴 Returning false rather than eating the key is the whole contract. A popup
 // that swallows a keystroke is the worst failure a text editor has: the user
-// typed something and the editor silently discarded it. Only the four keys the
-// popup genuinely owns are consumed; everything else dismisses it and is then
-// handled exactly as if the popup had never been open.
+// typed something and the editor silently discarded it. Only Tab, Esc, Up and
+// Down are consumed (plus Enter in a MANUAL popup — see the file header for why
+// an automatic one lets Enter through). Identifier runes pass through with the
+// popup still open, so handleKey inserts them and afterTypedRune re-filters;
+// every other key dismisses it and is then handled exactly as if the popup had
+// never been open.
 func (a *App) handleCompletionKey(ev *tcell.EventKey) bool {
 	switch ev.Key() {
 	case tcell.KeyEsc:
 		a.closeCompletion()
 		return true
-	case tcell.KeyEnter, tcell.KeyTab:
+	case tcell.KeyTab:
+		a.applyCompletion()
+		return true
+	case tcell.KeyEnter:
+		if a.completionAuto {
+			a.closeCompletion()
+			return false
+		}
 		a.applyCompletion()
 		return true
 	case tcell.KeyUp:
@@ -210,6 +390,12 @@ func (a *App) handleCompletionKey(ev *tcell.EventKey) bool {
 			a.clampCompletionScroll()
 		}
 		return true
+	case tcell.KeyRune:
+		if isIdentRune(ev.Rune()) {
+			return false
+		}
+		a.closeCompletion()
+		return false
 	default:
 		a.closeCompletion()
 		return false

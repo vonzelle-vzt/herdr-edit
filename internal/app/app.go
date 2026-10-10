@@ -18,6 +18,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -594,12 +595,25 @@ type App struct {
 	paletteOverride []paletteCommand
 	paletteTitle    string
 
-	// LSP completion popup — Esc c, explicitly invoked.
+	// LSP completion popup — Esc SPACE, or automatically while typing. See
+	// completion.go for the contract that keeps it from eating keystrokes.
 	completionOpen     bool
+	completionAuto     bool                 // opened by typing: Enter is NOT consumed
+	completionAll      []lsp.CompletionItem // the server's answer, re-filtered as you type
 	completionItems    []lsp.CompletionItem
 	completionSelected int
 	completionScroll   int
 	completionPrefix   string
+	// completionGen is bumped on every key event; a debounce timer or answer
+	// carrying an older value is dropped.
+	completionGen    uint64
+	completionCancel context.CancelFunc
+	// completionAutoOff is config.json's completion.auto=false, inverted so the
+	// zero value (and every test App) keeps the default ON.
+	completionAutoOff bool
+	// completionSource stubs the language server in tests; nil means
+	// a.lsp.Completion (completionFetcher).
+	completionSource completionFunc
 
 	// Inline git blame — Esc b. Cursor line only, cached per (path, line),
 	// computed off the event loop and delivered as a posted event.
@@ -830,6 +844,7 @@ func (a *App) loadSpiceConfig() {
 	if err != nil {
 		a.flash("config: " + err.Error())
 	}
+	a.completionAutoOff = !cfg.CompletionAuto
 	if a.tree != nil {
 		a.tree.IconsEnabled = icons.Resolve(cfg.Icons)
 		// Only re-derive when the user turned it OFF: New() already built the set with the filter
@@ -1105,6 +1120,8 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleDebugThreads(e)
 	case *completionEvent:
 		a.handleCompletion(e)
+	case *completionTimerEvent:
+		a.handleCompletionTimer(e)
 	case *referencesEvent:
 		a.handleReferences(e)
 	case *symbolsEvent:
@@ -1478,6 +1495,10 @@ func (a *App) menuModalRect() (x, y, w, h int) {
 // only "command" key is Esc, which closes the menu and acts as the leader
 // for the hotkey table in leader.go (Esc s = Save, Esc u = Undo, etc.).
 func (a *App) handleKey(ev *tcell.EventKey) {
+	// Every key invalidates any pending automatic completion: a debounce timer
+	// or server answer from before this key describes text that has changed.
+	a.completionGen++
+
 	// Secondary modals own the keyboard while they're up. Each handler
 	// understands Esc (cancel), Enter (submit / activate), and the keys
 	// relevant to its layout (text editing for the prompt, arrow keys for
@@ -1667,7 +1688,9 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 	case tcell.KeyTab:
 		tab.InsertString(tab.IndentUnit)
 	case tcell.KeyRune:
+		hadSelection := tab.HasSelection()
 		tab.InsertRune(ev.Rune())
+		a.afterTypedRune(tab, ev.Rune(), hadSelection)
 	}
 }
 

@@ -18,6 +18,7 @@
 //	{"icons": "auto"}    // default; auto-detect Nerd Fonts on startup
 //	{"icons": "on"}      // force-on, even if detection would say no
 //	{"icons": "off"}     // force-off, even if a Nerd Font is installed
+//	{"completion": {"auto": false}}   // only Esc SPACE opens completions
 //
 // The loader is best-effort the same way customactions is: missing
 // file → defaults, malformed file → error returned for the app to
@@ -56,27 +57,39 @@ type Config struct {
 	// A pointer in fileFormat distinguishes "absent" from "explicitly false"; this is the promoted
 	// plain bool.
 	RespectGitignore bool
+
+	// CompletionAuto opens the completion popup while typing (after a short
+	// debounce) instead of only on Esc SPACE. Default ON, like VS Code's
+	// editor.quickSuggestions. Same pointer-in-fileFormat promotion as
+	// RespectGitignore, so only an explicit false turns it off.
+	CompletionAuto bool
 }
 
 // Defaults returns a Config populated with the values used when no
 // config file is present (or every field in it is blank). Centralised
 // so tests and the loader can't drift from each other.
 func Defaults() Config {
-	return Config{Icons: IconsAuto, RespectGitignore: true}
+	return Config{Icons: IconsAuto, RespectGitignore: true, CompletionAuto: true}
 }
 
 // fileFormat mirrors the on-disk JSON shape. We decode into this and
 // then promote into Config so the public type doesn't have to carry
 // JSON tags or pointer fields just for "field was absent" detection.
 type fileFormat struct {
-	Icons string `json:"icons,omitempty"`
-	Tree  *tree  `json:"tree,omitempty"`
+	Icons      string      `json:"icons,omitempty"`
+	Tree       *tree       `json:"tree,omitempty"`
+	Completion *completion `json:"completion,omitempty"`
 }
 
 // tree groups file-explorer settings. Nested rather than flat so future tree options have an
 // obvious home, and a pointer so an absent block keeps the default instead of reading as false.
 type tree struct {
 	RespectGitignore *bool `json:"respectGitignore,omitempty"`
+}
+
+// completion groups editor-completion settings, nested for the same reason as tree.
+type completion struct {
+	Auto *bool `json:"auto,omitempty"`
 }
 
 // DefaultPath returns the canonical config-file location:
@@ -147,6 +160,9 @@ func Load(path string) (Config, error) {
 	// Absent block or absent key keeps the default; only an explicit false turns it off.
 	if ff.Tree != nil && ff.Tree.RespectGitignore != nil {
 		cfg.RespectGitignore = *ff.Tree.RespectGitignore
+	}
+	if ff.Completion != nil && ff.Completion.Auto != nil {
+		cfg.CompletionAuto = *ff.Completion.Auto
 	}
 	return cfg, nil
 }

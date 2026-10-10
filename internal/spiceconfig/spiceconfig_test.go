@@ -172,3 +172,34 @@ func TestDefaultPathFallsBackToHome(t *testing.T) {
 		t.Fatalf("DefaultPath() = %q, want %q", got, want)
 	}
 }
+
+// TestCompletionAuto pins that as-you-type completion is ON unless the user
+// writes an explicit false — an absent block, or a block without the key, must
+// keep the default rather than reading as "off".
+func TestCompletionAuto(t *testing.T) {
+	if !Defaults().CompletionAuto {
+		t.Fatal("Defaults().CompletionAuto = false, want true")
+	}
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{}`, true},
+		{`{"completion":{}}`, true},
+		{`{"completion":{"auto":true}}`, true},
+		{`{"completion":{"auto":false}}`, false},
+	}
+	for _, c := range cases {
+		p := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(p, []byte(c.body), 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		cfg, err := Load(p)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", c.body, err)
+		}
+		if cfg.CompletionAuto != c.want {
+			t.Errorf("Load(%s).CompletionAuto = %v, want %v", c.body, cfg.CompletionAuto, c.want)
+		}
+	}
+}
