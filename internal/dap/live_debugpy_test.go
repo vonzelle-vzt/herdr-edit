@@ -38,6 +38,7 @@ package dap
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -84,6 +85,40 @@ func requireDebugpy(t *testing.T, root string) *Command {
 	}
 	t.Logf("debugpy resolved from %s: argv=%v env=%v", cmd.Origin, cmd.Argv, cmd.Env)
 	return cmd
+}
+
+// pytestPython chooses the first project-relevant interpreter that can import pytest.
+func pytestPython(t *testing.T, root string) string {
+	t.Helper()
+	candidates := []string{os.Getenv("HERDR_PYTEST_PYTHON"), projectPython(root), systemPython()}
+	seen := map[string]bool{}
+	for _, python := range candidates {
+		if python == "" || seen[python] || !isExecutableFile(python) {
+			continue
+		}
+		seen[python] = true
+		ctx, cancel := context.WithTimeout(context.Background(), debugpyProbeTimeout)
+		err := exec.CommandContext(ctx, python, "-c", "import pytest").Run()
+		cancel()
+		if err == nil {
+			return python
+		}
+	}
+	skipOrFatal(t, "no interpreter can import pytest; set HERDR_PYTEST_PYTHON to one that can")
+	return ""
+}
+
+// debugpyCommandForPython supplies debugpy without changing the selected test interpreter.
+func debugpyCommandForPython(t *testing.T, python string) *Command {
+	t.Helper()
+	if pythonCanImportDebugpy(python) {
+		return &Command{Argv: []string{python, "-m", "debugpy.adapter"}, Origin: "pytest " + python}
+	}
+	if libs := findDebugpyInVSCodeExtensions(vscodeExtensionRoots()); libs != "" {
+		return &Command{Argv: []string{python, "-m", "debugpy.adapter"}, Env: []string{"PYTHONPATH=" + libs}, Origin: "pytest interpreter with vscode extension " + libs}
+	}
+	skipOrFatal(t, "the pytest interpreter cannot import debugpy and no VS Code debugpy bundle was found")
+	return nil
 }
 
 // debugpyFixture writes a small real Python program and returns its directory,
@@ -339,6 +374,77 @@ func TestLiveDebugpyStopsAtBreakpoint(t *testing.T) {
 	if err := s.client.Disconnect(ctx, true); err != nil {
 		t.Errorf("disconnect: %v", err)
 	}
+}
+
+// TestLiveDebugpyDebugsAPytestTest proves the synthesized module launch stops inside one pytest node.
+func TestLiveDebugpyDebugsAPytestTest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), debugpyTimeout)
+	defer cancel()
+
+	root := t.TempDir()
+	src := `def test_calc():
+    left = 7
+    assert left + 2 == 9  # PYTEST-BREAKPOINT-TARGET
+`
+	file := filepath.Join(root, "test_calc.py")
+	if err := os.WriteFile(file, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(src, "\n")
+	python := pytestPython(t, root)
+	cmd := debugpyCommandForPython(t, python)
+	adapter, ok := AdapterFor("python")
+	if !ok {
+		t.Fatal("no adapter registered for python")
+	}
+	adapter.Locate = func(string) *Command { return cmd }
+	spec := PytestLaunchConfig(root, file, "test_calc")
+	spec.Adapter = adapter
+
+	waiter, handlers := newStoppedWaiter(t)
+	client, err := NewRegistry(root).Start(ctx, spec.Adapter, handlers)
+	if err != nil {
+		t.Fatalf("starting debugpy with %s: %v", python, err)
+	}
+	t.Cleanup(client.Stop)
+	caps, err := client.Initialize(ctx, adapter.AdapterID)
+	if err != nil {
+		t.Fatalf("initialize: %v (adapter stderr: %v)", err, client.LastStderr())
+	}
+	if _, err := client.Launch(spec.Args); err != nil {
+		t.Fatalf("launch pytest: %v", err)
+	}
+	if err := client.WaitEvent(ctx, EventInitialized); err != nil {
+		t.Fatalf("initialized: %v (adapter stderr: %v)", err, client.LastStderr())
+	}
+	markerLine := lineWithMarker(t, lines, "PYTEST-BREAKPOINT-TARGET")
+	answers, err := client.SetBreakpoints(ctx, Source{Path: file, Name: filepath.Base(file)}, []SourceBreakpoint{{Line: markerLine}})
+	if err != nil || len(answers) != 1 || !answers[0].Verified {
+		t.Fatalf("set pytest breakpoint: answers=%+v err=%v", answers, err)
+	}
+	if err := client.SetExceptionBreakpoints(ctx, caps.DefaultFilters()); err != nil {
+		t.Fatalf("setExceptionBreakpoints: %v", err)
+	}
+	if err := client.ConfigurationDone(ctx); err != nil {
+		t.Fatalf("configurationDone: %v", err)
+	}
+
+	s := &debugpySession{client: client, waiter: waiter, caps: caps, file: file, lines: lines}
+	stopped := s.awaitStopped(t, "pytest test breakpoint")
+	top := s.assertStoppedOn(t, ctx, stopped, "PYTEST-BREAKPOINT-TARGET")
+	stoppedInfo, stoppedErr := os.Stat(top.Source.Path)
+	wantInfo, wantErr := os.Stat(file)
+	if stoppedErr != nil || wantErr != nil || !os.SameFile(stoppedInfo, wantInfo) {
+		t.Fatalf("stopped in %q, want pytest file %q", top.Source.Path, file)
+	}
+	res, err := client.Evaluate(ctx, "left", top.ID, EvalContextWatch)
+	if err != nil {
+		t.Fatalf("evaluate pytest local: %v", err)
+	}
+	if res.Result != "7" {
+		t.Fatalf("left = %q, want 7", res.Result)
+	}
+	t.Logf("pytest stopped at %s:%d and left evaluated to %s using %s", filepath.Base(file), top.Line, res.Result, python)
 }
 
 // TestLiveDebugpyWithholdsTheLaunchResponse is the ordering trap, proven rather

@@ -467,6 +467,25 @@ func SpecForFile(adapter Adapter, program string) LaunchSpec {
 	}
 }
 
+// PytestLaunchConfig builds the one-test launch shape understood by debugpy.
+func PytestLaunchConfig(root, file, node string) LaunchSpec {
+	adapter, _ := AdapterFor("python")
+	rel, err := filepath.Rel(root, file)
+	if err != nil {
+		rel = file
+	}
+	args := map[string]interface{}{
+		"request":    "launch",
+		"type":       "python",
+		"module":     "pytest",
+		"args":       []string{rel + "::" + node, "-q", "-p", "no:cacheprovider"},
+		"cwd":        root,
+		"console":    "internalConsole",
+		"justMyCode": true,
+	}
+	return LaunchSpec{Name: "Debug Test", Adapter: adapter, Request: "launch", Target: rel + "::" + node, Args: args}
+}
+
 // launchTarget names what a spec runs, preferring the program, then the url,
 // then the configuration's own name. It is what the status bar and the
 // published panel payload show, so "" would read as a session running nothing.

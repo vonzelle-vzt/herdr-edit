@@ -399,6 +399,40 @@ func TestLocateDebugpyPrefersTheProjectVirtualenv(t *testing.T) {
 	}
 }
 
+// TestProjectPythonHonoursSettings pins the VS Code setting ahead of venv discovery.
+func TestProjectPythonHonoursSettings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("executable mode checks differ on Windows")
+	}
+	root := t.TempDir()
+	configured := filepath.Join(root, "tools", "python")
+	fallback := filepath.Join(root, ".venv", "bin", "python")
+	for _, path := range []string{configured, fallback} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settings := filepath.Join(root, ".vscode", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settings, []byte("{\n // selected by the project\n \"python.defaultInterpreterPath\": \"${workspaceFolder}/tools/python\",\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectPython(root); got != configured {
+		t.Fatalf("projectPython = %q, want configured %q", got, configured)
+	}
+	if err := os.Chmod(configured, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectPython(root); got != fallback {
+		t.Fatalf("non-executable setting selected %q, want fallback %q", got, fallback)
+	}
+}
+
 // TestLocateDebugpyNeverRunsAnInterpreterThatCannotImportIt is the other half of
 // the order, and it caught the assumption it was written to check.
 //

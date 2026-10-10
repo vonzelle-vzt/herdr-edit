@@ -49,6 +49,7 @@ type cliResult struct {
 	// DebugAction is the verb for actionDebug, already validated against
 	// state.ValidDebugAction. Empty for every other action.
 	DebugAction string
+	DebugNode   string
 
 	Err error
 }
@@ -102,6 +103,16 @@ func resolveArgs(args []string) cliResult {
 		if len(args) > 2 {
 			res.OpenFile = args[2]
 		}
+		if args[1] == state.DebugActionTest {
+			if res.OpenFile == "" {
+				return cliResult{Err: errors.New("--debug test needs FILE::NODE")}
+			}
+			file, node, ok := strings.Cut(res.OpenFile, "::")
+			if !ok || file == "" || node == "" {
+				return cliResult{Err: errors.New("--debug test needs FILE::NODE")}
+			}
+			res.OpenFile, res.DebugNode = file, node
+		}
 		if args[1] == state.DebugActionToggleBreakpoint && res.OpenFile == "" {
 			return cliResult{Err: errors.New("--debug toggle-breakpoint needs a location as file:line")}
 		}
@@ -149,7 +160,7 @@ Usage:
   spiceedit --open-at F:L[:C]   Ask a RUNNING editor to jump to that location.
   spiceedit --debug ACTION      Drive a RUNNING editor's debugger. ACTION is one of
                                 start, continue, next, stepIn, stepOut, pause, stop,
-                                or toggle-breakpoint FILE:LINE.
+                                toggle-breakpoint FILE:LINE, or test FILE::NODE.
   spiceedit --version           Print the version and exit.
   spiceedit --help              Print this help and exit.
 
@@ -196,15 +207,24 @@ func main() {
 		var abs string
 		line := 0
 		if res.OpenFile != "" {
-			path, l, _ := state.SplitLocation(res.OpenFile)
-			p, err := filepath.Abs(path)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "herdr-edit:", err)
-				os.Exit(1)
+			if res.DebugAction == state.DebugActionTest {
+				p, err := filepath.Abs(res.OpenFile)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+					os.Exit(1)
+				}
+				abs = p
+			} else {
+				path, l, _ := state.SplitLocation(res.OpenFile)
+				p, err := filepath.Abs(path)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+					os.Exit(1)
+				}
+				abs, line = p, l
 			}
-			abs, line = p, l
 		}
-		if err := state.WriteDebugRequest(res.DebugAction, abs, line); err != nil {
+		if err := state.WriteDebugRequest(res.DebugAction, abs, line, res.DebugNode); err != nil {
 			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
 			os.Exit(1)
 		}

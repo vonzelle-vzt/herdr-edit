@@ -161,6 +161,9 @@ func TestResolveArgs_Debug(t *testing.T) {
 		if action == state.DebugActionToggleBreakpoint {
 			args = append(args, "src/a.go:12")
 		}
+		if action == state.DebugActionTest {
+			args = append(args, "/x/t.py::TestK::test_a[p1]")
+		}
 		got := resolveArgs(args)
 		if got.Err != nil {
 			t.Errorf("--debug %s: unexpected error %v", action, got.Err)
@@ -179,6 +182,20 @@ func TestResolveArgs_Debug(t *testing.T) {
 	}
 	if got := resolveArgs([]string{"--debug", "toggle-breakpoint"}); got.Err == nil {
 		t.Error("toggle-breakpoint with no location should be an error")
+	}
+}
+
+// TestResolveArgsDebugTestSplitsOnlyTheFileBoundary preserves nested pytest nodes.
+func TestResolveArgsDebugTestSplitsOnlyTheFileBoundary(t *testing.T) {
+	got := resolveArgs([]string{"--debug", "test", "/x/t.py::TestK::test_a[p1]"})
+	if got.Err != nil {
+		t.Fatal(got.Err)
+	}
+	if got.OpenFile != "/x/t.py" || got.DebugNode != "TestK::test_a[p1]" {
+		t.Fatalf("resolved to %+v", got)
+	}
+	if got := resolveArgs([]string{"--debug", "test", "/x/t.py"}); got.Err == nil {
+		t.Fatal("test target without :: was accepted")
 	}
 }
 

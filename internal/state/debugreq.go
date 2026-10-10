@@ -51,6 +51,7 @@ const (
 	DebugActionStepOut          = "stepOut"
 	DebugActionPause            = "pause"
 	DebugActionStop             = "stop"
+	DebugActionTest             = "test"
 	DebugActionToggleBreakpoint = "toggle-breakpoint"
 )
 
@@ -60,7 +61,7 @@ const (
 // symptom would be a key that works from the panel and not from the CLI.
 var debugActions = []string{
 	DebugActionStart, DebugActionContinue, DebugActionNext, DebugActionStepIn,
-	DebugActionStepOut, DebugActionPause, DebugActionStop, DebugActionToggleBreakpoint,
+	DebugActionStepOut, DebugActionPause, DebugActionStop, DebugActionTest, DebugActionToggleBreakpoint,
 }
 
 // DebugActions returns the accepted actions, in the order the help lists them.
@@ -87,13 +88,14 @@ func DebugRequestFile() string {
 
 // DebugRequest is one instruction to the editor's debugger.
 //
-// File and Line are only meaningful for toggle-breakpoint, and Line is 1-based
-// on the wire — the same convention as OpenRequest and active.json, converted by
-// the editor on the way in.
+// File and Line carry toggle-breakpoint's location, while File and Node identify
+// one pytest test. Line is 1-based on the wire — the same convention as
+// OpenRequest and active.json, converted by the editor on the way in.
 type DebugRequest struct {
 	Action string `json:"action"`
 	File   string `json:"file"`
 	Line   int    `json:"line"`
+	Node   string `json:"node,omitempty"`
 	Seq    int64  `json:"seq"`
 }
 
@@ -103,7 +105,7 @@ type DebugRequest struct {
 // It refuses an unknown action HERE rather than letting the editor discover it,
 // so `herdr-edit --debug contnue` is a typo the user is told about instead of a
 // key that silently does nothing.
-func WriteDebugRequest(action, file string, line int) error {
+func WriteDebugRequest(action, file string, line int, node ...string) error {
 	if !ValidDebugAction(action) {
 		return errors.New("unknown debug action: " + action)
 	}
@@ -114,7 +116,14 @@ func WriteDebugRequest(action, file string, line int) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	req := DebugRequest{Action: action, File: file, Line: line, Seq: time.Now().UnixNano()}
+	var testNode string
+	if len(node) > 0 {
+		testNode = node[0]
+	}
+	if action == DebugActionTest && (file == "" || testNode == "") {
+		return errors.New("test needs a file and pytest node")
+	}
+	req := DebugRequest{Action: action, File: file, Line: line, Node: testNode, Seq: time.Now().UnixNano()}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -156,6 +165,9 @@ func ReadDebugRequest() (DebugRequest, bool) {
 		return DebugRequest{}, false
 	}
 	if req.Action == DebugActionToggleBreakpoint && req.File == "" {
+		return DebugRequest{}, false
+	}
+	if req.Action == DebugActionTest && (req.File == "" || req.Node == "") {
 		return DebugRequest{}, false
 	}
 	return req, true
