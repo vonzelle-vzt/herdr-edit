@@ -10,7 +10,7 @@
 //	Copyright (c) Microsoft Corporation. All rights reserved.
 //	Licensed under the MIT License.
 //
-// Extracted from Visual Studio Code 1.131.0. See NOTICE at the repository root
+// Extracted from Visual Studio Code 1.140.0. See NOTICE at the repository root
 // for the full attribution and the OSS-repository / binary-distribution
 // distinction.
 // -----------------------------------------------------------------------------
@@ -20,14 +20,14 @@ package langconf
 // SourceVersion is the Visual Studio Code release the table below was
 // extracted from, recorded so the provenance in NOTICE can be checked rather
 // than taken on trust.
-const SourceVersion = "1.131.0"
+const SourceVersion = "1.140.0"
 
 // configs is the compiled-in language table, keyed by VS Code language id.
 // 69 languages.
 var configs = map[string]Config{
 	"bat": {
 		ID:       "bat",
-		Comments: Comments{Line: "@REM"},
+		Comments: Comments{Line: "@REM "},
 		Brackets: []Pair{
 			{Open: "{", Close: "}"},
 			{Open: "[", Close: "]"},
@@ -200,7 +200,7 @@ var configs = map[string]Config{
 			{Open: "'", Close: "'"},
 			{Open: "<", Close: ">"},
 		},
-		Folding: Folding{Start: "^\\s*#pragma\\s+region\\b", End: "^\\s*#pragma\\s+endregion\\b"},
+		Folding: Folding{Start: "^\\s*#\\s*pragma\\s+region\\b", End: "^\\s*#\\s*pragma\\s+endregion\\b"},
 	},
 	"csharp": {
 		ID:       "csharp",
@@ -756,6 +756,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\"", NotIn: []string{"string", "comment"}},
 			{Open: "`", Close: "`", NotIn: []string{"string", "comment"}},
 		},
+		Folding: Folding{Start: "^\\s*//\\s*#?region\\b", End: "^\\s*//\\s*#?endregion\\b"},
 	},
 	"jsonc": {
 		ID:       "jsonc",
@@ -772,6 +773,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\"", NotIn: []string{"string", "comment"}},
 			{Open: "`", Close: "`", NotIn: []string{"string", "comment"}},
 		},
+		Folding: Folding{Start: "^\\s*//\\s*#?region\\b", End: "^\\s*//\\s*#?endregion\\b"},
 	},
 	"jsonl": {
 		ID:       "jsonl",
@@ -788,6 +790,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\"", NotIn: []string{"string", "comment"}},
 			{Open: "`", Close: "`", NotIn: []string{"string", "comment"}},
 		},
+		Folding: Folding{Start: "^\\s*//\\s*#?region\\b", End: "^\\s*//\\s*#?endregion\\b"},
 	},
 	"jsx-tags": {
 		ID:       "jsx-tags",
@@ -848,10 +851,13 @@ var configs = map[string]Config{
 			{Open: "(", Close: ")"},
 			{Open: "[", Close: ")"},
 			{Open: "(", Close: "]"},
+			{Open: "\\{", Close: "\\}"},
 			{Open: "\\left(", Close: "\\right)"},
+			{Open: "\\left(", Close: "\\right]"},
 			{Open: "\\left(", Close: "\\right."},
 			{Open: "\\left.", Close: "\\right)"},
 			{Open: "\\left[", Close: "\\right]"},
+			{Open: "\\left[", Close: "\\right)"},
 			{Open: "\\left[", Close: "\\right."},
 			{Open: "\\left.", Close: "\\right]"},
 			{Open: "\\left\\{", Close: "\\right\\}"},
@@ -874,6 +880,8 @@ var configs = map[string]Config{
 			{Open: "\\lvert", Close: "\\rvert"},
 			{Open: "\\lVert", Close: "\\rVert"},
 			{Open: "\\left|", Close: "\\right|"},
+			{Open: "\\left.", Close: "\\right|"},
+			{Open: "\\left|", Close: "\\right."},
 			{Open: "\\left\\vert", Close: "\\right\\vert"},
 			{Open: "\\left\\|", Close: "\\right\\|"},
 			{Open: "\\left\\Vert", Close: "\\right\\Vert"},
@@ -942,7 +950,7 @@ var configs = map[string]Config{
 			{Open: "`", Close: "'"},
 			{Open: "$", Close: "$"},
 		},
-		Folding: Folding{Start: "^\\s*%?\\s*(region|\\\\begingroup)\\b", End: "^\\s*%?\\s*(endregion|\\\\endgroup)\\b"},
+		Folding: Folding{Start: "^\\s*(%\\s*region|%?\\s*\\\\begingroup)\\b", End: "^\\s*(%\\s*endregion|%?\\s*\\\\endgroup)\\b"},
 	},
 	"less": {
 		ID:       "less",
@@ -1045,10 +1053,13 @@ var configs = map[string]Config{
 			{Open: "(", Close: ")"},
 			{Open: "[", Close: ")"},
 			{Open: "(", Close: "]"},
+			{Open: "\\{", Close: "\\}"},
 			{Open: "\\left(", Close: "\\right)"},
+			{Open: "\\left(", Close: "\\right]"},
 			{Open: "\\left(", Close: "\\right."},
 			{Open: "\\left.", Close: "\\right)"},
 			{Open: "\\left[", Close: "\\right]"},
+			{Open: "\\left[", Close: "\\right)"},
 			{Open: "\\left[", Close: "\\right."},
 			{Open: "\\left.", Close: "\\right]"},
 			{Open: "\\left\\{", Close: "\\right\\}"},
@@ -1071,6 +1082,8 @@ var configs = map[string]Config{
 			{Open: "\\lvert", Close: "\\rvert"},
 			{Open: "\\lVert", Close: "\\rVert"},
 			{Open: "\\left|", Close: "\\right|"},
+			{Open: "\\left.", Close: "\\right|"},
+			{Open: "\\left|", Close: "\\right."},
 			{Open: "\\left\\vert", Close: "\\right\\vert"},
 			{Open: "\\left\\|", Close: "\\right\\|"},
 			{Open: "\\left\\Vert", Close: "\\right\\Vert"},
@@ -1621,6 +1634,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\"", NotIn: []string{"string", "comment"}},
 			{Open: "`", Close: "`", NotIn: []string{"string", "comment"}},
 		},
+		Folding: Folding{Start: "^\\s*//\\s*#?region\\b", End: "^\\s*//\\s*#?endregion\\b"},
 	},
 	"sql": {
 		ID:       "sql",
@@ -1682,10 +1696,13 @@ var configs = map[string]Config{
 			{Open: "(", Close: ")"},
 			{Open: "[", Close: ")"},
 			{Open: "(", Close: "]"},
+			{Open: "\\{", Close: "\\}"},
 			{Open: "\\left(", Close: "\\right)"},
+			{Open: "\\left(", Close: "\\right]"},
 			{Open: "\\left(", Close: "\\right."},
 			{Open: "\\left.", Close: "\\right)"},
 			{Open: "\\left[", Close: "\\right]"},
+			{Open: "\\left[", Close: "\\right)"},
 			{Open: "\\left[", Close: "\\right."},
 			{Open: "\\left.", Close: "\\right]"},
 			{Open: "\\left\\{", Close: "\\right\\}"},
@@ -1708,6 +1725,8 @@ var configs = map[string]Config{
 			{Open: "\\lvert", Close: "\\rvert"},
 			{Open: "\\lVert", Close: "\\rVert"},
 			{Open: "\\left|", Close: "\\right|"},
+			{Open: "\\left.", Close: "\\right|"},
+			{Open: "\\left|", Close: "\\right."},
 			{Open: "\\left\\vert", Close: "\\right\\vert"},
 			{Open: "\\left\\|", Close: "\\right\\|"},
 			{Open: "\\left\\Vert", Close: "\\right\\Vert"},
@@ -1776,7 +1795,7 @@ var configs = map[string]Config{
 			{Open: "`", Close: "'"},
 			{Open: "$", Close: "$"},
 		},
-		Folding: Folding{Start: "^\\s*%?\\s*(region|\\\\begingroup)\\b", End: "^\\s*%?\\s*(endregion|\\\\endgroup)\\b"},
+		Folding: Folding{Start: "^\\s*(%\\s*region|%?\\s*\\\\begingroup)\\b", End: "^\\s*(%\\s*endregion|%?\\s*\\\\endgroup)\\b"},
 	},
 	"typescript": {
 		ID:       "typescript",

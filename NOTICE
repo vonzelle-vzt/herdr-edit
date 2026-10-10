@@ -57,7 +57,7 @@ Provenance
 ----------
   Upstream project : Visual Studio Code (github.com/microsoft/vscode)
   Upstream licence : MIT
-  Extracted from   : Visual Studio Code 1.131.0
+  Extracted from   : Visual Studio Code 1.140.0
   Languages taken  : 69
   Recorded in code : `langconf.SourceVersion`, and the header of
                      `internal/langconf/data.go`

@@ -307,6 +307,35 @@ func TestLiveDebugpyStopsAtBreakpoint(t *testing.T) {
 	}
 	t.Logf("evaluate(\"a\") = %q (type %q)", res.Result, res.Type)
 
+	// The Variables panel's chain: frame → scopes → the Locals reference →
+	// variables. add(2, 3) is stopped before `total` is assigned, so its locals
+	// are exactly a and b.
+	scopes, err := s.client.Scopes(ctx, top.ID)
+	if err != nil {
+		t.Fatalf("scopes for frame %d: %v", top.ID, err)
+	}
+	localsRef := 0
+	for _, sc := range scopes {
+		if strings.EqualFold(sc.Name, "locals") {
+			localsRef = sc.VariablesReference
+		}
+	}
+	if localsRef == 0 {
+		t.Fatalf("no Locals scope with a variables reference: %+v", scopes)
+	}
+	vars, err := s.client.Variables(ctx, localsRef, 0, 0)
+	if err != nil {
+		t.Fatalf("variables(%d): %v", localsRef, err)
+	}
+	got := map[string]string{}
+	for _, v := range vars {
+		got[v.Name] = v.Value
+	}
+	if got["a"] != "2" || got["b"] != "3" {
+		t.Errorf("Locals = %v, want a=2 and b=3", got)
+	}
+	t.Logf("Locals: a=%s b=%s (%d variables)", got["a"], got["b"], len(vars))
+
 	if err := s.client.Disconnect(ctx, true); err != nil {
 		t.Errorf("disconnect: %v", err)
 	}
