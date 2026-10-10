@@ -608,6 +608,22 @@ func LocateDebugpy(root string) *Command {
 // against several projects is not necessarily the shell that matches the file on
 // screen. A .venv sitting in the project root is unambiguous.
 func projectPython(root string) string {
+	settings := filepath.Join(root, ".vscode", "settings.json")
+	if data, err := os.ReadFile(settings); err == nil {
+		var values map[string]interface{}
+		if json.Unmarshal(StripJSONC(data), &values) == nil {
+			if configured, ok := values["python.defaultInterpreterPath"].(string); ok {
+				configured = strings.ReplaceAll(configured, "${workspaceFolder}", root)
+				if !filepath.IsAbs(configured) {
+					configured = filepath.Join(root, configured)
+				}
+				if isExecutableFile(configured) {
+					return configured
+				}
+			}
+		}
+	}
+
 	var candidates []string
 	for _, name := range []string{".venv", "venv", ".virtualenv"} {
 		candidates = append(candidates,

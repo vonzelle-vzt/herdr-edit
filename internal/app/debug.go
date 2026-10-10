@@ -1599,6 +1599,12 @@ func (a *App) consumeDebugRequest() {
 		a.menuDebugPause()
 	case state.DebugActionStop:
 		a.menuDebugStop()
+	case state.DebugActionTest:
+		if !a.withinRoot(req.File) {
+			a.flash("Test file is outside this project")
+			return
+		}
+		a.runDebugSession(dap.PytestLaunchConfig(a.rootDir, req.File, req.Node), nil)
 	case state.DebugActionToggleBreakpoint:
 		// The wire is 1-based, like every other location this editor accepts.
 		a.toggleBreakpointAt(req.File, bufLineFromAdapter(req.Line))

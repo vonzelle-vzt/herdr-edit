@@ -1956,6 +1956,29 @@ func TestDebugRequestOutsideTheProjectIsIgnored(t *testing.T) {
 	}
 }
 
+// TestDebugTestOutsideTheProjectIsConsumed prevents another editor from launching it repeatedly.
+func TestDebugTestOutsideTheProjectIsConsumed(t *testing.T) {
+	a, _ := debugFixture(t)
+	panelStateDir(t, a)
+	a.lastDebugSeq = debugRequestFloor
+	elsewhere := filepath.Join(t.TempDir(), "test_other.py")
+	if err := os.WriteFile(elsewhere, []byte("def test_other(): pass\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.WriteDebugRequest(state.DebugActionTest, elsewhere, 0, "test_other"); err != nil {
+		t.Fatal(err)
+	}
+	a.consumeDebugRequest()
+	consumed := a.lastDebugSeq
+	if consumed <= debugRequestFloor {
+		t.Fatal("outside-root test request was not consumed")
+	}
+	a.consumeDebugRequest()
+	if a.lastDebugSeq != consumed || a.debug != nil {
+		t.Fatalf("outside request replayed or launched: seq=%d debug=%+v", a.lastDebugSeq, a.debug)
+	}
+}
+
 // TestDebugRequestMalformedChangesNothing pins that a panel writing junk cannot
 // disturb the editor. The file is read on every poll, so anything that threw or
 // half-applied would do it several times a second.

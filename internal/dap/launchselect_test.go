@@ -376,6 +376,23 @@ func TestSpecForFileIsTheOldPathByteForByte(t *testing.T) {
 	}
 }
 
+// TestPytestLaunchConfigPinsOneNode checks the exact pytest invocation sent to debugpy.
+func TestPytestLaunchConfigPinsOneNode(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "project")
+	file := filepath.Join(root, "tests", "test_calc.py")
+	got := PytestLaunchConfig(root, file, "TestK::test_a[p1]")
+	wantArgs := []string{filepath.Join("tests", "test_calc.py") + "::TestK::test_a[p1]", "-q", "-p", "no:cacheprovider"}
+	if got.Name != "Debug Test" || got.Request != "launch" || got.Args["module"] != "pytest" || got.Args["cwd"] != root {
+		t.Fatalf("config = %+v", got)
+	}
+	if !reflect.DeepEqual(got.Args["args"], wantArgs) {
+		t.Fatalf("args = %#v, want %#v", got.Args["args"], wantArgs)
+	}
+	if got.Args["console"] != "internalConsole" || got.Args["justMyCode"] != true {
+		t.Fatalf("debugpy policy missing: %+v", got.Args)
+	}
+}
+
 // TestExpandLaunchVarsCoversTheOnesVSCodeWrites sweeps the substitutions a real
 // launch.json uses, including the ones this editor deliberately leaves alone.
 func TestExpandLaunchVarsCoversTheOnesVSCodeWrites(t *testing.T) {

@@ -32,6 +32,18 @@ func TestDebugRequest_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestDebugTestRequestRoundTripsNode preserves the pytest node independently of its file.
+func TestDebugTestRequestRoundTripsNode(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := WriteDebugRequest(DebugActionTest, "/proj/test_calc.py", 0, "TestK::test_a[p1]"); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ReadDebugRequest()
+	if !ok || got.Node != "TestK::test_a[p1]" || got.File != "/proj/test_calc.py" {
+		t.Fatalf("round-trip = %+v, ok=%v", got, ok)
+	}
+}
+
 // TestDebugRequest_SeqAdvances pins that two writes are distinguishable.
 // Without a moving sequence the editor either replays the last request on every
 // poll — stepping the program forever — or ignores everything after the first.
@@ -118,10 +130,14 @@ func TestDebugRequest_EveryActionIsAccepted(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	for _, action := range DebugActions() {
 		file := ""
+		node := ""
 		if action == DebugActionToggleBreakpoint {
 			file = "/proj/main.go"
 		}
-		if err := WriteDebugRequest(action, file, 1); err != nil {
+		if action == DebugActionTest {
+			file, node = "/proj/test_main.py", "test_one"
+		}
+		if err := WriteDebugRequest(action, file, 1, node); err != nil {
 			t.Fatalf("%s: %v", action, err)
 		}
 		got, ok := ReadDebugRequest()
