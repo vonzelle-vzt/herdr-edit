@@ -47,13 +47,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
 
 	"github.com/cloudmanic/spice-edit/internal/dap"
 	"github.com/cloudmanic/spice-edit/internal/editor"
+	"github.com/cloudmanic/spice-edit/internal/format"
 	"github.com/cloudmanic/spice-edit/internal/lsp"
 	"github.com/cloudmanic/spice-edit/internal/state"
 )
@@ -197,6 +201,21 @@ type debugSession struct {
 	// be exercised by installing a different debugger is a gate nobody runs.
 	caps dap.Capabilities
 
+	// evalCaps is the part of the same initialize answer that Capabilities
+	// drops: hover evaluation and cancel, which the visualization commands'
+	// safe evaluate needs. Revised by a `capabilities` event like caps.
+	evalCaps dap.EvalCaps
+
+	// stopGen is the session's stop generation. The client's OnEvent moves it
+	// on stopped/continued as the event is READ, and invalidateStop moves it
+	// for the resumes the editor starts itself. A visualization command pins
+	// its whole request to the value it saw — see dap.PauseState.
+	stopGen *dap.StopGen
+	// stateGen is the stop generation the pause state below reflects. The DAP reader advances stopGen
+	// as soon as an event arrives; stateGen advances only when the main loop has APPLIED it, so a
+	// query pinned to stateGen is refused while an event is still pending.
+	stateGen uint64
+
 	// starting is true between F5 and the adapter finishing configuration.
 	// Distinct from running so a second F5 in that window says "starting…"
 	// rather than launching a second debugger.
@@ -273,9 +292,30 @@ func (s *debugSession) dropVariableCache() {
 // between on some adapters). Handling only one leaves a window in which stale
 // handles are served.
 func (s *debugSession) invalidateStop() {
+	s.gen().Bump()
+	s.stateGen = s.gen().Load()
+	s.dropStopState()
+}
+
+// invalidateStopForEvent drops the old stop's state for a stopped/continued EVENT, whose generation
+// the reader already advanced (StopGen.Observe); handleDAPEvent records it in stateGen.
+func (s *debugSession) invalidateStopForEvent() {
+	s.dropStopState()
+}
+
+func (s *debugSession) dropStopState() {
 	s.dropVariableCache()
 	s.frames = nil
 	s.curFrame = 0
+}
+
+// gen returns the session's stop generation, creating it for a session built
+// without one.
+func (s *debugSession) gen() *dap.StopGen {
+	if s.stopGen == nil {
+		s.stopGen = &dap.StopGen{}
+	}
+	return s.stopGen
 }
 
 // resumeFailed reports a refused resume — a continue or any of the three steps
@@ -297,6 +337,9 @@ func (a *App) resumeFailed(client *dap.Client, thread int, what string, err erro
 // debugEvent carries one adapter event onto the tcell queue.
 type debugEvent struct {
 	when time.Time
+	// gen is the stop generation this event produced (StopGen.Observe), so the main loop can record
+	// exactly which generation its pause state reflects.
+	gen uint64
 	// client is the connection the event arrived on. A js-debug session is a
 	// ROOT coordinator plus a LEAF that owns the program, and both post here, so
 	// without this the two streams merge and a stop in the debuggee is
@@ -315,12 +358,14 @@ type debugStartedEvent struct {
 	// child sessions that is the child, never the coordinator.
 	client *dap.Client
 	// root is the coordinator to shut down last, and nil when there is none.
-	root    *dap.Client
-	adapter string
-	caps    dap.Capabilities
-	bound   map[string][]boundBreakpoint
-	notes   []string
-	err     error
+	root     *dap.Client
+	adapter  string
+	caps     dap.Capabilities
+	evalCaps dap.EvalCaps
+	stopGen  *dap.StopGen
+	bound    map[string][]boundBreakpoint
+	notes    []string
+	err      error
 }
 
 func (e *debugStartedEvent) When() time.Time { return e.when }
@@ -495,9 +540,11 @@ func (a *App) runDebugSession(spec dap.LaunchSpec, bps []Breakpoint) {
 	ctx, cancel := context.WithTimeout(context.Background(), debugStartTimeout)
 	defer cancel()
 
+	gen, leafGen := sessionStopGens(adapter.UsesChildSessions)
 	handlers := dap.Handlers{
 		OnEvent: func(c *dap.Client, e dap.Event) {
-			a.post(&debugEvent{when: time.Now(), client: c, ev: e})
+			g := gen.Observe(e)
+			a.post(&debugEvent{when: time.Now(), client: c, ev: e, gen: g})
 		},
 		OnLog: func(c *dap.Client, s string) {
 			a.post(&debugLogEvent{when: time.Now(), client: c, msg: s})
@@ -514,7 +561,7 @@ func (a *App) runDebugSession(spec dap.LaunchSpec, bps []Breakpoint) {
 		return
 	}
 
-	caps, err := client.Initialize(ctx, adapter.AdapterID)
+	caps, evalCaps, err := client.InitializeForEval(ctx, adapter.AdapterID)
 	if err != nil {
 		// 🔴 The adapter's own stderr is appended here, and it is the whole
 		// message on the stdio transport. A socket adapter that dies on startup
@@ -557,7 +604,7 @@ func (a *App) runDebugSession(spec dap.LaunchSpec, bps []Breakpoint) {
 		}
 		a.post(&debugStartedEvent{
 			when: time.Now(), client: client, adapter: adapter.Name,
-			caps: caps, bound: bound, notes: notes,
+			caps: caps, evalCaps: evalCaps, stopGen: gen, bound: bound, notes: notes,
 		})
 		return
 	}
@@ -576,7 +623,7 @@ func (a *App) runDebugSession(spec dap.LaunchSpec, bps []Breakpoint) {
 	}
 
 	root := client
-	leaf, leafCaps, err := a.adoptChildSession(ctx, adapter, root)
+	leaf, leafCaps, leafEvalCaps, err := a.adoptChildSession(ctx, adapter, root, leafGen)
 	if err != nil {
 		root.Stop()
 		fail(withAdapterStderr(err, root))
@@ -594,8 +641,19 @@ func (a *App) runDebugSession(spec dap.LaunchSpec, bps []Breakpoint) {
 
 	a.post(&debugStartedEvent{
 		when: time.Now(), client: leaf, root: root, adapter: adapter.Name,
-		caps: leafCaps, bound: bound, notes: notes,
+		caps: leafCaps, evalCaps: leafEvalCaps, stopGen: leafGen, bound: bound, notes: notes,
 	})
+}
+
+// sessionStopGens returns the root's stop generation and the one evaluation is pinned to. With child
+// sessions (js-debug) the leaf owns the stop state, so it gets its own: the coordinator's events must
+// never move the generation a leaf evaluate compares against.
+func sessionStopGens(usesChildSessions bool) (root, eval *dap.StopGen) {
+	root = &dap.StopGen{}
+	if usesChildSessions {
+		return root, &dap.StopGen{}
+	}
+	return root, root
 }
 
 // configureSession runs the half of the handshake that follows `initialized`:
@@ -634,15 +692,16 @@ func (a *App) configureSession(ctx context.Context, client *dap.Client, pol brea
 //
 // It returns before configuring the leaf because the caller owns what goes in
 // the middle of that gap, which is the whole reason Launch hands back a channel.
-func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *dap.Client) (*dap.Client, dap.Capabilities, error) {
+func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *dap.Client, gen *dap.StopGen) (*dap.Client, dap.Capabilities, dap.EvalCaps, error) {
 	cs, err := root.AwaitChildSession(ctx)
 	if err != nil {
-		return nil, dap.Capabilities{}, err
+		return nil, dap.Capabilities{}, dap.EvalCaps{}, err
 	}
 
 	handlers := dap.Handlers{
 		OnEvent: func(c *dap.Client, e dap.Event) {
-			a.post(&debugEvent{when: time.Now(), client: c, ev: e})
+			g := gen.Observe(e)
+			a.post(&debugEvent{when: time.Now(), client: c, ev: e, gen: g})
 		},
 		OnLog: func(c *dap.Client, s string) {
 			a.post(&debugLogEvent{when: time.Now(), client: c, msg: s})
@@ -650,13 +709,13 @@ func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *
 	}
 	leaf, err := root.DialChild(adapter.Name, handlers)
 	if err != nil {
-		return nil, dap.Capabilities{}, err
+		return nil, dap.Capabilities{}, dap.EvalCaps{}, err
 	}
 
-	caps, err := leaf.Initialize(ctx, adapter.AdapterID)
+	caps, evalCaps, err := leaf.InitializeForEval(ctx, adapter.AdapterID)
 	if err != nil {
 		leaf.Stop()
-		return nil, dap.Capabilities{}, err
+		return nil, dap.Capabilities{}, dap.EvalCaps{}, err
 	}
 
 	// 🔴 The configuration goes over VERBATIM. It is not merged with
@@ -666,13 +725,13 @@ func (a *App) adoptChildSession(ctx context.Context, adapter dap.Adapter, root *
 	// through one process while another ran unobserved.
 	if _, err := launchOrAttach(leaf, cs.Request, cs.Configuration); err != nil {
 		leaf.Stop()
-		return nil, dap.Capabilities{}, err
+		return nil, dap.Capabilities{}, dap.EvalCaps{}, err
 	}
 	if err := leaf.WaitEvent(ctx, dap.EventInitialized); err != nil {
 		leaf.Stop()
-		return nil, dap.Capabilities{}, err
+		return nil, dap.Capabilities{}, dap.EvalCaps{}, err
 	}
-	return leaf, caps, nil
+	return leaf, caps, evalCaps, nil
 }
 
 // launchOrAttach sends a configuration the way it asked to be sent: `attach` to
@@ -997,6 +1056,10 @@ func (a *App) handleDebugStarted(e *debugStartedEvent) {
 	a.debug.starting = false
 	a.debug.running = true
 	a.debug.caps = e.caps
+	a.debug.evalCaps = e.evalCaps
+	if e.stopGen != nil {
+		a.debug.stopGen = e.stopGen
+	}
 	a.debug.bound = e.bound
 	a.applyBoundBreakpoints()
 
@@ -1099,6 +1162,18 @@ func (a *App) handleDAPEvent(e *debugEvent) {
 			return // the coordinator has no program state to report
 		}
 	}
+	// The pause state this event changes is current once the handler below returns: record the
+	// generation the event produced, so a query pinned to stateGen sees state and generation agree.
+	if (e.ev.Event == dap.EventStopped || e.ev.Event == dap.EventContinued) && e.gen == 0 {
+		e.gen = a.debug.gen().Observe(e.ev) // posted without passing the reader (only tests do): observe now
+	}
+	if (e.ev.Event == dap.EventStopped || e.ev.Event == dap.EventContinued) && e.gen > a.debug.stateGen {
+		defer func(s *debugSession, g uint64) {
+			if g > s.stateGen {
+				s.stateGen = g
+			}
+		}(a.debug, e.gen)
+	}
 	switch e.ev.Event {
 	case dap.EventStopped:
 		a.handleDAPStopped(e.ev)
@@ -1110,7 +1185,7 @@ func (a *App) handleDAPEvent(e *debugEvent) {
 		// answering with values read before the program moved.
 		a.debug.stopped = false
 		a.debug.path, a.debug.frame, a.debug.reason = "", "", ""
-		a.debug.invalidateStop()
+		a.debug.invalidateStopForEvent()
 
 	case dap.EventOutput:
 		a.handleDAPOutput(e.ev)
@@ -1145,6 +1220,11 @@ func (a *App) handleDAPEvent(e *debugEvent) {
 		if a.debug.client != nil {
 			a.debug.caps = a.debug.client.Caps()
 		}
+		// Only the evaluating client (the LEAF for a coordinating adapter) may revise eval caps: a
+		// coordinator's capabilities event describes a session no evaluate is sent to.
+		if e.client == nil || e.client == a.debug.client {
+			a.debug.evalCaps = dap.EvalCapsFromEvent(a.debug.evalCaps, e.ev.Body)
+		}
 
 	case dap.EventProcess, dap.EventInitialized:
 		// Consumed by the start sequence (initialized) or purely informational
@@ -1163,7 +1243,7 @@ func (a *App) handleDAPStopped(ev dap.Event) {
 	// the event body is unreadable or there is no client to ask. An
 	// invalidation skipped on an error path is a stale handle served on the
 	// next expand.
-	a.debug.invalidateStop()
+	a.debug.invalidateStopForEvent()
 
 	var se dap.StoppedEvent
 	if err := decodeBody(ev.Body, &se); err != nil {
@@ -1487,6 +1567,7 @@ func (a *App) publishDebug() {
 func (a *App) publishDebugIdle() {
 	a.debugPub.Set(state.DebugSession{State: state.DebugStateIdle, Root: a.rootDir})
 	a.debugPub.Flush()
+	state.UnregisterDebugInstance(a.debugInstanceID())
 }
 
 // debugSnapshot renders the current session as the published payload.
@@ -1578,6 +1659,7 @@ func (a *App) breakpointVerified(b Breakpoint) bool {
 // applies withinRoot), which is the case where landing in the wrong editor would
 // edit the wrong file.
 func (a *App) consumeDebugRequest() {
+	a.serveDebugQueries()
 	req, ok := state.ReadDebugRequest()
 	if !ok || req.Seq <= a.lastDebugSeq || req.Seq <= debugRequestFloor {
 		return
@@ -1685,4 +1767,464 @@ func (a *App) debugStatus() string {
 		return where
 	}
 	return "debug: " + a.debug.adapter + " running"
+}
+
+// The debug-visualization commands: `evaluate` and `frames`, answered as JSON
+// for a process outside the editor (the viz panel).
+//
+// 🔴 Everything here goes through dap.SafeEvaluate and dap.PausedFrames, never
+// Client.Evaluate. The raw evaluate is right for the watch row a human typed
+// into; a command another process can send needs the trust gate, the
+// stopped-only rule, hover-by-default and the depth/node/output/time caps, and
+// those live in internal/dap so there is one copy of them.
+const (
+	debugVizEvaluate = "evaluate"
+	debugVizFrames   = "frames"
+)
+
+// debugVizRequest is one visualization command. Context, FrameID and
+// AllowSideEffects mean exactly what they mean on dap.EvalRequest.
+type debugVizRequest struct {
+	Command          string `json:"command"`
+	Expression       string `json:"expression,omitempty"`
+	FrameID          *int   `json:"frameId,omitempty"`
+	Context          string `json:"context,omitempty"`
+	AllowSideEffects bool   `json:"allowSideEffects,omitempty"`
+}
+
+// debugVizFrame is one paused frame as the frames command reports it. Line is
+// the ADAPTER's 1-based line, the same convention as every location on the
+// wire, and ID is what an evaluate's frameId takes.
+type debugVizFrame struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Path string `json:"path,omitempty"`
+	Line int    `json:"line"`
+}
+
+// debugVizFramesDoc is the frames command's answer. SelectedFrameID is the frame
+// an evaluate without a frameId is answered in. No omitempty on it: js-debug's
+// innermost frame is id 0, and a dropped zero would read as "none selected".
+// Truncated means outer frames were dropped to fit the output cap.
+type debugVizFramesDoc struct {
+	SchemaVersion   int             `json:"schemaVersion"`
+	Frames          []debugVizFrame `json:"frames"`
+	SelectedFrameID *int            `json:"selectedFrameId"`
+	Truncated       bool            `json:"truncated,omitempty"`
+}
+
+// debugVizErrorDoc is every refusal and failure. A caller reading JSON gets an
+// error it can show, never an empty document that looks like an empty value.
+type debugVizErrorDoc struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	Error         string `json:"error"`
+}
+
+// debugVizTarget is what a command needs from the session, captured on the
+// main goroutine so the adapter round trips can run off it.
+type debugVizTarget struct {
+	client  *dap.Client
+	caps    dap.EvalCaps
+	pause   dap.PauseState
+	trusted bool
+}
+
+// debugVizCommand answers one visualization command. The session is read here,
+// on the main goroutine; the DAP traffic runs on another one and reply is
+// called from there with the encoded document — exactly once, refusal or not.
+//
+// reply must not touch UI state: it runs on the request goroutine. Nothing on
+// screen changes because a panel asked a question.
+func (a *App) debugVizCommand(req debugVizRequest, reply func([]byte)) {
+	tgt, err := a.debugVizTarget()
+	if err != nil {
+		reply(debugVizError(err, dap.DefaultEvalMaxOutBytes))
+		return
+	}
+	go func() { reply(runDebugVizBounded(tgt, req, dap.DefaultEvalLimits())) }()
+}
+
+// runDebugVizBounded runs one command and answers within lim.Timeout whatever
+// the adapter does.
+//
+// 🔴 The work gets nine tenths of the bound, so an evaluate cut short by its
+// own deadline still answers with what it read; the outer deadline only fires
+// when something below ignored that one — a write the adapter never reads, a
+// lock held by one. The abandoned goroutine finishes on its own.
+func runDebugVizBounded(tgt debugVizTarget, req debugVizRequest, lim dap.EvalLimits) []byte {
+	ctx, cancel := context.WithTimeout(context.Background(), lim.Timeout)
+	defer cancel()
+	inner := lim
+	inner.Timeout = lim.Timeout * 9 / 10
+	done := make(chan []byte, 1)
+	go func() { done <- runDebugViz(ctx, tgt, req, inner) }()
+	select {
+	case doc := <-done:
+		return doc
+	case <-ctx.Done():
+		return debugVizError(fmt.Errorf("%w after %s", dap.ErrEvalTimeout, lim.Timeout), lim.MaxOutBytes)
+	}
+}
+
+// debugInstanceCount numbers the editors in this process; the first is addressed by its pid alone,
+// which is the only one there is outside tests.
+var debugInstanceCount atomic.Int64
+
+// debugInstanceID returns the id `--debug evaluate --instance` names this
+// editor by.
+func (a *App) debugInstanceID() string {
+	a.debugInstance.once.Do(func() {
+		id := strconv.Itoa(os.Getpid())
+		if n := debugInstanceCount.Add(1); n > 1 {
+			id += "-" + strconv.FormatInt(n, 10)
+		}
+		a.debugInstance.id = id
+	})
+	return a.debugInstance.id
+}
+
+// serveDebugQueries keeps this editor's registration in step with its session
+// and answers the queries addressed to it. Polled from consumeDebugRequest.
+//
+// An editor is registered exactly while it has a session to evaluate in, so
+// the CLI's "which editor?" question is asked only among editors that could
+// answer. Each query is answered by this editor alone: it lives in this
+// editor's own directory and is removed as it is read.
+func (a *App) serveDebugQueries() {
+	id := a.debugInstanceID()
+	live := a.debug != nil && a.debug.client != nil
+	if live != state.DebugInstanceRegistered(id) {
+		if !live {
+			state.UnregisterDebugInstance(id)
+		} else if err := state.RegisterDebugInstance(state.DebugInstance{ID: id, PID: os.Getpid(), Root: a.rootDir}); err != nil {
+			a.post(&debugLogEvent{when: time.Now(), msg: "debug instance: " + err.Error()})
+		}
+	}
+	if !live {
+		return
+	}
+	for _, q := range state.TakeDebugQueries(id) {
+		if q.Seq <= debugRequestFloor {
+			continue // left over from before this editor started
+		}
+		qid := q.ID
+		a.debugVizCommand(debugVizRequest{
+			Command: q.Action, Expression: q.Expression, FrameID: q.FrameID,
+			Context: q.Context, AllowSideEffects: q.AllowSideEffects,
+		}, func(doc []byte) {
+			if err := state.WriteDebugReply(qid, doc); err != nil {
+				a.post(&debugLogEvent{when: time.Now(), msg: "debug reply: " + err.Error()})
+			}
+		})
+	}
+}
+
+// debugVizTarget snapshots the live session for a visualization command.
+//
+// 🔴 The selected frame is the one the user is looking at in the call-stack
+// picker, so a panel evaluating `x` sees the same `x` the editor shows.
+//
+// The caps are the adapter's REAL answer from initialize (see
+// debugSession.evalCaps), so hover is the default exactly when the adapter
+// can evaluate without side effects, and a timeout cancels exactly when it can
+// cancel.
+func (a *App) debugVizTarget() (debugVizTarget, error) {
+	if a.debug == nil || a.debug.client == nil {
+		return debugVizTarget{}, fmt.Errorf("no debug session")
+	}
+	s := a.debug
+	pause := dap.PauseState{
+		Stopped: s.stopped, ThreadID: s.threadID,
+		// Pinned to the generation the state above reflects, not the reader's latest: a stopped or
+		// continued event that arrived but is not yet applied makes the request refuse at once.
+		Gen: s.gen(), GenAt: s.stateGen,
+	}
+	if s.stopped && s.curFrame >= 0 && s.curFrame < len(s.frames) {
+		id := s.frames[s.curFrame].ID
+		pause.SelectedFrameID = &id
+	}
+	return debugVizTarget{
+		client:  s.client,
+		caps:    s.evalCaps,
+		pause:   pause,
+		trusted: a.workspaceTrusted(),
+	}, nil
+}
+
+// workspaceTrusted reports whether the user has trusted THIS project through
+// herdr-edit's own trust store — the one the format-on-save prompt writes —
+// under the store's FULL rule: format.CheckTrust, keyed by project AND by the
+// hash of the project's format.json. A yes given for one config does not
+// survive an edit to it, here exactly as it does not for format-on-save.
+//
+// No record, a stored no, a changed config, or an unreadable store or config
+// all answer false: evaluate runs code in the debuggee, and "we could not tell"
+// must refuse.
+func (a *App) workspaceTrusted() bool {
+	tf, err := format.LoadTrust(format.DefaultTrustPath())
+	if err != nil || tf == nil {
+		return false
+	}
+	cfg, err := format.Load(a.rootDir)
+	if err != nil {
+		return false
+	}
+	return tf.CheckTrust(a.rootDir, cfg.Hash()) == format.TrustAllowed
+}
+
+// runDebugViz performs one command against the snapshot and encodes the answer.
+// Separate from debugVizCommand so a test can drive it synchronously against a
+// fake adapter.
+func runDebugViz(ctx context.Context, tgt debugVizTarget, req debugVizRequest, lim dap.EvalLimits) []byte {
+	switch req.Command {
+	case debugVizFrames:
+		// Gated like evaluate. A frame list is a map of the program's
+		// internals, and an untrusted workspace gets nothing from the socket.
+		if !tgt.trusted {
+			return debugVizError(dap.ErrEvalUntrusted, lim.MaxOutBytes)
+		}
+		frames, err := dap.PausedFrames(ctx, tgt.client, tgt.caps, tgt.pause, lim.Timeout)
+		if err != nil {
+			return debugVizError(err, lim.MaxOutBytes)
+		}
+		doc := debugVizFramesDoc{
+			SchemaVersion:   dap.VizSchemaVersion,
+			Frames:          make([]debugVizFrame, 0, len(frames)),
+			SelectedFrameID: tgt.pause.SelectedFrameID,
+		}
+		for _, f := range frames {
+			doc.Frames = append(doc.Frames, debugVizFrame{ID: f.ID, Name: f.Name, Path: f.Source.Path, Line: f.Line})
+		}
+		return debugVizFitFrames(doc, lim.MaxOutBytes)
+	case debugVizEvaluate:
+		res, err := dap.SafeEvaluate(ctx, tgt.client, tgt.caps, tgt.pause, dap.EvalRequest{
+			Expression:       req.Expression,
+			FrameID:          req.FrameID,
+			Context:          req.Context,
+			AllowSideEffects: req.AllowSideEffects,
+			Trusted:          tgt.trusted,
+		}, lim)
+		if err != nil {
+			return debugVizError(err, lim.MaxOutBytes)
+		}
+		return debugVizFit(res, lim.MaxOutBytes)
+	default:
+		return debugVizError(fmt.Errorf("unknown visualization command %q — want %s or %s",
+			req.Command, debugVizEvaluate, debugVizFrames), lim.MaxOutBytes)
+	}
+}
+
+// debugVizFitFrames encodes the frames answer within max serialized bytes,
+// dropping OUTER frames first: the innermost are the ones an evaluate wants.
+func debugVizFitFrames(doc debugVizFramesDoc, max int) []byte {
+	out := debugVizEncode(doc)
+	if max <= 0 || len(out) <= max {
+		return out
+	}
+	all, selected := doc.Frames, doc.SelectedFrameID
+	doc.Truncated = true
+	// A kept prefix that no longer holds the selected frame must not name it: the reply would declare
+	// a selection it does not contain.
+	prefix := func(n int) debugVizFramesDoc {
+		d := doc
+		d.Frames, d.SelectedFrameID = all[:n], nil
+		for _, f := range d.Frames {
+			if selected != nil && f.ID == *selected {
+				d.SelectedFrameID = selected
+			}
+		}
+		return d
+	}
+	lo, hi := 0, len(all)-1
+	var best []byte
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if b := debugVizEncode(prefix(mid)); len(b) <= max {
+			best, lo = b, mid+1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best != nil {
+		return best
+	}
+	return debugVizError(fmt.Errorf("frames do not fit the %d-byte output cap", max), max)
+}
+
+// debugVizDocument normalises a bounded evaluate answer into the viz schema,
+// carrying the evaluate's side-effect warning and the caps it hit.
+//
+// 🔴 Truncated is OR-ed with the evaluate's own flag. Normalize only sees the
+// per-node marks, but the output and timeout caps can cut a value short without
+// marking a node as having unread children — a clipped string is a leaf. Taking
+// Normalize's answer alone would present a clipped value as complete.
+func debugVizDocument(res dap.EvalResult) dap.VizResult {
+	viz := dap.Normalize(evalToVarNode(res.Root), dap.VizSource{
+		Expression: res.Expression, FrameID: res.FrameID, Adapter: res.Adapter,
+	})
+	viz.Truncated = viz.Truncated || res.Truncated
+	viz.SideEffectWarning = res.SideEffectWarning
+	if viz.Truncated {
+		viz.TruncatedBy = res.TruncatedBy
+	}
+	return viz
+}
+
+// debugVizFit encodes the document within max SERIALIZED bytes.
+//
+// 🔴 The evaluate walk's output cap counts raw name/value/type bytes, which is
+// a cheap early stop but not the size of the reply: JSON adds keys, quotes and
+// structure to every node, and escapes characters (a `<` becomes six bytes).
+// So the cap is enforced here, on the encoded bytes. An oversized answer keeps
+// the longest breadth-first PREFIX of the tree that fits — a prefix of a BFS
+// order always contains every kept node's parent, so the result is still one
+// tree, and what is lost is the deep detail, as with every other cap — and a
+// root that does not fit alone has its value clipped.
+func debugVizFit(res dap.EvalResult, max int) []byte {
+	out := debugVizEncode(debugVizDocument(res))
+	if max <= 0 || len(out) <= max {
+		return out
+	}
+	order := evalBFS(res.Root)
+	encodeKept := func(keep int) []byte {
+		cut := res
+		cut.Root = evalPrefix(res.Root, order, keep)
+		markOutputTruncated(&cut)
+		return debugVizEncode(debugVizDocument(cut))
+	}
+	// The largest prefix that fits. Encoded size grows with the prefix, so a
+	// binary search finds it; only a probe that FITS is ever kept.
+	var best []byte
+	lo, hi := 1, len(order)-1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if b := encodeKept(mid); len(b) <= max {
+			best, lo = b, mid+1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best != nil {
+		return best
+	}
+	// Not even the root alone fits: clip its value until it does.
+	cut := res
+	root := *res.Root
+	root.Children, root.VariablesReference, root.ChildrenTruncated = nil, 0, len(res.Root.Children) > 0 || res.Root.VariablesReference != 0
+	cut.Root = &root
+	markOutputTruncated(&cut)
+	for n := len(root.Value) / 2; ; n /= 2 {
+		root.Value = clipRunes(res.Root.Value, n)
+		if b := debugVizEncode(debugVizDocument(cut)); len(b) <= max || n == 0 {
+			if len(b) <= max {
+				return b
+			}
+			break
+		}
+	}
+	return debugVizError(fmt.Errorf("evaluate result does not fit the %d-byte output cap", max), max)
+}
+
+func markOutputTruncated(res *dap.EvalResult) {
+	res.Truncated = true
+	for _, r := range res.TruncatedBy {
+		if r == "output" {
+			return
+		}
+	}
+	res.TruncatedBy = append(append([]string(nil), res.TruncatedBy...), "output")
+}
+
+func evalBFS(root *dap.EvalNode) []*dap.EvalNode {
+	if root == nil {
+		return nil
+	}
+	order := []*dap.EvalNode{root}
+	for i := 0; i < len(order); i++ {
+		order = append(order, order[i].Children...)
+	}
+	return order
+}
+
+// evalPrefix copies the tree keeping only the first keep nodes of order. A
+// node that loses children is marked ChildrenTruncated, so the renderer shows
+// it as having more than it shows.
+func evalPrefix(root *dap.EvalNode, order []*dap.EvalNode, keep int) *dap.EvalNode {
+	kept := make(map[*dap.EvalNode]bool, keep)
+	for _, n := range order[:min(keep, len(order))] {
+		kept[n] = true
+	}
+	var cp func(n *dap.EvalNode) *dap.EvalNode
+	cp = func(n *dap.EvalNode) *dap.EvalNode {
+		c := *n
+		c.Children = nil
+		for _, k := range n.Children {
+			if kept[k] {
+				c.Children = append(c.Children, cp(k))
+			} else {
+				c.ChildrenTruncated = true
+			}
+		}
+		return &c
+	}
+	return cp(root)
+}
+
+// clipRunes cuts s to at most n bytes without splitting a rune.
+func clipRunes(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// evalToVarNode converts the evaluate walk's tree into the shape Normalize
+// reads. A node whose children failed to load counts as truncated: it has
+// children nobody read, and a renderer should draw it collapsible, not empty.
+func evalToVarNode(n *dap.EvalNode) *dap.VarNode {
+	if n == nil {
+		return nil
+	}
+	out := &dap.VarNode{Var: n.Variable, Truncated: n.ChildrenTruncated || n.ExpandError != ""}
+	for _, c := range n.Children {
+		out.Children = append(out.Children, evalToVarNode(c))
+	}
+	return out
+}
+
+// debugVizError encodes a refusal or failure within max serialized bytes,
+// clipping the message — an adapter's error text is the adapter's to size.
+func debugVizError(err error, limit int) []byte {
+	msg := err.Error()
+	enc := func(m string) []byte {
+		return debugVizEncode(debugVizErrorDoc{SchemaVersion: dap.VizSchemaVersion, Error: m})
+	}
+	out := enc(msg)
+	if limit <= 0 || len(out) <= limit {
+		return out
+	}
+	best := enc("")
+	for lo, hi := 0, len(msg)-1; lo <= hi; {
+		mid := (lo + hi) / 2
+		if b := enc(clipRunes(msg, mid)); len(b) <= limit {
+			best, lo = b, mid+1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
+}
+
+// debugVizEncode marshals a document. Every type passed here is plain data, so
+// a marshal failure is a programming error — answered as an error document
+// rather than an empty reply the caller would wait on.
+func debugVizEncode(v any) []byte {
+	out, err := json.Marshal(v)
+	if err != nil {
+		out, _ = json.Marshal(debugVizErrorDoc{SchemaVersion: dap.VizSchemaVersion, Error: err.Error()})
+	}
+	return out
 }

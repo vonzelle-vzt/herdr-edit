@@ -13,6 +13,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -50,6 +51,9 @@ type cliResult struct {
 	// state.ValidDebugAction. Empty for every other action.
 	DebugAction string
 	DebugNode   string
+	// DebugQuery is set for the two actions that ANSWER (evaluate, frames):
+	// the request is sent and the editor's JSON reply is printed.
+	DebugQuery *state.DebugRequest
 
 	Err error
 }
@@ -100,6 +104,14 @@ func resolveArgs(args []string) cliResult {
 				args[1], strings.Join(state.DebugActions(), " | "))}
 		}
 		res := cliResult{Action: actionDebug, DebugAction: args[1]}
+		if state.IsDebugQuery(args[1]) {
+			q, err := state.ParseDebugQuery(args[1], args[2:])
+			if err != nil {
+				return cliResult{Err: err}
+			}
+			res.DebugQuery = &q
+			return res
+		}
 		if len(args) > 2 {
 			res.OpenFile = args[2]
 		}
@@ -161,12 +173,58 @@ Usage:
   spiceedit --debug ACTION      Drive a RUNNING editor's debugger. ACTION is one of
                                 start, continue, next, stepIn, stepOut, pause, stop,
                                 toggle-breakpoint FILE:LINE, or test FILE::NODE.
+  spiceedit --debug evaluate --expr E [--frame N] [--context hover|watch|repl]
+                     [--allow-side-effects] [--instance ID]
+                                Evaluate E in the RUNNING editor's paused session
+                                and print the visualization JSON
+                                (docs/viz-schema-v1.json). watch and repl can run
+                                code, so they need --allow-side-effects. With
+                                several editors debugging, --instance picks one;
+                                without it the command lists them and refuses.
+  spiceedit --debug frames [--instance ID]
+                                Print the paused frames as JSON.
   spiceedit --version           Print the version and exit.
   spiceedit --help              Print this help and exit.
 
 Once running, click ≡ (top-left), right-click anywhere, or double-tap Esc
 for the action menu. See https://github.com/cloudmanic/spice-edit for
 hotkeys and the full feature list.`)
+}
+
+// runDebugQuery sends an evaluate or frames request to the running editor,
+// prints the JSON it answers with, and returns the exit status: 0 for a
+// document, 1 for a refusal or no answer — so a script can branch on it without
+// parsing.
+//
+// The query goes to ONE editor: the one --instance names, else the only one
+// with a debug session. Several without --instance is refused with the list,
+// because an expression with side effects must not run in a session the caller
+// did not pick.
+func runDebugQuery(q state.DebugRequest) int {
+	inst, err := state.ChooseDebugInstance(q.Instance)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+		return 1
+	}
+	q.Instance = inst.ID
+	id, err := state.WriteDebugQuery(q)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+		return 1
+	}
+	reply, err := state.AwaitDebugReply(inst.ID, id, state.DebugReplyTimeout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+		return 1
+	}
+	fmt.Println(string(reply))
+	var doc struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(reply, &doc) == nil && doc.Error != "" {
+		return 1
+	}
+	return 0
 }
 
 // main routes to the action resolveArgs picked. Edit is by far the
@@ -200,6 +258,9 @@ func main() {
 		}
 		return
 	case actionDebug:
+		if res.DebugQuery != nil {
+			os.Exit(runDebugQuery(*res.DebugQuery))
+		}
 		// The location is optional and only toggle-breakpoint uses it, but it
 		// goes through the SAME SplitLocation as --open-at rather than a second
 		// parser: "file:line" has exactly one correct reading and a panel emits

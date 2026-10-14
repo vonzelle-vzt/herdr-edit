@@ -136,11 +136,14 @@ type Client struct {
 
 	handlers Handlers
 
-	mu      sync.Mutex
-	nextSeq int
-	pending map[int]chan Response // keyed by REQUEST_SEQ — see Response's doc
-	caps    Capabilities
-	closed  bool
+	mu sync.Mutex
+	// writeSem serializes writes. It is a channel, not c.mu, so a request can give up waiting for
+	// another write at its own context deadline instead of blocking past it.
+	writeSem chan struct{}
+	nextSeq  int
+	pending  map[int]chan Response // keyed by REQUEST_SEQ — see Response's doc
+	caps     Capabilities
+	closed   bool
 
 	// childReq carries the FIRST startDebugging the adapter asks for. Buffered
 	// so the read loop never blocks on a caller that is not waiting yet — the
@@ -187,6 +190,7 @@ func newClient(name string, conn io.ReadWriteCloser, h Handlers) *Client {
 		childReq:   make(chan ChildSession, 1),
 		seenEvents: make(map[string]bool),
 		waiters:    make(map[string][]chan struct{}),
+		writeSem:   make(chan struct{}, 1),
 	}
 }
 
@@ -685,20 +689,8 @@ func (c *Client) Caps() Capabilities {
 // owns that sequence because only the caller knows what breakpoints to set in
 // the middle of it.
 func (c *Client) Initialize(ctx context.Context, adapterID string) (Capabilities, error) {
-	raw, err := c.call(ctx, "initialize", initializeArgsForClient(adapterID))
-	if err != nil {
-		return Capabilities{}, err
-	}
-	var caps Capabilities
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &caps); err != nil {
-			return Capabilities{}, fmt.Errorf("%s: initialize body: %w", c.name, err)
-		}
-	}
-	c.mu.Lock()
-	c.caps = caps
-	c.mu.Unlock()
-	return caps, nil
+	caps, _, err := c.InitializeForEval(ctx, adapterID)
+	return caps, err
 }
 
 // initializeArgsForClient is the capability declaration sent at initialize,
@@ -1172,8 +1164,8 @@ func (c *Client) call(ctx context.Context, command string, args interface{}) (js
 		c.mu.Unlock()
 	}()
 
-	if err := c.write(Request{Seq: seq, Type: TypeRequest, Command: command, Arguments: args}); err != nil {
-		return nil, err
+	if err := c.writeCtx(ctx, Request{Seq: seq, Type: TypeRequest, Command: command, Arguments: args}); err != nil {
+		return nil, fmt.Errorf("%s: %w", command, err)
 	}
 
 	select {
@@ -1218,26 +1210,81 @@ func (c *Client) responseError(command string, resp Response) error {
 // a Response. One framing path for both is the point — two would be two places
 // for the deadline and the nil-connection check to drift.
 func (c *Client) write(msg interface{}) error {
+	return c.writeCtx(context.Background(), msg)
+}
+
+// errNotSent marks a request the adapter never received a byte of: safe to treat as never executed.
+// It wraps the cause (the context's error, or the transport deadline).
+var errNotSent = errors.New("not sent")
+
+// writeCtx frames msg and writes it in ONE Write, bounded by ctx and writeTimeout.
+//
+// 🔴 A side-effecting request must never reach the adapter after its caller gave up. So: waiting for
+// another write respects ctx (writeSem), an expired ctx sends nothing, the write deadline is the
+// earlier of ctx's and writeTimeout, and an early cancel forces the deadline to now. A write that
+// moved zero bytes is errNotSent. A PARTIAL write leaves the framed stream corrupt, so the connection
+// is closed rather than reused.
+func (c *Client) writeCtx(ctx context.Context, msg interface{}) error {
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
+	frame := append([]byte(fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))), body...)
+	select {
+	case c.writeSem <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("%s: %w: %w", c.name, errNotSent, ctx.Err())
+	}
+	defer func() { <-c.writeSem }()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn == nil {
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
 		return fmt.Errorf("%s: no connection", c.name)
 	}
-	// Bound the write when the transport can be bounded — see writeTimeout.
-	// net.Conn and net.Pipe both can; an io.ReadWriteCloser in a test may not,
-	// and there is nothing to protect against in that case.
-	if dc, ok := c.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		_ = dc.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s: %w: %w", c.name, errNotSent, err)
 	}
-	if _, err := fmt.Fprintf(c.conn, "Content-Length: %d\r\n\r\n", len(body)); err != nil {
-		return err
+	ctxBound := false // the write deadline in effect is ctx's own
+	if dc, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		limit := time.Now().Add(writeTimeout)
+		if dl, ok := ctx.Deadline(); ok && dl.Before(limit) {
+			limit, ctxBound = dl, true
+		}
+		_ = dc.SetWriteDeadline(limit)
+		fired := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = dc.SetWriteDeadline(time.Now())
+			close(fired)
+		})
+		// Release the write slot only after a cancel callback that already started has finished,
+		// or it could reset the NEXT writer's deadline.
+		defer func() {
+			if !stop() {
+				<-fired
+			}
+		}()
 	}
-	_, err = c.conn.Write(body)
-	return err
+	n, err := conn.Write(frame)
+	if err == nil && n == len(frame) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	if n == 0 {
+		// The transport can report ctx's deadline a moment before ctx's own timer fires; it is due, so
+		// wait for it and report the context's error rather than a raw i/o timeout.
+		if ctxBound && errors.Is(err, os.ErrDeadlineExceeded) {
+			<-ctx.Done()
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("%s: %w: %w", c.name, errNotSent, ctxErr)
+		}
+		return fmt.Errorf("%s: %w: %w", c.name, errNotSent, err)
+	}
+	_ = conn.Close()
+	return fmt.Errorf("%s: partial write (%d of %d bytes); connection closed: %w", c.name, n, len(frame), err)
 }
 
 // readLoop demultiplexes everything the adapter sends: responses go to whoever

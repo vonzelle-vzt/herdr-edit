@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/vonzelle-vzt/herdr-edit/blob/main/docs/viz-schema-v1.json",
+  "title": "herdr-edit debug visualization document, schema version 1",
+  "description": "What herdr-edit's debug evaluate command returns: an evaluated expression normalised from DAP variables. `kind` selects the shape of `data`. Produced by internal/dap/viz.go. The `graph` kind is defined so renderers can target it, but no v1 extractor produces it.",
+  "$comment": "schemaVersion stays 1 after `truncatedBy` and `sideEffectWarning` were added (2026-10-14, debugviz-herdr-p8 repair round 1). Both are OPTIONAL and were added before any renderer shipped against this file, so no v1 consumer can have been written to reject them; a renderer that ignores them still reads every document correctly. Any later change a v1 renderer could misread is schemaVersion 2 and a new file. `frames.truncated` was added in repair round 2 under the same reasoning. The `frames` and `error` defs describe the socket command's two non-visualization replies, validated with $ref to them, not against the root.",
+  "type": "object",
+  "required": ["schemaVersion", "kind", "data", "source"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "enum": ["text", "table", "tree", "graph", "grid", "plot", "ast"] },
+    "data": {},
+    "source": { "$ref": "#/$defs/source" },
+    "truncated": {
+      "type": "boolean",
+      "description": "True when a depth, node, output or time cap cut the result short. Absent means complete."
+    },
+    "truncatedBy": {
+      "type": "array",
+      "description": "Every cap that was hit, each named once. Present only with truncated.",
+      "items": { "enum": ["depth", "nodes", "output", "timeout"] }
+    },
+    "sideEffectWarning": {
+      "type": "boolean",
+      "description": "True when the expression was evaluated in a watch or repl context, which can run code in the debuggee. Absent for hover."
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "kind": { "const": "text" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/text" } } } },
+    { "if": { "properties": { "kind": { "const": "table" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/table" } } } },
+    { "if": { "properties": { "kind": { "const": "tree" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/tree" } } } },
+    { "if": { "properties": { "kind": { "const": "graph" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/graph" } } } },
+    { "if": { "properties": { "kind": { "const": "grid" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/grid" } } } },
+    { "if": { "properties": { "kind": { "const": "plot" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/plot" } } } },
+    { "if": { "properties": { "kind": { "const": "ast" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/ast" } } } }
+  ],
+  "$defs": {
+    "frames": {
+      "type": "object",
+      "description": "The reply to the frames command: the paused frames and the one an evaluate without a frameId uses.",
+      "required": ["schemaVersion", "frames", "selectedFrameId"],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "frames": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name", "line"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "integer", "minimum": 0 },
+              "name": { "type": "string" },
+              "path": { "type": "string" },
+              "line": { "type": "integer", "minimum": 0, "description": "The adapter's 1-based line." }
+            }
+          }
+        },
+        "selectedFrameId": { "type": ["integer", "null"], "minimum": 0 },
+        "truncated": { "type": "boolean", "description": "True when outer frames were dropped to fit the output cap. Absent means every paused frame is listed." }
+      }
+    },
+    "error": {
+      "type": "object",
+      "description": "Every refusal and failure of the evaluate and frames commands.",
+      "required": ["schemaVersion", "error"],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "error": { "type": "string" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": ["expression", "frameId", "adapter"],
+      "additionalProperties": false,
+      "properties": {
+        "expression": { "type": "string" },
+        "frameId": { "type": "integer", "minimum": 0, "description": "Always present; 0 is a real frame id (js-debug's innermost frame)." },
+        "adapter": { "type": "string" }
+      }
+    },
+    "cell": { "type": ["string", "null"], "description": "The adapter's rendered value; null means the cell does not exist." },
+    "text": {
+      "type": "object",
+      "required": ["value"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "string" },
+        "type": { "type": "string" }
+      }
+    },
+    "treeNode": {
+      "type": "object",
+      "required": ["name", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "value": { "type": "string" },
+        "type": { "type": "string" },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/treeNode" } },
+        "unexpanded": { "type": "boolean", "description": "The adapter reports children that were not fetched." }
+      }
+    },
+    "tree": {
+      "type": "object",
+      "required": ["root"],
+      "additionalProperties": false,
+      "properties": { "root": { "$ref": "#/$defs/treeNode" } }
+    },
+    "table": {
+      "type": "object",
+      "required": ["columns", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "columns": { "type": "array", "items": { "type": "string" } },
+        "rows": {
+          "type": "array",
+          "description": "One array per record, aligned with columns.",
+          "items": { "type": "array", "items": { "$ref": "#/$defs/cell" } }
+        }
+      }
+    },
+    "grid": {
+      "type": "object",
+      "required": ["rows", "cols", "cells"],
+      "additionalProperties": false,
+      "properties": {
+        "rows": { "type": "integer", "minimum": 1 },
+        "cols": { "type": "integer", "minimum": 1 },
+        "cells": {
+          "type": "array",
+          "description": "rows arrays of cols cells; ragged input is padded with null.",
+          "items": { "type": "array", "items": { "$ref": "#/$defs/cell" } }
+        }
+      }
+    },
+    "plot": {
+      "type": "object",
+      "required": ["y"],
+      "additionalProperties": false,
+      "properties": {
+        "y": { "type": "array", "description": "Values by index.", "items": { "type": "number" } }
+      }
+    },
+    "astNode": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string" },
+        "value": { "type": "string", "description": "Set only on a child that was not itself node-shaped." },
+        "props": { "type": "object", "additionalProperties": { "type": "string" } },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/astNode" } }
+      }
+    },
+    "ast": {
+      "type": "object",
+      "required": ["root"],
+      "additionalProperties": false,
+      "properties": { "root": { "$ref": "#/$defs/astNode" } }
+    },
+    "graph": {
+      "type": "object",
+      "required": ["nodes", "edges"],
+      "additionalProperties": false,
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label"],
+            "additionalProperties": false,
+            "properties": { "id": { "type": "string" }, "label": { "type": "string" } }
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to"],
+            "additionalProperties": false,
+            "properties": {
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

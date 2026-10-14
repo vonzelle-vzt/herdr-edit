@@ -11,7 +11,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -1593,4 +1595,122 @@ func TestAChildSessionRefusesAGrandchildLoudly(t *testing.T) {
 	logs := append([]string(nil), col.logs...)
 	col.mu.Unlock()
 	t.Fatalf("the grandchild was refused SILENTLY — no log names it. logs: %v", logs)
+}
+
+// A request whose context has already expired is never handed to the adapter: a timed-out
+// side-effecting evaluate must not execute later.
+func TestCallWithExpiredContextSendsNothing(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Evaluate(ctx, "x = 1", 0, EvalContextRepl); !errors.Is(err, errNotSent) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want errNotSent wrapping context.Canceled", err)
+	}
+	_ = f.conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, err := readMessage(f.r); err == nil {
+		t.Fatal("the adapter received a request from a cancelled context")
+	}
+}
+
+// The write is bounded by the request's own deadline, not only writeTimeout: with an adapter that
+// never reads, the call gives up at the context deadline and the request is never delivered.
+func TestCallWriteDeadlineFollowsContextDeadline(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := c.Evaluate(ctx, "x = 1", 0, EvalContextRepl); err == nil {
+		t.Fatal("Evaluate succeeded against an adapter that never reads")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("the write outlived its 150 ms context: took %v (writeTimeout is %v)", elapsed, writeTimeout)
+	}
+	_ = f.conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, err := readMessage(f.r); err == nil {
+		t.Fatal("the request was delivered after its context deadline")
+	}
+}
+
+// An EARLY cancel (before any deadline) aborts a blocked write: the call returns promptly and the
+// request is never delivered later.
+func TestEarlyCancelAbortsABlockedWrite(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(80*time.Millisecond, cancel)
+	start := time.Now()
+	if _, err := c.callCancellable(ctx, true, "evaluate", map[string]interface{}{"expression": "x = 1"}); !errors.Is(err, errNotSent) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want errNotSent wrapping context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("an early cancel did not abort the blocked write: %v", elapsed)
+	}
+	time.Sleep(200 * time.Millisecond)
+	_ = f.conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, err := readMessage(f.r); err == nil {
+		t.Fatal("a cancelled request reached the adapter")
+	}
+}
+
+// Waiting behind another write respects the caller's context: with the write slot held by a
+// stuck write, a short-deadline call gives up at its deadline and sends nothing.
+func TestWriteContentionRespectsTheContext(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+	long, cancelLong := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelLong()
+	go func() {
+		_, _ = c.callCancellable(long, true, "evaluate", map[string]interface{}{"expression": "first"})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	short, cancelShort := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancelShort()
+	start := time.Now()
+	_, err := c.Evaluate(short, "second", 0, EvalContextRepl)
+	if err == nil || !errors.Is(err, errNotSent) {
+		t.Fatalf("contended call: err = %v, want errNotSent", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waiting for the write slot outlived the 150 ms context: %v", elapsed)
+	}
+}
+
+// A write that moved some but not all bytes leaves the stream corrupt: the connection is closed.
+func TestPartialWriteClosesTheConnection(t *testing.T) {
+	c, f := newFakePair(t, Handlers{})
+	defer stopFake(c, f)
+	go func() {
+		buf := make([]byte, 8)
+		_, _ = io.ReadFull(f.conn, buf) // read part of the frame, then stop reading
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_, err := c.Evaluate(ctx, "x = 1", 0, EvalContextRepl)
+	if err == nil || !strings.Contains(err.Error(), "partial write") {
+		t.Fatalf("err = %v, want a partial-write error", err)
+	}
+}
+
+// shortConn accepts all but one byte of every write and reports no error.
+type shortConn struct {
+	net.Conn
+	closed bool
+}
+
+func (s *shortConn) Write(p []byte) (int, error) { return len(p) - 1, nil }
+func (s *shortConn) Close() error                { s.closed = true; return s.Conn.Close() }
+
+// A short write with a nil error is still a partial write: the stream is corrupt, so the
+// connection is closed.
+func TestShortWriteWithoutErrorClosesTheConnection(t *testing.T) {
+	ours, theirs := net.Pipe()
+	defer theirs.Close()
+	sc := &shortConn{Conn: ours}
+	c := newClient("short", sc, Handlers{})
+	err := c.writeCtx(context.Background(), Request{Seq: 1, Type: TypeRequest, Command: "threads"})
+	if !errors.Is(err, io.ErrShortWrite) || !sc.closed {
+		t.Fatalf("err = %v closed = %v, want io.ErrShortWrite and a closed connection", err, sc.closed)
+	}
 }

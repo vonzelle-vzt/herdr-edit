@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -400,6 +401,11 @@ func (a *App) hasTree() bool {
 
 // App is the editor's top-level state holder and event-loop owner.
 type App struct {
+	// debugInstance is this editor's debug-query address, assigned once on first use.
+	debugInstance struct {
+		once sync.Once
+		id   string
+	}
 	screen tcell.Screen
 	theme  theme.Theme
 
