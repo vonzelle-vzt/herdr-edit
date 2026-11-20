@@ -1,14 +1,15 @@
 // =============================================================================
 // File: internal/lsp/convert.go
-// Author: Spicer Matthews <spicer@cloudmanic.com>
+// Author: Vonzelle Brown
 // Created: 2026-07-29
-// Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+// Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
 package lsp
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"runtime"
@@ -384,7 +385,8 @@ func CompletionKindName(kind int) string {
 	}
 }
 
-// workspaceEdits unwraps a textDocument/rename result into path -> edits.
+// decodeWorkspaceEdit unwraps a WorkspaceEdit into path -> edits, plus the name
+// of any operation it carries that this editor cannot perform.
 //
 // The spec offers TWO ways to say the same thing: a flat `changes` map, and a
 // `documentChanges` array carrying versioned document identifiers. Servers pick
@@ -392,14 +394,24 @@ func CompletionKindName(kind int) string {
 // decoding only one yields "rename did nothing" against half of them, with no
 // error to explain it.
 //
+// Two traps live in the obvious "decode both and merge" answer. The spec says a
+// client that understands documentChanges MUST ignore `changes`, and a server
+// that fills both sends the same edits twice, so merging applies every edit
+// twice. And documentChanges entries are a union: a create/rename/delete file
+// operation has no textDocument at all, so a typed decode reads it as an empty
+// edit and drops it silently — leaving a "fix" that did half its work. Each
+// entry is therefore decoded on its own, and an operation is REPORTED.
+//
 // Edits are returned in DESCENDING position order per file. Applying them in
 // document order would invalidate every later range as soon as the first edit
 // changed the text length; walking backwards keeps every remaining range valid
 // without re-deriving anything. Same reason ReplaceAll walks its matches
-// last-to-first.
-func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
+// last-to-first. Edits that share a start (two insertions at one point) come out
+// in REVERSE array order, so applying them one after another leaves the first
+// ahead of the second, which is the order the spec prescribes.
+func decodeWorkspaceEdit(raw json.RawMessage) (map[string][]TextEdit, string) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return nil
+		return nil, ""
 	}
 	type wireEdit struct {
 		Range   Range  `json:"range"`
@@ -407,18 +419,14 @@ func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
 	}
 	var payload struct {
 		Changes         map[string][]wireEdit `json:"changes"`
-		DocumentChanges []struct {
-			TextDocument struct {
-				URI string `json:"uri"`
-			} `json:"textDocument"`
-			Edits []wireEdit `json:"edits"`
-		} `json:"documentChanges"`
+		DocumentChanges []json.RawMessage     `json:"documentChanges"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil
+		return nil, ""
 	}
 
 	out := map[string][]TextEdit{}
+	unsupported := ""
 	add := func(uri string, edits []wireEdit) {
 		path := PathFromURI(uri)
 		if path == "" {
@@ -428,24 +436,125 @@ func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
 			out[path] = append(out[path], TextEdit{Range: e.Range, NewText: e.NewText})
 		}
 	}
-	for uri, edits := range payload.Changes {
-		add(uri, edits)
-	}
-	for _, dc := range payload.DocumentChanges {
-		add(dc.TextDocument.URI, dc.Edits)
+	if len(payload.DocumentChanges) > 0 {
+		for _, entry := range payload.DocumentChanges {
+			var dc struct {
+				Kind         string `json:"kind"`
+				TextDocument struct {
+					URI string `json:"uri"`
+				} `json:"textDocument"`
+				Edits []wireEdit `json:"edits"`
+			}
+			if err := json.Unmarshal(entry, &dc); err != nil {
+				unsupported = "an unreadable documentChanges entry"
+				continue
+			}
+			if dc.Kind != "" {
+				unsupported = dc.Kind + " file operation"
+				continue
+			}
+			add(dc.TextDocument.URI, dc.Edits)
+		}
+	} else {
+		for uri, edits := range payload.Changes {
+			add(uri, edits)
+		}
 	}
 
 	for path := range out {
 		edits := out[path]
 		sort.SliceStable(edits, func(i, j int) bool {
 			if edits[i].Range.Start.Line != edits[j].Range.Start.Line {
-				return edits[i].Range.Start.Line > edits[j].Range.Start.Line
+				return edits[i].Range.Start.Line < edits[j].Range.Start.Line
 			}
-			return edits[i].Range.Start.Character > edits[j].Range.Start.Character
+			return edits[i].Range.Start.Character < edits[j].Range.Start.Character
 		})
+		for i, j := 0, len(edits)-1; i < j; i, j = i+1, j-1 {
+			edits[i], edits[j] = edits[j], edits[i]
+		}
 		out[path] = edits
 	}
-	return out
+	return out, unsupported
+}
+
+// ApplyTextEdits applies edits to text and returns the result, or an error
+// naming the first edit that does not fit, in which case nothing is applied.
+//
+// This is the one place a TextEdit meets text, shared by rename and code
+// actions, so validation lives here: every range must lie inside the text, run
+// forward, land on a UTF-16 character boundary, and not overlap another edit.
+// Edits are expected as decodeWorkspaceEdit returns them (descending); anything
+// else is re-sorted stably. Ranges may span lines; a quick fix that deletes an
+// import is typically one.
+func ApplyTextEdits(text string, edits []TextEdit) (string, error) {
+	if len(edits) == 0 {
+		return text, nil
+	}
+	lines := strings.Split(text, "\n")
+	starts := make([]int, len(lines))
+	total := 0
+	for i, l := range lines {
+		starts[i] = total
+		total += len([]rune(l)) + 1
+	}
+	offset := func(p Position) (int, error) {
+		if p.Line < 0 || p.Line >= len(lines) {
+			return 0, fmt.Errorf("line %d is outside the file (%d lines)", p.Line+1, len(lines))
+		}
+		line := strings.TrimSuffix(lines[p.Line], "\r")
+		units, runes := 0, 0
+		for _, r := range line {
+			if units >= p.Character {
+				break
+			}
+			units += utf16Len(r)
+			runes++
+		}
+		if units != p.Character {
+			return 0, fmt.Errorf("column %d is not a valid position on line %d", p.Character, p.Line+1)
+		}
+		return starts[p.Line] + runes, nil
+	}
+
+	type span struct{ s, e int }
+	spans := make([]span, len(edits))
+	for i, ed := range edits {
+		s, err := offset(ed.Range.Start)
+		if err != nil {
+			return "", err
+		}
+		e, err := offset(ed.Range.End)
+		if err != nil {
+			return "", err
+		}
+		if e < s {
+			return "", fmt.Errorf("edit at line %d ends before it starts", ed.Range.Start.Line+1)
+		}
+		spans[i] = span{s, e}
+	}
+	order := make([]int, len(edits))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return spans[order[a]].s > spans[order[b]].s })
+	for k := 1; k < len(order); k++ {
+		later, earlier := spans[order[k-1]], spans[order[k]]
+		if earlier.e > later.s {
+			return "", fmt.Errorf("edits at line %d overlap", edits[order[k]].Range.Start.Line+1)
+		}
+	}
+
+	rs := []rune(text)
+	for _, idx := range order {
+		sp := spans[idx]
+		repl := []rune(edits[idx].NewText)
+		next := make([]rune, 0, len(rs)-(sp.e-sp.s)+len(repl))
+		next = append(next, rs[:sp.s]...)
+		next = append(next, repl...)
+		next = append(next, rs[sp.e:]...)
+		rs = next
+	}
+	return string(rs), nil
 }
 
 // symbols unwraps a documentSymbol result.
@@ -632,35 +741,79 @@ func signatureText(raw json.RawMessage) string {
 	return sig.Label
 }
 
-// codeActions unwraps a codeAction result, keeping only the actions this editor
-// can actually carry out.
+// codeActions unwraps a codeAction result, keeping EVERY action and marking the
+// ones this editor cannot carry out.
 //
 // A server may answer with a Command instead of a CodeAction with edits, and
 // executing a command needs workspace/executeCommand plus whatever the server
-// does on the far side. Offering one we cannot run would be a menu entry that
-// silently does nothing, so those are dropped here rather than surfaced.
+// does on the far side. Dropping those made "the server offered nothing" and
+// "the server offered something we cannot run" indistinguishable, so they are
+// listed with Unavailable set and the UI says why when one is chosen.
+// Runnable actions come first, in server order, then the unavailable ones.
 func codeActions(raw json.RawMessage) []CodeAction {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
 	}
-	var items []struct {
-		Title string          `json:"title"`
-		Kind  string          `json:"kind"`
-		Edit  json.RawMessage `json:"edit"`
-	}
+	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil
 	}
-	var out []CodeAction
-	for _, it := range items {
-		if it.Title == "" || len(it.Edit) == 0 {
+	var runnable, blocked []CodeAction
+	for _, item := range items {
+		var it struct {
+			Title    string          `json:"title"`
+			Kind     string          `json:"kind"`
+			Edit     json.RawMessage `json:"edit"`
+			Command  json.RawMessage `json:"command"`
+			Disabled *struct {
+				Reason string `json:"reason"`
+			} `json:"disabled"`
+		}
+		if err := json.Unmarshal(item, &it); err != nil || it.Title == "" {
 			continue
 		}
-		edits := workspaceEdits(it.Edit)
-		if len(edits) == 0 {
-			continue
+		act := CodeAction{Title: it.Title, Kind: it.Kind}
+
+		// `command` is a string in a bare Command and an object in a CodeAction;
+		// the two shapes share the key, so it is decoded as raw and probed.
+		if len(it.Command) > 0 && string(it.Command) != "null" {
+			var name string
+			if json.Unmarshal(it.Command, &name) == nil {
+				act.Command = name
+			} else {
+				var obj struct {
+					Command string `json:"command"`
+				}
+				_ = json.Unmarshal(it.Command, &obj)
+				act.Command = obj.Command
+			}
+			if act.Command == "" {
+				act.Command = "(unnamed)"
+			}
 		}
-		out = append(out, CodeAction{Title: it.Title, Kind: it.Kind, Edits: edits})
+
+		if len(it.Edit) > 0 && string(it.Edit) != "null" {
+			edits, unsupported := decodeWorkspaceEdit(it.Edit)
+			act.Edits = edits
+			if unsupported != "" {
+				act.Unavailable = "needs a " + unsupported + ", which this editor cannot perform"
+			} else if len(edits) == 0 {
+				act.Unavailable = "the server sent an empty edit"
+			}
+		} else if act.Command != "" {
+			act.Unavailable = "needs workspace/executeCommand (" + act.Command + "), which this editor does not implement"
+		} else {
+			act.Unavailable = "the server sent neither an edit nor a command"
+		}
+		if it.Disabled != nil {
+			act.Unavailable = "disabled by the server: " + it.Disabled.Reason
+		}
+
+		if act.Unavailable == "" {
+			runnable = append(runnable, act)
+		} else {
+			blocked = append(blocked, act)
+		}
 	}
-	return out
+	return append(runnable, blocked...)
 }

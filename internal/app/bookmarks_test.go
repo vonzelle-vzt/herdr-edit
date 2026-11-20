@@ -7,7 +7,12 @@
 
 package app
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/cloudmanic/spice-edit/internal/editor"
+	"github.com/gdamore/tcell/v2"
+)
 
 // TestBookmark_ToggleIsIdempotent pins that marking the same line twice removes
 // it rather than stacking a duplicate. Without this the list grows every time
@@ -118,5 +123,47 @@ func TestBookmark_Reachable(t *testing.T) {
 	}
 	if found != 3 {
 		t.Errorf("only %d of 3 bookmark rows are in the menu", found)
+	}
+}
+
+// bookmarkNarrowApp opens the debug fixture on a narrow pane. Nerd Font mode is
+// off by construction (newTestApp never sets icons), which is the ASCII-terminal
+// case the glyph has to survive.
+func bookmarkNarrowApp(t *testing.T) (*App, string) {
+	t.Helper()
+	a, path := debugFixture(t)
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(44, 20)
+	a.width, a.height = scr.Size()
+	return a, path
+}
+
+// TestBookmark_GutterGlyphIsDrawn pins that a bookmark reaches the rendered
+// gutter at a narrow width with Nerd Font off, and that an unmarked line stays
+// blank. It reads the SimulationScreen, not the Tab field, so it fails if the
+// app stops feeding the tab before the paint.
+func TestBookmark_GutterGlyphIsDrawn(t *testing.T) {
+	a, path := bookmarkNarrowApp(t)
+	a.bookmarks = []bookmark{{Path: path, Line: 5}}
+	a.draw()
+	a.screen.Show()
+	if got := gutterRuneAt(t, a, 5); got != '▪' {
+		t.Fatalf("bookmarked line gutter = %q, want '▪'", string(got))
+	}
+	if got := gutterRuneAt(t, a, 6); got == '▪' {
+		t.Fatalf("unmarked line shows the bookmark glyph")
+	}
+}
+
+// TestBookmark_BreakpointWinsTheGutter pins the precedence: a line holding both
+// a breakpoint and a bookmark shows the breakpoint dot.
+func TestBookmark_BreakpointWinsTheGutter(t *testing.T) {
+	a, path := bookmarkNarrowApp(t)
+	a.bookmarks = []bookmark{{Path: path, Line: 5}}
+	a.activeTabPtr().SetMark(5, editor.Mark{Kind: editor.MarkBreakpoint, Enabled: true})
+	a.draw()
+	a.screen.Show()
+	if got := gutterRuneAt(t, a, 5); got != '●' {
+		t.Fatalf("breakpoint+bookmark gutter = %q, want the breakpoint '●'", string(got))
 	}
 }

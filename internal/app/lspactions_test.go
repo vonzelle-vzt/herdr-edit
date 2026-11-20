@@ -182,3 +182,94 @@ func TestToggleWrapWithNoTab(t *testing.T) {
 		t.Fatalf("status: %q", a.statusMsg)
 	}
 }
+
+// paletteRow finds a command-palette row by label, since the palette derives from menuLayout and is
+// the surface these rows exist to reach. Fails the test when the row is absent.
+func paletteRow(t *testing.T, a *App, label string) paletteCommand {
+	t.Helper()
+	for _, c := range a.paletteCommands() {
+		if c.label == label {
+			return c
+		}
+	}
+	t.Fatalf("no menu/palette row labelled %q", label)
+	return paletteCommand{}
+}
+
+// TestHoverDefinitionRowsEnabledStates pins the states the rows must tell apart: no tab, a file whose
+// language has no server (plain text), a Go file with no manager, and a real LSP file with a manager.
+// A row that is always enabled would let the palette fire a request that can only flash "No language
+// server".
+func TestHoverDefinitionRowsEnabledStates(t *testing.T) {
+	dir := t.TempDir()
+	goFile := filepath.Join(dir, "a.go")
+	txtFile := filepath.Join(dir, "a.txt")
+	for _, p := range []string{goFile, txtFile} {
+		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := newTestApp(t, dir)
+
+	for _, label := range []string{"Show hover info", "Go to definition"} {
+		row := paletteRow(t, a, label)
+		a.tabs, a.activeTab, a.lsp = nil, 0, lsp.NewManager(dir)
+		if row.enabled(a) {
+			t.Errorf("%s enabled with no tab", label)
+		}
+		a.openFile(txtFile)
+		if row.enabled(a) {
+			t.Errorf("%s enabled on a plain-text file", label)
+		}
+		a.openFile(goFile)
+		if !row.enabled(a) {
+			t.Errorf("%s disabled on a Go file with a manager", label)
+		}
+		a.lsp.Stop()
+		a.lsp = nil
+		if row.enabled(a) {
+			t.Errorf("%s enabled with no manager", label)
+		}
+	}
+}
+
+// TestHoverDefinitionRowsRunTheLeaderActions pins that the rows are the same actions the leader keys
+// run, with their shortcut shown, so the menu cannot drift from Esc h / Esc d.
+func TestHoverDefinitionRowsRunTheLeaderActions(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	for label, key := range map[string]string{"Show hover info": "Esc h", "Go to definition": "Esc d"} {
+		row := paletteRow(t, a, label)
+		if row.shortcut != key {
+			t.Errorf("%s shortcut = %q, want %q", label, row.shortcut, key)
+		}
+		a.statusMsg = ""
+		row.action(a)
+		if !strings.Contains(a.statusMsg, "No language server") {
+			t.Errorf("%s did not run its action: %q", label, a.statusMsg)
+		}
+	}
+}
+
+// TestWrapRowLabelFollowsTabState pins the labelFor hook and the enabled predicate: disabled with no
+// tab, "Enable" while wrap is off, "Disable" once the row itself has turned it on.
+func TestWrapRowLabelFollowsTabState(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "w.txt")
+	if err := os.WriteFile(f, []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestApp(t, dir)
+	if paletteRow(t, a, "Enable word wrap").enabled(a) {
+		t.Fatal("wrap row enabled with no tab")
+	}
+	a.openFile(f)
+	row := paletteRow(t, a, "Enable word wrap")
+	if !row.enabled(a) {
+		t.Fatal("wrap row disabled with a text tab open")
+	}
+	row.action(a)
+	if !a.activeTabPtr().Wrap {
+		t.Fatal("row did not toggle wrap")
+	}
+	paletteRow(t, a, "Disable word wrap")
+}

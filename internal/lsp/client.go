@@ -1,8 +1,8 @@
 // =============================================================================
 // File: internal/lsp/client.go
-// Author: Spicer Matthews <spicer@cloudmanic.com>
+// Author: Vonzelle Brown
 // Created: 2026-07-29
-// Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+// Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
 package lsp
@@ -155,10 +155,28 @@ func (c *Client) initialize(ctx context.Context, rootURI string) error {
 				"references":     map[string]interface{}{},
 				"documentSymbol": map[string]interface{}{"hierarchicalDocumentSymbolSupport": true},
 				"signatureHelp":  map[string]interface{}{},
-				"codeAction":     map[string]interface{}{},
+				"codeAction": map[string]interface{}{
+					// Without codeActionLiteralSupport a server may only answer with
+					// bare Commands, which we cannot run. Declaring it is what makes
+					// servers send CodeAction literals carrying an `edit`.
+					"codeActionLiteralSupport": map[string]interface{}{
+						"codeActionKind": map[string]interface{}{
+							"valueSet": []string{
+								"", "quickfix", "refactor", "refactor.extract",
+								"refactor.inline", "refactor.rewrite", "source",
+								"source.organizeImports", "source.fixAll",
+							},
+						},
+					},
+					// An action the server cannot offer right now arrives with a
+					// reason instead of being withheld; we show it as unavailable.
+					"disabledSupport": true,
+				},
 				"rename": map[string]interface{}{
-					// We apply a plain WorkspaceEdit.changes map; we do not
-					// implement prepareRename or documentChanges/versioning.
+					// A WorkspaceEdit is decoded in both wire shapes (`changes` and
+					// `documentChanges`), but file create/rename/delete operations
+					// and versioned edits are not applied, and prepareRename is not
+					// implemented.
 					"prepareSupport": false,
 				},
 				"completion": map[string]interface{}{
@@ -380,7 +398,14 @@ func (c *Client) Rename(ctx context.Context, uri string, pos Position, newName s
 	if err != nil {
 		return nil, err
 	}
-	return workspaceEdits(raw), nil
+	// All or nothing, like code actions. A rename that also moves a file (a Go
+	// package rename, a TS module rename) applied without the move leaves the
+	// project half-renamed and failing to build, so refuse the whole edit.
+	edits, unsupported := decodeWorkspaceEdit(raw)
+	if unsupported != "" {
+		return nil, fmt.Errorf("the server's rename includes an operation this editor cannot apply (%s); nothing was changed", unsupported)
+	}
+	return edits, nil
 }
 
 // DocumentSymbol lists the symbols declared in a file.

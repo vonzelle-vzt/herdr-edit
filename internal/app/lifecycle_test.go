@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+
+	"github.com/cloudmanic/spice-edit/internal/spiceconfig"
 )
 
 // quitEvent flips a.quit on the UI goroutine, which is how a test ends Run
@@ -66,6 +68,12 @@ func TestRunAndCloseLeaveNoGoroutinesBehind(t *testing.T) {
 	}
 	defer func() { registerEditor = origReg }()
 
+	// Inline suggestions ON, against a provider that holds every request open
+	// until its context is cancelled: the debouncer's goroutine is parked
+	// inside a call when quit arrives, and only shutdown can release it.
+	inlineFake := newFakeInlineProvider("", true)
+	stubInline(t, spiceconfig.Inline{Enabled: true}, inlineFake)
+
 	a := newTestApp(t, root)
 	a.openFile(file)
 
@@ -86,6 +94,9 @@ func TestRunAndCloseLeaveNoGoroutinesBehind(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- a.Run() }()
 	_ = a.screen.PostEvent(&tcell.EventKey{})
+	// A typed rune triggers an inline request; quit only once it is in flight.
+	_ = a.screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'x', tcell.ModNone))
+	waitSignal(t, inlineFake.started, 5*time.Second, "the inline request to be in flight")
 	if err := a.screen.PostEvent(&quitEvent{when: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
@@ -102,6 +113,7 @@ func TestRunAndCloseLeaveNoGoroutinesBehind(t *testing.T) {
 	if registered.Load() != 1 || unregistered.Load() != 1 {
 		t.Fatalf("registered=%d unregistered=%d, want 1 and 1", registered.Load(), unregistered.Load())
 	}
+	waitSignal(t, inlineFake.cancelled, 2*time.Second, "shutdown to cancel the in-flight inline request")
 	if n := waitGoroutines(base, 2, 2*time.Second); n > base+2 {
 		buf := make([]byte, 1<<16)
 		t.Fatalf("goroutines after Close = %d, baseline %d\n%s", n, base, buf[:runtime.Stack(buf, true)])
@@ -137,6 +149,7 @@ func TestShutdownStopsEveryTimer(t *testing.T) {
 // ignored and a nil unregister is tolerated: being absent from a peer's list
 // must never stop the editor from running or quitting.
 func TestRegisterEditorFailureDoesNotStopRun(t *testing.T) {
+	stubInline(t, spiceconfig.Inline{}, nil) // beginLifecycle must not read the real config.json
 	orig := registerEditor
 	defer func() { registerEditor = orig }()
 
@@ -152,6 +165,35 @@ func TestRegisterEditorFailureDoesNotStopRun(t *testing.T) {
 			a.beginLifecycle()
 			a.shutdownBackground() // must not panic whatever came back
 		})
+	}
+}
+
+// TestBeginLifecycleStartsInlineEvenWhenRegistryFails pins the ordering inside
+// beginLifecycle: the registry's failure path returns early, and inline
+// suggestions enabled in config.json must still start — and, with them off,
+// must not.
+func TestBeginLifecycleStartsInlineEvenWhenRegistryFails(t *testing.T) {
+	orig := registerEditor
+	registerEditor = func(string) (func(), error) { return nil, errors.New("no registry") }
+	defer func() { registerEditor = orig }()
+
+	stubInline(t, spiceconfig.Inline{Enabled: true}, newFakeInlineProvider("x", false))
+	a := newTestApp(t, t.TempDir())
+	a.beginLifecycle()
+	if a.inline.deb == nil {
+		t.Fatal("a registry failure skipped starting enabled inline suggestions")
+	}
+	a.shutdownBackground()
+	if a.inline.deb != nil {
+		t.Fatal("shutdownBackground left inline suggestions running")
+	}
+
+	stubInline(t, spiceconfig.Inline{}, newFakeInlineProvider("x", false))
+	b := newTestApp(t, t.TempDir())
+	b.beginLifecycle()
+	defer b.shutdownBackground()
+	if b.inline.deb != nil {
+		t.Fatal("beginLifecycle started inline suggestions the config leaves off")
 	}
 }
 

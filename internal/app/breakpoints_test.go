@@ -365,3 +365,95 @@ func TestLogpointMarkShowsTheLogpointGlyph(t *testing.T) {
 		t.Errorf("breakpoints = %+v, want the logpoint with its message", a.breakpoints)
 	}
 }
+
+// TestExportPickerListsOnlyApplicableFormatsDefaultFirst pins that Go breakpoints offer dlv only, a
+// mixed set offers exactly the implied formats in a stable order, and that an unknowable set falls
+// back to all three rather than an empty picker.
+func TestExportPickerListsOnlyApplicableFormatsDefaultFirst(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	goBp := Breakpoint{Path: "/r/a.go", Enabled: true}
+	pyBp := Breakpoint{Path: "/r/a.py", Enabled: true}
+
+	choices, def := a.exportFlavourChoices([]Breakpoint{goBp})
+	if len(choices) != 1 || choices[0] != "dlv" || def != "dlv" {
+		t.Errorf("go-only: choices=%v def=%q", choices, def)
+	}
+	choices, _ = a.exportFlavourChoices([]Breakpoint{pyBp, goBp})
+	if strings.Join(choices, ",") != "dlv,pdb" {
+		t.Errorf("go+py: choices=%v", choices)
+	}
+	choices, _ = a.exportFlavourChoices([]Breakpoint{{Path: "/r/notes.txt", Enabled: true}})
+	if strings.Join(choices, ",") != "dlv,pdb,gdb" {
+		t.Errorf("unknown language should offer all: %v", choices)
+	}
+	// A disabled breakpoint must not widen the picker.
+	choices, _ = a.exportFlavourChoices([]Breakpoint{goBp, {Path: "/r/a.c", Enabled: false}})
+	if strings.Join(choices, ",") != "dlv" {
+		t.Errorf("disabled bp widened the picker: %v", choices)
+	}
+}
+
+// TestExportDefaultIsTheActiveAdaptersFlavour pins the default: a live debugpy session defaults to
+// pdb even when the breakpoints also include Go, and the picker rows put the default first.
+func TestExportDefaultIsTheActiveAdaptersFlavour(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	bps := []Breakpoint{{Path: "/r/a.go", Enabled: true}, {Path: "/r/b.c", Enabled: true}}
+	if _, def := a.exportFlavourChoices(bps); def != "dlv" {
+		t.Errorf("no session: default = %q, want first listed dlv", def)
+	}
+	a.debug = &debugSession{adapter: "debugpy"}
+	choices, def := a.exportFlavourChoices(bps)
+	if def != "pdb" {
+		t.Fatalf("debugpy session default = %q, want pdb", def)
+	}
+	rows := a.exportPickerRows(choices, def)
+	if len(rows) != len(choices) || rows[0].label != "pdb (default)" {
+		t.Errorf("rows = %+v, want pdb (default) first", rows)
+	}
+	a.debug = &debugSession{adapter: "delve"}
+	if _, def = a.exportFlavourChoices(bps); def != "dlv" {
+		t.Errorf("delve session default = %q", def)
+	}
+}
+
+// TestMenuExportOpensThePickerNotAClipboardWrite pins that the menu entry opens the picker (the
+// reachable surface) rather than copying immediately as dlv, and that it refuses with nothing to export.
+func TestMenuExportOpensThePickerNotAClipboardWrite(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	a.menuExportBreakpoints()
+	if a.paletteOpen || !strings.Contains(a.statusMsg, "No enabled breakpoints") {
+		t.Fatalf("empty export: open=%v status=%q", a.paletteOpen, a.statusMsg)
+	}
+	a.breakpoints = []Breakpoint{{Path: "/r/a.go", Line: 2, Enabled: true}}
+	a.menuExportBreakpoints()
+	if !a.paletteOpen || a.paletteTitle != "Export breakpoints as" {
+		t.Fatalf("picker not opened: open=%v title=%q", a.paletteOpen, a.paletteTitle)
+	}
+	if len(a.paletteOverride) != 1 || a.paletteOverride[0].label != "dlv (default)" {
+		t.Fatalf("picker rows = %+v", a.paletteOverride)
+	}
+}
+
+// TestExportLossWarnsOnLogpoints pins the lossy path: a logpoint is exported as a stopping break, and
+// the summary names what was dropped, while a faithful export (conditions included) is plain.
+func TestExportLossWarnsOnLogpoints(t *testing.T) {
+	faithful := []Breakpoint{{Path: "/r/a.go", Enabled: true, Condition: "i == 3"}}
+	if lost := exportLoss(faithful, "dlv"); len(lost) != 0 {
+		t.Fatalf("conditions are expressible; reported lost: %v", lost)
+	}
+	if got := exportSummary("dlv", nil); strings.Contains(got, "dropped") {
+		t.Errorf("faithful summary warns: %q", got)
+	}
+	lossy := []Breakpoint{
+		{Path: "/r/a.go", Enabled: true, LogMessage: "x"},
+		{Path: "/r/a.go", Line: 4, Enabled: true, LogMessage: "y"},
+		{Path: "/r/a.go", Line: 9, Enabled: false, LogMessage: "off"},
+	}
+	lost := exportLoss(lossy, "gdb")
+	if len(lost) != 1 || !strings.Contains(lost[0], "2 logpoint") {
+		t.Fatalf("lost = %v, want 2 enabled logpoints (disabled one skipped)", lost)
+	}
+	if got := exportSummary("gdb", lost); !strings.Contains(got, "dropped") || !strings.Contains(got, "2 logpoint") {
+		t.Errorf("summary = %q", got)
+	}
+}

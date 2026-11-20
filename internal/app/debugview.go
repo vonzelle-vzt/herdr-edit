@@ -164,7 +164,7 @@ func debugMenuGroup() []menuItemDef {
 		{label: "Clear condition / log message", action: (*App).menuClearBreakpointCondition, enabled: (*App).hasConditionableBreakpoint},
 		{label: "List breakpoints", action: (*App).menuListBreakpoints, enabled: (*App).hasBreakpoints},
 		{label: "Clear breakpoints", action: (*App).menuClearBreakpoints, enabled: (*App).hasBreakpoints},
-		{label: "Export breakpoints (dlv)", action: (*App).menuExportBreakpoints, enabled: (*App).hasBreakpoints},
+		{label: "Export breakpoints…", action: (*App).menuExportBreakpoints, enabled: (*App).hasBreakpoints},
 	}
 }
 

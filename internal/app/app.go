@@ -247,6 +247,9 @@ func builtinMenuGroups() [][]menuItemDef {
 			{label: "Go to symbol (outline)", shortcut: "Esc i", action: (*App).menuOutline, enabled: (*App).hasLSPFile},
 			{label: "Go to symbol in workspace", shortcut: "Esc I", action: (*App).menuWorkspaceSymbol, enabled: alwaysTrue},
 			{label: "Fix at cursor", shortcut: "Esc l", action: (*App).menuCodeActions, enabled: (*App).hasLSPFile},
+			{label: "Show hover info", shortcut: "Esc h", action: (*App).menuHover, enabled: (*App).hasLSPServerFile},
+			{label: "Go to definition", shortcut: "Esc d", action: (*App).menuGoToDefinition, enabled: (*App).hasLSPServerFile},
+			{shortcut: "Esc z", action: (*App).menuToggleWrap, enabled: (*App).hasFindable, labelFor: (*App).wrapToggleLabel},
 			{label: "Find references", shortcut: "Esc j", action: (*App).menuFindReferences, enabled: (*App).hasFileTab},
 			{label: "Rename symbol", shortcut: "Esc y", action: (*App).menuRenameSymbol, enabled: (*App).hasFileTab},
 			{label: "Language server status", action: (*App).menuLSPStatus, enabled: alwaysTrue},
@@ -283,6 +286,9 @@ func builtinMenuGroups() [][]menuItemDef {
 		// View toggle
 		{
 			{shortcut: "Esc t", action: (*App).menuToggleSidebar, enabled: alwaysTrue, labelFor: (*App).sidebarToggleLabel, visible: (*App).hasTree},
+			// No leader key: the free lowercase runes are reserved (c, x, v)
+			// or taken, and this is a set-once switch, not a reflex.
+			{label: "Toggle inline suggestions", action: (*App).menuToggleInlineSuggestions, enabled: alwaysTrue, labelFor: (*App).inlineSuggestionsLabel},
 		},
 		// Merge conflicts (fork). Every row is `visible`-gated on the active
 		// tab actually being unmerged according to git, so this whole group —
@@ -628,6 +634,10 @@ type App struct {
 	// completionSource stubs the language server in tests; nil means
 	// a.lsp.Completion (completionFetcher).
 	completionSource completionFunc
+	// inline is AI inline suggestions (ghost text), end to end: settings, the
+	// debouncer while ON, the request in flight and the suggestion on screen.
+	// The zero value is OFF and constructs nothing. See inlinewire.go.
+	inline inlineState
 
 	// Inline git blame — Esc b. Cursor line only, cached per (path, line),
 	// computed off the event loop and delivered as a posted event.
@@ -1573,6 +1583,12 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 	// Every key invalidates any pending automatic completion: a debounce timer
 	// or server answer from before this key describes text that has changed.
 	a.completionGen++
+	// A visible inline suggestion sees every key first. Tab accepts it; any
+	// other key — Esc, the leader, included — dismisses it and carries on
+	// below as if it had never been there (inlinewire.go).
+	if a.inlineKey(ev) {
+		return
+	}
 
 	// Secondary modals own the keyboard while they're up. Each handler
 	// understands Esc (cancel), Enter (submit / activate), and the keys
@@ -1766,6 +1782,7 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 		hadSelection := tab.HasSelection()
 		tab.InsertRune(ev.Rune())
 		a.afterTypedRune(tab, ev.Rune(), hadSelection)
+		a.inlineAfterInsert(tab)
 	}
 }
 
@@ -3040,6 +3057,7 @@ func (a *App) draw() {
 
 	if tab := a.activeTabPtr(); tab != nil {
 		ex, ey, ew, eh := a.editorRect()
+		tab.Bookmarks = a.bookmarkedLines(tab.Path)
 		tab.Render(a.screen, a.theme, ex, ey, ew, eh)
 		// Document highlight draws BEFORE diagnostics: a squiggle under an actual
 		// mistake must always win the eye over a tint that's just saying "this word
@@ -3063,6 +3081,11 @@ func (a *App) draw() {
 	} else {
 		a.drawStartPage()
 	}
+	// Inline suggestion ghost text: after Tab.Render and every other editor
+	// overlay, because it shifts the cells already painted right of the cursor
+	// and must carry their styling with them. Outside the branch above so the
+	// request in flight is still settled when the last tab has just closed.
+	a.drawInline()
 
 	if a.findOpen {
 		a.drawFindBar()

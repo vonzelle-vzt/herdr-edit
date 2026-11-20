@@ -1,8 +1,8 @@
 // =============================================================================
 // File: internal/state/state.go
-// Author: Spicer Matthews <spicer@cloudmanic.com>
+// Author: Vonzelle Brown
 // Created: 2026-07-29
-// Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+// Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
 // Package state publishes what the editor is currently looking at, so tools outside this process

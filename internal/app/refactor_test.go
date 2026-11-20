@@ -68,29 +68,47 @@ func TestApplyWorkspaceEdits_RewritesFiles(t *testing.T) {
 	}
 }
 
-// TestApplyWorkspaceEdits_SkipsMultiLine pins that a multi-line replacement is
-// skipped rather than guessed at. A rename does not produce them, and applying
-// one wrongly corrupts the file irreversibly.
-func TestApplyWorkspaceEdits_SkipsMultiLine(t *testing.T) {
+// TestApplyWorkspaceEdits_AppliesMultiLine pins that a multi-line range is
+// applied. Quick fixes produce them (deleting an import is "start of line N to
+// start of line N+1"), and the old applier skipped them silently, so an action
+// reported success and changed nothing.
+func TestApplyWorkspaceEdits_AppliesMultiLine(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "b.go")
-	original := "one\ntwo\nthree\n"
-	if err := os.WriteFile(f, []byte(original), 0644); err != nil {
+	if err := os.WriteFile(f, []byte("one\ntwo\nthree\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	edits := map[string][]lsp.TextEdit{f: {
-		{Range: lsp.Range{Start: lsp.Position{Line: 0, Character: 0}, End: lsp.Position{Line: 2, Character: 1}}, NewText: "X"},
+		{Range: lsp.Range{Start: lsp.Position{Line: 1, Character: 0}, End: lsp.Position{Line: 2, Character: 0}}},
 	}}
 	_, count, err := applyWorkspaceEdits(edits)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
 	}
-	if count != 0 {
-		t.Fatalf("applied %d multi-line edits, want 0", count)
+	if got, _ := os.ReadFile(f); string(got) != "one\nthree\n" {
+		t.Fatalf("file is %q, want the middle line deleted", got)
 	}
-	got, _ := os.ReadFile(f)
-	if string(got) != original {
-		t.Fatalf("file was modified to %q despite the edit being skipped", got)
+}
+
+// TestApplyWorkspaceEdits_InvalidEditIsAllOrNothing pins that one out-of-range
+// edit rejects the whole WorkspaceEdit, across files, before anything is written.
+func TestApplyWorkspaceEdits_InvalidEditIsAllOrNothing(t *testing.T) {
+	dir := t.TempDir()
+	good, bad := filepath.Join(dir, "a.go"), filepath.Join(dir, "b.go")
+	for _, f := range []string{good, bad} {
+		if err := os.WriteFile(f, []byte("one\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	edits := map[string][]lsp.TextEdit{
+		good: {{Range: lsp.Range{Start: lsp.Position{Line: 0, Character: 0}, End: lsp.Position{Line: 0, Character: 1}}, NewText: "X"}},
+		bad:  {{Range: lsp.Range{Start: lsp.Position{Line: 5, Character: 0}, End: lsp.Position{Line: 5, Character: 1}}, NewText: "X"}},
+	}
+	if _, _, err := applyWorkspaceEdits(edits); err == nil {
+		t.Fatal("an out-of-range edit was accepted")
+	}
+	if got, _ := os.ReadFile(good); string(got) != "one\n" {
+		t.Fatalf("the valid file was written (%q) although another edit was invalid", got)
 	}
 }
 

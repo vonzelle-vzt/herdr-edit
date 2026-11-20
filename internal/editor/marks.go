@@ -150,6 +150,11 @@ func copyMarks(m map[int]Mark) map[int]Mark {
 	return out
 }
 
+// bookmarkGlyph is the gutter glyph for a bookmarked line. Plain BMP Unicode
+// like every other gutter glyph here, so it needs no Nerd Font and has the same
+// ASCII-terminal behaviour as the breakpoint dot.
+const bookmarkGlyph = '▪'
+
 // markGlyph returns the gutter glyph for m.Kind. A disabled breakpoint stays
 // visible as a hollow dot rather than disappearing — the same way VS Code
 // shows you it's there but inert, instead of making it look cleared.
@@ -210,6 +215,14 @@ func (t *Tab) gutterMarker(th theme.Theme, lineIdx int) (r rune, color tcell.Col
 		// Error, matching filetree's gitChangeColor for GitChangeConflict: an
 		// unresolved conflict BLOCKS work and must not read as an ordinary edit.
 		return conflictGlyph, th.Error, true
+	}
+	// A bookmark outranks the git bar but not a breakpoint or a conflict. It is
+	// something the user placed deliberately; the git bar is passive and is
+	// repeated across every changed line. With git last-but-one, bookmarking a
+	// line you just edited, which is the commonest case, would show nothing at all.
+	// Same helper, so the wrapped path gets it for free.
+	if t.Bookmarks[lineIdx] {
+		return bookmarkGlyph, th.Accent, true
 	}
 	if marker, gok := t.GitLines[lineIdx]; gok && marker != GitLineNone {
 		return gitLineMarkerRune(marker), gitLineMarkerColor(th, marker), true

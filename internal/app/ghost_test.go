@@ -8,12 +8,15 @@
 package app
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gdamore/tcell/v2"
 
+	"github.com/cloudmanic/spice-edit/internal/editor"
 	"github.com/cloudmanic/spice-edit/internal/lsp"
+	"github.com/cloudmanic/spice-edit/internal/theme"
 )
 
 // ghostRoute gives the ghost the key first and hands anything it declines to
@@ -58,9 +61,10 @@ func ghostRow(t *testing.T, a *App, g *ghostText) (string, []tcell.SimCell, int)
 	return b.String(), row, ex
 }
 
-// TestGhostTabAccepts is the happy path: Tab inserts the suggestion at the
-// cursor, the key is consumed (so no indent is ALSO inserted), the cursor ends
-// after the inserted text, and a single undo removes the whole suggestion.
+// TestGhostTabAccepts is the happy path: once a frame has shown it, Tab
+// inserts the suggestion at the cursor, the key is consumed (so no indent is
+// ALSO inserted), the cursor ends after the inserted text, and a single undo
+// removes the whole suggestion.
 func TestGhostTabAccepts(t *testing.T) {
 	a := ghostApp(t, "fmt.\n", 0, 4)
 	tab := a.activeTabPtr()
@@ -68,6 +72,7 @@ func TestGhostTabAccepts(t *testing.T) {
 	if !g.offer(tab, g.revision(tab), tab.Cursor, "Println()") {
 		t.Fatal("offer at the cursor was refused")
 	}
+	ghostRow(t, a, &g) // the frame that shows it; Tab accepts only what was drawn
 
 	ghostRoute(a, &g, keyEv(tcell.KeyTab, 0))
 
@@ -86,16 +91,18 @@ func TestGhostTabAccepts(t *testing.T) {
 	}
 }
 
-// TestGhostEscDismisses pins Esc: consumed, buffer untouched, suggestion gone —
-// and afterwards Tab is an ordinary Tab again, not a delayed accept.
+// TestGhostEscDismisses pins Esc: NOT consumed — it is the leader and must
+// still reach handleKey (TestInlineEscLeaderStillWorks has the `Esc s` case) —
+// but the buffer is untouched and the suggestion gone, and afterwards Tab is an
+// ordinary Tab again, not a delayed accept.
 func TestGhostEscDismisses(t *testing.T) {
 	a := ghostApp(t, "fmt.\n", 0, 4)
 	tab := a.activeTabPtr()
 	var g ghostText
 	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
 
-	if !g.handleKey(keyEv(tcell.KeyEsc, 0), tab, false) {
-		t.Fatal("Esc with a visible suggestion must be consumed — it would otherwise start the leader")
+	if g.handleKey(keyEv(tcell.KeyEsc, 0), tab, false) {
+		t.Fatal("Esc with a visible suggestion was consumed — the leader would never see it")
 	}
 	if got := tab.Buffer.Lines[0]; got != "fmt." {
 		t.Fatalf("Esc changed the buffer: %q", got)
@@ -108,6 +115,33 @@ func TestGhostEscDismisses(t *testing.T) {
 	}
 	if strings.Contains(tab.Buffer.Lines[0], "Println") {
 		t.Fatal("a dismissed suggestion was applied")
+	}
+}
+
+// TestGhostUndrawnIsNotAccepted pins the unit half of "Tab accepts what you
+// saw": an offered suggestion that no frame has painted — or whose last frame
+// had it scrolled off screen — is dismissed by Tab, which is then not consumed.
+func TestGhostUndrawnIsNotAccepted(t *testing.T) {
+	a := ghostApp(t, "fmt.\n", 0, 4)
+	tab := a.activeTabPtr()
+	var g ghostText
+	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
+	if g.handleKey(keyEv(tcell.KeyTab, 0), tab, false) || g.active {
+		t.Fatal("Tab accepted, or left behind, a suggestion no frame had drawn")
+	}
+
+	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
+	ghostRow(t, a, &g)
+	if !g.drawn {
+		t.Fatal("a painted suggestion was not recorded as drawn")
+	}
+	ex, ey, ew, _ := a.editorRect()
+	g.draw(a.screen, a.theme, tab, false, ex, ey, ew, 0) // a frame with no room for the cursor line
+	if g.drawn || g.handleKey(keyEv(tcell.KeyTab, 0), tab, false) {
+		t.Fatal("Tab accepted a suggestion the last frame did not show")
+	}
+	if tab.Buffer.Lines[0] != "fmt." {
+		t.Fatalf("an undrawn suggestion reached the buffer: %q", tab.Buffer.Lines[0])
 	}
 }
 
@@ -168,7 +202,9 @@ func TestGhostInvalidatedByNonKeyEdit(t *testing.T) {
 	}
 
 	// The same for a pure cursor move (a mouse click elsewhere) and for a
-	// change of line count elsewhere that leaves the cursor line alone.
+	// change of line count elsewhere that leaves the cursor line alone. The
+	// direct Lines write calls Touch, as CLAUDE.md requires of every such
+	// writer: Buffer.Version is what the revision reads.
 	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
 	tab.MoveCursorTo(posAt(1, 0), false)
 	if g.valid(tab) {
@@ -177,6 +213,7 @@ func TestGhostInvalidatedByNonKeyEdit(t *testing.T) {
 	tab.MoveCursorTo(posAt(0, 5), false)
 	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
 	tab.Buffer.Lines = append(tab.Buffer.Lines, "appended")
+	tab.Buffer.Touch()
 	if g.valid(tab) {
 		t.Fatal("a change in line count left the suggestion valid")
 	}
@@ -387,6 +424,7 @@ func TestGhostInvalidatedByEditToAnotherLine(t *testing.T) {
 	g.offer(tab, g.revision(tab), tab.Cursor, "Println(foo)")
 
 	tab.Buffer.Lines[1] = "renamed := 1"
+	tab.Buffer.Touch() // a direct Lines writer must stamp the edit (CLAUDE.md)
 	if g.valid(tab) {
 		t.Fatal("an edit to another line left the suggestion valid")
 	}
@@ -441,6 +479,7 @@ func TestGhostAnchoredAtRequestTime(t *testing.T) {
 	rev, at := g.revision(tab), tab.Cursor // the request is built here
 
 	tab.Buffer.Lines[1] = "renamed := 1" // off-cursor edit while it is in flight
+	tab.Buffer.Touch()
 
 	if g.offer(tab, rev, at, "Println(foo)") {
 		t.Fatal("a response computed before an edit was offered")
@@ -464,14 +503,14 @@ func TestGhostRevisionSurvivesRevert(t *testing.T) {
 	tab := a.activeTabPtr()
 	var g ghostText
 
-	// Showing, then edit + revert reported through the edit hook, no draw.
+	// Showing, then edit + revert with no draw in between.
 	if !g.offer(tab, g.revision(tab), tab.Cursor, "Println()") {
 		t.Fatal("setup: offer refused")
 	}
 	tab.Buffer.Lines[1] = "foo := 2"
-	g.noteEdit(tab)
+	tab.Buffer.Touch()
 	tab.Buffer.Lines[1] = "foo := 1"
-	g.noteEdit(tab)
+	tab.Buffer.Touch()
 	if g.valid(tab) {
 		t.Fatal("edit-then-revert resurrected the suggestion")
 	}
@@ -479,22 +518,22 @@ func TestGhostRevisionSurvivesRevert(t *testing.T) {
 		t.Fatalf("Tab accepted after edit-then-revert: %q", tab.Buffer.Lines[0])
 	}
 
-	// In flight, then edit + revert observed by draws: the answer is refused.
+	// In flight, then edit + revert with draws between: the answer is refused.
 	rev, at := g.revision(tab), tab.Cursor
 	tab.Buffer.Lines[1] = "foo := 3"
+	tab.Buffer.Touch()
 	ghostRow(t, a, &g)
 	tab.Buffer.Lines[1] = "foo := 1"
+	tab.Buffer.Touch()
 	ghostRow(t, a, &g)
 	if g.offer(tab, rev, at, "Println()") {
 		t.Fatal("an answer computed before edit-then-revert was offered")
 	}
 
-	// Same through the hook alone, with nothing observing in between.
+	// Through the real edit primitives: an insert and its undo.
 	rev = g.revision(tab)
 	tab.InsertString("X")
-	g.noteEdit(tab)
 	tab.Undo()
-	g.noteEdit(tab)
 	if tab.Buffer.Lines[0] != "fmt." || tab.Cursor != at {
 		t.Fatalf("undo did not restore: %q at %+v", tab.Buffer.Lines[0], tab.Cursor)
 	}
@@ -503,9 +542,10 @@ func TestGhostRevisionSurvivesRevert(t *testing.T) {
 	}
 }
 
-// TestGhostRevisionNeverRepeats pins the counter's two invariants: 0 is never
-// a valid revision, and a buffer dropped from the table comes back with a
-// fresh revision rather than its old one.
+// TestGhostRevisionNeverRepeats pins the stamp's two invariants: 0 is never a
+// valid revision (a hand-built Buffer literal has it, and must never take an
+// offer), and a buffer REPLACED by a byte-identical one — a reload from disk —
+// has a new revision, so an answer computed against the old one is refused.
 func TestGhostRevisionNeverRepeats(t *testing.T) {
 	a := ghostApp(t, "fmt.\n", 0, 4)
 	tab := a.activeTabPtr()
@@ -514,43 +554,40 @@ func TestGhostRevisionNeverRepeats(t *testing.T) {
 		t.Fatal("revision 0 was accepted")
 	}
 	old := g.revision(tab)
-	g.revs = nil // as if the table had been dropped at its cap
+	tab.Buffer = editor.NewBuffer(tab.Buffer.String()) // as a silent reload does
 	if g.revision(tab) == old || g.offer(tab, old, tab.Cursor, "X") {
-		t.Fatal("a dropped buffer reused its old revision")
+		t.Fatal("a replaced buffer reused its old revision")
+	}
+	tab.Buffer = &editor.Buffer{Lines: []string{"fmt.", ""}}
+	if g.offer(tab, g.revision(tab), tab.Cursor, "X") {
+		t.Fatal("an unstamped (version 0) buffer took an offer")
 	}
 }
 
-// TestGhostIdleNeverHashes pins the cost model: with no suggestion showing and
-// no request in flight, keys, draws and edits never hash the buffer, so an
-// idle ghost costs nothing proportional to the file's size.
-func TestGhostIdleNeverHashes(t *testing.T) {
+// TestGhostRevisionIsTheBufferStamp pins the cost model: the revision is
+// Buffer.Version, read and never computed, and observing it — offer, valid,
+// draw — never moves it. A hash over the buffer made every frame cost time in
+// proportion to the file (BenchmarkGhostObserve has the numbers).
+func TestGhostRevisionIsTheBufferStamp(t *testing.T) {
 	a := ghostApp(t, "fmt.\nfoo := 1\n", 0, 4)
 	tab := a.activeTabPtr()
 	var g ghostText
-	for i := 0; i < 50; i++ {
+	if got, want := g.revision(tab), tab.Buffer.Version(); got != want || got == 0 {
+		t.Fatalf("revision = %d, want the buffer's version %d (non-zero)", got, want)
+	}
+	if g.revision(nil) != 0 {
+		t.Fatal("a nil tab must have revision 0")
+	}
+	before := tab.Buffer.Version()
+	if !g.offer(tab, g.revision(tab), tab.Cursor, "Println()") {
+		t.Fatal("setup: offer refused")
+	}
+	for i := 0; i < 5; i++ {
 		g.valid(tab)
-		g.handleKey(keyEv(tcell.KeyRune, 'x'), tab, false)
 		ghostRow(t, a, &g)
-		g.noteEdit(tab)
 	}
-	if g.hashes != 0 {
-		t.Fatalf("idle ghost hashed the buffer %d times", g.hashes)
-	}
-
-	rev := g.revision(tab) // a request now watches the buffer
-	tab.Buffer.Lines[1] = "foo := 2"
-	ghostRow(t, a, &g)
-	if g.hashes == 0 {
-		t.Fatal("an in-flight request no longer observes the buffer")
-	}
-	if g.offer(tab, rev, tab.Cursor, "Println()") {
-		t.Fatal("an answer computed before an edit was offered")
-	}
-	before := g.hashes
-	g.valid(tab)
-	g.noteEdit(tab)
-	if g.hashes != before {
-		t.Fatal("offer did not end watching: the idle path hashes again")
+	if tab.Buffer.Version() != before || !g.valid(tab) {
+		t.Fatal("observing the suggestion moved the buffer's stamp or invalidated it")
 	}
 }
 
@@ -579,6 +616,63 @@ func TestGhostPreviewMatchesInsert(t *testing.T) {
 	// The editor's renderer draws every non-tab rune as one cell, so it does
 	// not compose the accent or reserve two cells for 世 in buffer text
 	// either; the ghost reproduces that exactly rather than promising better.
+}
+
+// benchGhostTab builds a tab of n lines with a suggestion showing at the end
+// of line 0, plus a simulation screen and theme to draw it onto.
+func benchGhostTab(b *testing.B, n int) (*editor.Tab, *ghostText, tcell.SimulationScreen, theme.Theme) {
+	b.Helper()
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = "\tfoo := bar(baz, " + strconv.Itoa(i) + ") // a line of ordinary Go"
+	}
+	lines[0] = "fmt."
+	tab := editor.NewSyntheticTab("bench.go", strings.Join(lines, "\n"))
+	tab.Synthetic = false // ghostEligible refuses synthetic tabs; this one stands in for a file
+	tab.MoveCursorTo(posAt(0, 4), false)
+	var g ghostText
+	if !g.offer(tab, g.revision(tab), tab.Cursor, "Println()") {
+		b.Fatal("setup: offer refused")
+	}
+	scr := tcell.NewSimulationScreen("UTF-8")
+	if err := scr.Init(); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(scr.Fini)
+	scr.SetSize(120, 40)
+	return tab, &g, scr, theme.Default()
+}
+
+// BenchmarkGhostObserve measures the check every key and every frame runs
+// while a suggestion is showing. It must cost the same at 10k lines as at 100:
+// the staleness test is a version stamp, not a walk over the buffer.
+func BenchmarkGhostObserve(b *testing.B) {
+	for _, n := range []int{100, 10000} {
+		b.Run("lines="+strconv.Itoa(n), func(b *testing.B) {
+			tab, g, _, _ := benchGhostTab(b, n)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if !g.valid(tab) {
+					b.Fatal("suggestion went stale with nothing edited")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGhostDraw measures one frame of the overlay with a suggestion
+// showing, at two buffer sizes; like Observe it must not grow with the file.
+func BenchmarkGhostDraw(b *testing.B) {
+	for _, n := range []int{100, 10000} {
+		b.Run("lines="+strconv.Itoa(n), func(b *testing.B) {
+			tab, g, scr, th := benchGhostTab(b, n)
+			tab.Render(scr, th, 0, 0, 120, 40)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				g.draw(scr, th, tab, false, 0, 0, 120, 40)
+			}
+		})
+	}
 }
 
 // cellRunes joins every rune of every cell, combining marks included, with

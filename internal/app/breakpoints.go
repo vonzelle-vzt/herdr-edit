@@ -40,6 +40,7 @@ import (
 
 	"github.com/cloudmanic/spice-edit/internal/clipboard"
 	"github.com/cloudmanic/spice-edit/internal/editor"
+	"github.com/cloudmanic/spice-edit/internal/lsp"
 	"github.com/cloudmanic/spice-edit/internal/state"
 )
 
@@ -499,14 +500,168 @@ func (a *App) menuClearBreakpoints() {
 	a.flash(fmt.Sprintf("Cleared %d breakpoint(s)", n))
 }
 
-// menuExportBreakpoints copies every ENABLED breakpoint to the system
-// clipboard as `break file:line` lines ready to paste into dlv, pdb or gdb.
-// Disabled breakpoints are skipped — a script that re-armed something the
-// user deliberately turned off would be a surprise, not a convenience.
+// exportFlavours is the closed set of debugger dialects exportBreakpointScript
+// speaks, in the order the picker lists them.
+var exportFlavours = []string{"dlv", "pdb", "gdb"}
+
+// flavourForLanguage maps an LSP language id to the debugger a user would paste
+// breakpoints into: delve for Go, pdb for Python, gdb for C and C++. Anything
+// else has no flavour, so it contributes nothing to the picker rather than a
+// guess.
+func flavourForLanguage(lang string) string {
+	switch lang {
+	case "go":
+		return "dlv"
+	case "python":
+		return "pdb"
+	case "c", "cpp":
+		return "gdb"
+	}
+	return ""
+}
+
+// flavourForAdapter maps a debug adapter's display name (dap.Adapter.Name, as
+// stored on debugSession.adapter) to its debugger's flavour, or "" for an
+// adapter such as js-debug that has no command-line twin.
+func flavourForAdapter(name string) string {
+	switch name {
+	case "delve":
+		return "dlv"
+	case "debugpy":
+		return "pdb"
+	}
+	return ""
+}
+
+// exportFlavourChoices returns the formats worth offering for bps and which of
+// them is the default.
+//
+// Only APPLICABLE formats are listed: those implied by the languages of the
+// enabled breakpoints, plus the live debug session's own flavour. Offering pdb
+// for a project of Go files is a row that can only be picked by mistake. When
+// nothing implies a flavour (a plain-text or unknown-language breakpoint) all
+// three are offered instead, since an empty picker would be a dead end.
+//
+// The default is the active debug adapter's flavour (delve -> dlv, debugpy ->
+// pdb), then the active tab's language, then the first listed.
+func (a *App) exportFlavourChoices(bps []Breakpoint) (choices []string, def string) {
+	seen := map[string]bool{}
+	for _, bp := range bps {
+		if bp.Enabled {
+			if f := flavourForLanguage(lsp.LanguageID(bp.Path)); f != "" {
+				seen[f] = true
+			}
+		}
+	}
+	session := ""
+	if a.debug != nil {
+		session = flavourForAdapter(a.debug.adapter)
+		if session != "" {
+			seen[session] = true
+		}
+	}
+	for _, f := range exportFlavours {
+		if seen[f] {
+			choices = append(choices, f)
+		}
+	}
+	if len(choices) == 0 {
+		choices = append(choices, exportFlavours...)
+	}
+	def = choices[0]
+	if t := a.activeTabPtr(); t != nil {
+		if f := flavourForLanguage(lsp.LanguageID(t.Path)); f != "" && seen[f] {
+			def = f
+		}
+	}
+	if session != "" {
+		def = session
+	}
+	return choices, def
+}
+
+// exportLoss reports what exporting bps in the given flavour cannot say, as
+// human phrases; empty means the export is faithful.
+//
+// Today that is exactly the logpoint messages: dlv, pdb and gdb all spell a
+// stopping `break`, so a logpoint arrives as a breakpoint that STOPS instead
+// of printing, which is a behaviour change worth a warning rather than a
+// silent downgrade. Conditions are expressible in all three (see
+// exportBreakpointScript), so none are reported; flavour stays a parameter so
+// a dialect that cannot express them has one place to say so.
+func exportLoss(bps []Breakpoint, flavour string) []string {
+	_ = flavour
+	logs := 0
+	for _, bp := range bps {
+		if bp.Enabled && bp.LogMessage != "" {
+			logs++
+		}
+	}
+	if logs == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("%d logpoint message(s) (they will stop instead of logging)", logs)}
+}
+
+// exportSummary is the flash shown after a successful copy: plain when the
+// export was faithful, a warning naming what was dropped when it was lossy.
+func exportSummary(flavour string, lost []string) string {
+	if len(lost) == 0 {
+		return "Copied breakpoints to clipboard as " + flavour + " commands"
+	}
+	return "Copied as " + flavour + " commands, but dropped: " + strings.Join(lost, "; ")
+}
+
+// exportPickerRows builds the picker rows for the given choices, default
+// first so Enter on the freshly opened picker takes it.
+func (a *App) exportPickerRows(choices []string, def string) []paletteCommand {
+	ordered := []string{def}
+	for _, f := range choices {
+		if f != def {
+			ordered = append(ordered, f)
+		}
+	}
+	cmds := make([]paletteCommand, 0, len(ordered))
+	for _, f := range ordered {
+		f := f // capture
+		label := f
+		if f == def {
+			label += " (default)"
+		}
+		cmds = append(cmds, paletteCommand{
+			label:   label,
+			action:  func(app *App) { app.exportBreakpoints(f) },
+			enabled: alwaysTrue,
+		})
+	}
+	return cmds
+}
+
+// menuExportBreakpoints opens a small picker of the applicable export formats
+// (dlv, pdb, gdb), default first. It reuses the palette-as-picker mechanism
+// the debug picker and the breakpoint list use rather than a modal of its own.
 func (a *App) menuExportBreakpoints() {
 	a.closeMenu()
 	bps := a.allBreakpoints()
-	script := exportBreakpointScript(bps, "dlv")
+	if exportBreakpointScript(bps, "dlv") == "" {
+		a.flash("No enabled breakpoints to export")
+		return
+	}
+	choices, def := a.exportFlavourChoices(bps)
+	a.openPaletteWith(a.exportPickerRows(choices, def), "Export breakpoints as")
+}
+
+// exportBreakpoints copies every ENABLED breakpoint to the system clipboard in
+// the given flavour. Disabled breakpoints are skipped — a script that re-armed
+// something the user deliberately turned off would be a surprise, not a
+// convenience.
+//
+// The destination is the clipboard (OSC 52), never a file, so there is nothing
+// to overwrite and no path to ask for. A lossy export still copies — the user
+// asked for it — but the flash names what was dropped.
+func (a *App) exportBreakpoints(flavour string) {
+	bps := a.allBreakpoints()
+	script := exportBreakpointScript(bps, flavour)
 	if script == "" {
 		a.flash("No enabled breakpoints to export")
 		return
@@ -515,7 +670,7 @@ func (a *App) menuExportBreakpoints() {
 		a.flash("Could not copy to clipboard: " + err.Error())
 		return
 	}
-	a.flash("Copied breakpoints to clipboard as dlv commands")
+	a.flash(exportSummary(flavour, exportLoss(bps, flavour)))
 }
 
 // exportBreakpointScript renders bps as debugger commands for the given

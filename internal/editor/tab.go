@@ -180,6 +180,12 @@ type Tab struct {
 	// move, so they're the only callers that renumber this map.
 	Marks map[int]Mark
 
+	// Bookmarks is a RENDER-ONLY set of bookmarked 0-based lines, refreshed by
+	// the app from its own bookmark list just before each paint. It is not
+	// edit-tracked (the app's bookmarks are not either) and gutterMarker gives
+	// it the lowest priority.
+	Bookmarks map[int]bool
+
 	// lastHighlightScrollY / lastHighlightHeight record the viewport Render
 	// last tokenised for. Without them, every redraw (mouse moves included)
 	// would re-tokenise the visible rows even when nothing changed. Render

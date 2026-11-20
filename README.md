@@ -216,7 +216,7 @@ primary surface, because macOS Terminal and tmux frequently swallow right-click.
 | `Esc` `h` | **Hover** — types and docs at the cursor | needs a language server |
 | `Esc` `d` | **Go to definition** | needs a language server |
 | `Esc` `z` | Toggle **word wrap** | per tab, off by default |
-| `Esc` `space` | **Complete at cursor** | LSP autocomplete; explicitly invoked, never as-you-type. `space` mirrors VS Code's Ctrl+Space, and keeps `c` free for the terminal's own clipboard |
+| `Esc` `space` | **Complete at cursor** | LSP autocomplete on demand. The popup also opens by itself as you type (see *What this fork adds*; `completion.auto` turns that off). `space` mirrors VS Code's Ctrl+Space, and keeps `c` free for the terminal's own clipboard |
 | `Esc` `k` | **Command palette** | fuzzy search over every action |
 | `Esc` `g` | **Go to line** | accepts `N` or `N:C` |
 | `Esc` `a` | **Select all** | |
@@ -442,11 +442,27 @@ resolved path is the `.ts` file at the marked line — a stop on the compiled ou
 ```jsonc
 {
   "icons": "auto",                       // "auto" | "on" | "off"
-  "tree": { "respectGitignore": true }   // default true; false restores upstream behaviour
+  "tree": { "respectGitignore": true },  // default true; false restores upstream behaviour
+  "completion": { "auto": true },        // default true; false = the popup only opens on Esc SPACE
+  "inline": {                            // ghost-text suggestions; OFF by default
+    "enabled": false,
+    "provider": "ollama",                // the only provider implemented today
+    "model": "qwen2.5-coder:1.5b",       // required when enabled; no default
+    "url": "",                           // default http://127.0.0.1:11434; must be localhost
+    "allowRemote": false                 // opt-in for a remote endpoint (not implemented yet)
+  }
 }
 ```
 
 Unknown keys are ignored, so the file is safe to grow.
+
+**Inline suggestions** are off unless `inline.enabled` is true. While they are off, no provider is
+constructed and no connection is made. When they are on, a suggestion is requested after you pause
+typing, shown dimmed after the cursor, and accepted with `Tab`. Any other key dismisses it and still
+does what it normally does (so `Esc` stays the leader). Files on the secrets deny-list (`.env`, keys)
+are never sent. The ≡ menu's *Toggle inline suggestions* flips it for the session. A hostname in `url`
+is resolved once when suggestions turn on, which can stall the editor for a few seconds if DNS is slow;
+the default IP-literal URL needs no lookup.
 
 See [`UPSTREAM-README.md`](UPSTREAM-README.md) for custom actions (`actions.json`) and format-on-save
 (`.spiceedit/format.json`) — both inherited unchanged.
@@ -476,6 +492,37 @@ Design notes, since they are easy to get wrong:
 - **Written via temp file + rename**, so a reader never observes a half-written file.
 - **Published from one call site** in the draw loop rather than from each of the ~40 places that
   move the cursor. One polled site cannot miss a case; hand-placed hooks would.
+
+## The handoff contract (panels and vzt-orca-flow → editor)
+
+Everything that drives a running editor from outside goes through files in
+`$XDG_STATE_HOME/spiceedit/`, written by the `herdr-edit` CLI:
+
+| Command | What it does |
+| --- | --- |
+| `herdr-edit --open-at F:L[:C]` | Asks a running editor to jump there (`open-request.json`, guarded by a monotonic `seq`). |
+| `herdr-edit --debug start [FILE[:LINE]] [--config NAME]` | Starts debugging FILE. `--config` runs that launch.json configuration with no picker; a remote start **never** opens the TUI picker, because nobody may be looking at it. |
+| `herdr-edit --debug continue\|next\|stepIn\|stepOut\|pause\|stop` | Drives the session. |
+| `herdr-edit --debug toggle-breakpoint F:L`, `--debug test FILE::NODE` | Breakpoints, and one pytest node under debugpy. |
+| `herdr-edit --debug evaluate --expr E [--frame N] [--context hover\|watch\|repl]` | Evaluates in the paused session and prints JSON in the shape of [`docs/viz-schema-v1.json`](docs/viz-schema-v1.json). `watch`/`repl` can run code, so they need `--allow-side-effects`. |
+| `herdr-edit --debug frames` | The paused frames, as JSON. |
+| `herdr-edit --capabilities` | One JSON object: `capabilitiesSchema`, `version`, `verbs`, `openAt`, `startFile`, `startConfig`, `debugSessionSchema`, `vizSchema`, `liveEditors`. Side-effect free. Gate new consumer features on it, never on a version string. |
+
+**Exit codes.** `0` means the request was **queued** while at least one live editor was registered:
+it is *not* a confirmation that anything opened. `1` means it failed. `3` means it was written but no
+editor was registered; an `--open-at` is picked up by the next editor started, a `--debug` request is
+not.
+
+**Who receives a request.** Requests are a broadcast. Each editor claims only paths inside its own
+root (symlinks resolved on both sides), and that includes a `start` while a session is paused, so a
+start that names a FILE reaches only the editor whose project contains it. A `start` with **no** FILE
+reaches every running editor; consumers should always name the file.
+
+**Liveness.** Each running editor writes `editors/<pid>.json` (`{schema, pid, instance, root, version,
+startedAt, lastBeat}`, mode 0600) and refreshes `lastBeat` on the 10-second tick. An entry counts only
+with a live pid **and** a beat under 60 s old, so a crashed editor whose pid was recycled is not
+believed. `debug-session.json` is likewise re-written while a session is active, so a panel can tell a
+session paused for a minute from one that died.
 
 ---
 

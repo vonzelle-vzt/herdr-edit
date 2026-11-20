@@ -1,14 +1,15 @@
 // =============================================================================
 // File: internal/lsp/convert_test.go
-// Author: Spicer Matthews <spicer@cloudmanic.com>
+// Author: Vonzelle Brown
 // Created: 2026-07-29
-// Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+// Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
 package lsp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -371,21 +372,144 @@ func TestSignatureText_SilentWhenNotInACall(t *testing.T) {
 	}
 }
 
-// TestCodeActions_DropsUnrunnable is the honesty guard. A server may answer with
-// a Command rather than edits, and running one needs workspace/executeCommand
-// which this editor does not implement — offering it would be a menu entry that
-// silently does nothing.
-func TestCodeActions_DropsUnrunnable(t *testing.T) {
+// TestCodeActions_ListsUnrunnableAsUnavailable is the honesty guard. A server may
+// answer with a Command rather than edits, and running one needs
+// workspace/executeCommand, which this editor does not implement. Dropping it made
+// "nothing to fix" and "something we cannot run" look identical, so it is listed
+// with a reason; runnable actions sort first.
+func TestCodeActions_ListsUnrunnableAsUnavailable(t *testing.T) {
 	raw := []byte(`[
+	  {"title":"Command only","kind":"quickfix","command":{"title":"t","command":"do.thing"}},
+	  {"title":"Bare command","command":"bare.cmd"},
 	  {"title":"Has edits","kind":"quickfix","edit":{"changes":{"file:///tmp/a.go":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]}}},
-	  {"title":"Command only","kind":"quickfix","command":{"command":"do.thing"}},
-	  {"title":"Empty edit","kind":"quickfix","edit":{"changes":{}}}]`)
+	  {"title":"Empty edit","kind":"quickfix","edit":{"changes":{}}},
+	  {"title":"Off","kind":"refactor","disabled":{"reason":"not here"},"edit":{"changes":{"file:///tmp/a.go":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]}}},
+	  {"title":"Neither","kind":"quickfix"}]`)
 	got := codeActions(raw)
-	if len(got) != 1 {
-		t.Fatalf("kept %d actions, want only the runnable one: %+v", len(got), got)
+	if len(got) != 6 {
+		t.Fatalf("kept %d actions, want all 6: %+v", len(got), got)
 	}
-	if got[0].Title != "Has edits" {
-		t.Errorf("kept the wrong action: %+v", got[0])
+	if got[0].Title != "Has edits" || got[0].Unavailable != "" {
+		t.Fatalf("the runnable action must come first and be available: %+v", got[0])
+	}
+	want := map[string]string{
+		"Command only": "executeCommand",
+		"Bare command": "bare.cmd",
+		"Empty edit":   "empty edit",
+		"Off":          "not here",
+		"Neither":      "neither",
+	}
+	for _, a := range got[1:] {
+		if !strings.Contains(a.Unavailable, want[a.Title]) {
+			t.Errorf("%q: Unavailable = %q, want it to mention %q", a.Title, a.Unavailable, want[a.Title])
+		}
+	}
+	if got[1].Command == "" && got[2].Command == "" {
+		t.Errorf("command names were not recorded: %+v", got)
+	}
+}
+
+// TestDecodeWorkspaceEdit_DocumentChangesWinsOverChanges pins the spec rule that
+// documentChanges supersedes changes. A server that fills BOTH sends the same
+// edits twice; merging them applied every edit twice and corrupted the file.
+func TestDecodeWorkspaceEdit_DocumentChangesWinsOverChanges(t *testing.T) {
+	raw := []byte(`{
+	  "changes":{"file:///tmp/a.go":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]},
+	  "documentChanges":[{"textDocument":{"uri":"file:///tmp/a.go","version":1},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]}]}`)
+	edits, unsupported := decodeWorkspaceEdit(raw)
+	if unsupported != "" {
+		t.Fatalf("unexpected unsupported: %q", unsupported)
+	}
+	if len(edits["/tmp/a.go"]) != 1 {
+		t.Fatalf("edit decoded %d times, want exactly once: %+v", len(edits["/tmp/a.go"]), edits)
+	}
+}
+
+// TestDecodeWorkspaceEdit_ReportsFileOperations pins that a create/rename/delete
+// entry in documentChanges is REPORTED. A typed decode reads it as an empty text
+// edit and drops it, leaving an action that silently did half its work.
+func TestDecodeWorkspaceEdit_ReportsFileOperations(t *testing.T) {
+	raw := []byte(`{"documentChanges":[
+	  {"kind":"create","uri":"file:///tmp/new.go"},
+	  {"textDocument":{"uri":"file:///tmp/a.go","version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"x"}]}]}`)
+	edits, unsupported := decodeWorkspaceEdit(raw)
+	if !strings.Contains(unsupported, "create") {
+		t.Fatalf("unsupported = %q, want it to name the create operation", unsupported)
+	}
+	if len(edits["/tmp/a.go"]) != 1 {
+		t.Errorf("the text edit beside it was lost: %+v", edits)
+	}
+	acts := codeActions([]byte(`[{"title":"Move","kind":"refactor","edit":` + string(raw) + `}]`))
+	if len(acts) != 1 || !strings.Contains(acts[0].Unavailable, "create") {
+		t.Fatalf("a file-operation action must be unavailable with a reason: %+v", acts)
+	}
+}
+
+// TestApplyTextEdits_MultiLine covers the edit a quick fix that deletes an import
+// actually produces: a range from the start of one line to the start of the next.
+func TestApplyTextEdits_MultiLine(t *testing.T) {
+	text := "import (\n\t\"fmt\"\n\t\"os\"\n)\n"
+	got, err := ApplyTextEdits(text, []TextEdit{
+		{Range: Range{Start: Position{Line: 2, Character: 0}, End: Position{Line: 3, Character: 0}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "import (\n\t\"fmt\"\n)\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	got, err = ApplyTextEdits("one\ntwo\nthree\n", []TextEdit{
+		{Range: Range{Start: Position{Line: 0, Character: 1}, End: Position{Line: 2, Character: 2}}, NewText: "X"},
+	})
+	if err != nil || got != "oXree\n" {
+		t.Fatalf("spanning edit gave %q, %v", got, err)
+	}
+}
+
+// TestApplyTextEdits_RejectsBadRangesAllOrNothing pins validation: out-of-bounds,
+// backwards, overlapping and mid-surrogate ranges are errors, and one bad edit
+// among good ones means nothing is applied.
+func TestApplyTextEdits_RejectsBadRangesAllOrNothing(t *testing.T) {
+	text := "abc\nde\n"
+	good := TextEdit{Range: Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 1}}, NewText: "Z"}
+	bad := map[string]TextEdit{
+		"line past end":   {Range: Range{Start: Position{Line: 9, Character: 0}, End: Position{Line: 9, Character: 0}}},
+		"column past end": {Range: Range{Start: Position{Line: 1, Character: 0}, End: Position{Line: 1, Character: 99}}},
+		"backwards":       {Range: Range{Start: Position{Line: 1, Character: 2}, End: Position{Line: 1, Character: 1}}},
+	}
+	for name, b := range bad {
+		if out, err := ApplyTextEdits(text, []TextEdit{b, good}); err == nil || out != "" {
+			t.Errorf("%s: got (%q, %v), want an error and no output", name, out, err)
+		}
+	}
+	over := []TextEdit{
+		{Range: Range{Start: Position{Line: 0, Character: 1}, End: Position{Line: 0, Character: 3}}, NewText: "a"},
+		{Range: Range{Start: Position{Line: 0, Character: 0}, End: Position{Line: 0, Character: 2}}, NewText: "b"},
+	}
+	if _, err := ApplyTextEdits(text, over); err == nil {
+		t.Error("overlapping edits were accepted")
+	}
+	// An emoji is two UTF-16 units: column 1 lands inside it.
+	if _, err := ApplyTextEdits("\U0001F600x", []TextEdit{{Range: Range{Start: Position{Line: 0, Character: 1}, End: Position{Line: 0, Character: 2}}}}); err == nil {
+		t.Error("a column inside a surrogate pair was accepted")
+	}
+	// ...and column 2 is the boundary after it, the rune index being 1.
+	got, err := ApplyTextEdits("\U0001F600x", []TextEdit{{Range: Range{Start: Position{Line: 0, Character: 2}, End: Position{Line: 0, Character: 3}}, NewText: "y"}})
+	if err != nil || got != "\U0001F600y" {
+		t.Errorf("UTF-16 column after an emoji: got %q, %v", got, err)
+	}
+}
+
+// TestApplyTextEdits_SameStartInsertionsKeepSpecOrder pins the tie rule: two
+// insertions at one point must land in array order. decodeWorkspaceEdit hands
+// edits over descending, and a naive stable sort reversed this pair.
+func TestApplyTextEdits_SameStartInsertionsKeepSpecOrder(t *testing.T) {
+	raw := []byte(`{"changes":{"file:///tmp/t.go":[
+	  {"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":1}},"newText":"1"},
+	  {"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":1}},"newText":"2"}]}}`)
+	got, err := ApplyTextEdits("ab", workspaceEdits(raw)["/tmp/t.go"])
+	if err != nil || got != "a12b" {
+		t.Fatalf("got %q, %v; want a12b", got, err)
 	}
 }
 
@@ -397,4 +521,13 @@ func TestSymbolKindName(t *testing.T) {
 	if SymbolKindName(999) != "" {
 		t.Errorf("unknown kind should be blank, got %q", SymbolKindName(999))
 	}
+}
+
+// workspaceEdits is decodeWorkspaceEdit without the unsupported-operation report,
+// for tests that only look at the edits. Production code never drops that
+// report: rename refuses an edit carrying a file operation, and code actions
+// mark it unavailable.
+func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
+	edits, _ := decodeWorkspaceEdit(raw)
+	return edits
 }

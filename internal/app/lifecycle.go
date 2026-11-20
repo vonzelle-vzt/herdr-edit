@@ -9,8 +9,9 @@
 //
 // Run starts a surprising amount that outlives a single event: the 10s tree
 // ticker, the auto-scroll ticker, three one-shot timers (LSP trailing-edge
-// sync, blame rest, completion debounce), the git refresh job and the blame
-// subprocess. Most are harmless at process exit, but "the process is about to
+// sync, blame rest, completion debounce), the git refresh job, the blame
+// subprocess, and — only when switched on — the inline-suggestion debouncer
+// and its request. Most are harmless at process exit, but "the process is about to
 // exit" is not a contract a test, an embedder or a future in-process restart
 // can lean on. shutdownBackground makes the contract explicit: every timer is
 // stopped, every ticker is told to exit, and the two goroutines that wrap a
@@ -55,6 +56,11 @@ type lifecycle struct {
 // deliberately ignored: being absent from a peer's list must never stop the
 // editor from running.
 func (a *App) beginLifecycle() {
+	// Inline suggestions start here, inside Run, so only a running editor ever
+	// reads their config or builds a provider — and only when config.json
+	// enables them (inlinewire.go). Before the registry, whose early return
+	// below must not skip it.
+	a.startInline()
 	unreg, err := registerEditor(a.rootDir)
 	if err != nil || unreg == nil {
 		return
@@ -94,6 +100,10 @@ func (a *App) shutdownBackground() {
 	a.stopRequestWatch()
 	a.stopAutoScroll()
 	a.cancelCompletionRequest()
+	// Closes the inline-suggestion debouncer: its timer is stopped, a request
+	// in flight is cancelled (the HTTP call itself, not just the wait), and no
+	// later answer can be delivered.
+	a.stopInline()
 	if a.lspWakeTimer != nil {
 		a.lspWakeTimer.Stop()
 		a.lspWakeTimer = nil

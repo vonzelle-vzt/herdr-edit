@@ -1863,18 +1863,26 @@ func TestDrawStatusBar_OmitsBranchWhenEmpty(t *testing.T) {
 // Bumped again by the launch.json picker, which added ONE row to the Debug
 // group ("Choose debug configuration...", 63 -> 64 items, modalHeight 74 -> 75).
 // Still that one group, so again only the last divider moves: 71 -> 72.
+//
+// Bumped by the hover / definition / word-wrap rows, which sit in the editing
+// group above four later dividers: 64 -> 67 items, modalHeight 75 -> 78, and
+// dividers 34/42/48/50/72 -> 37/45/51/53/75.
+//
+// Bumped by "Toggle inline suggestions", ONE row in the View toggle group,
+// above the last two dividers: 67 -> 68 items, modalHeight 78 -> 79, and
+// dividers 53/75 -> 54/76.
 func TestMenuLayout_NoCustomActions(t *testing.T) {
 	a := newTestApp(t, t.TempDir())
 	a.customActions = nil
 	items, dividers, h := a.menuLayout()
 
-	if h != 75 {
-		t.Errorf("modalHeight = %d, want 75", h)
+	if h != 79 {
+		t.Errorf("modalHeight = %d, want 79", h)
 	}
-	if got := len(items); got != 64 {
-		t.Errorf("item count = %d, want 64 built-ins", got)
+	if got := len(items); got != 68 {
+		t.Errorf("item count = %d, want 68 built-ins", got)
 	}
-	wantDiv := []int{2, 6, 10, 34, 42, 48, 50, 72}
+	wantDiv := []int{2, 6, 10, 37, 45, 51, 54, 76}
 	if len(dividers) != len(wantDiv) {
 		t.Fatalf("dividers = %v, want %v", dividers, wantDiv)
 	}
@@ -2035,8 +2043,8 @@ func TestMenuLayout_WithCustomActions(t *testing.T) {
 	}
 	items, _, h := a.menuLayout()
 
-	if h != 78 { // 75 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
-		t.Errorf("modalHeight = %d, want 78", h)
+	if h != 82 { // 79 (see TestMenuLayout_NoCustomActions) + 2 items + 1 divider
+		t.Errorf("modalHeight = %d, want 82", h)
 	}
 	// Custom actions should be the second-to-last and third-to-last
 	// rows, with Quit as the final row.

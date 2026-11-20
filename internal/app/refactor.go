@@ -167,12 +167,18 @@ func (a *App) handleRename(e *renameEvent) {
 	a.flash(fmt.Sprintf("Renamed to %s — %d edit(s) across %d file(s)", e.newName, count, files))
 }
 
-// applyWorkspaceEdits writes every edit to disk, per file, back to front.
+// applyWorkspaceEdits writes a WorkspaceEdit to disk, ALL OR NOTHING. It serves
+// both rename and code actions, so there is one applier and one set of rules.
 //
-// Edits arrive already sorted descending by position (see workspaceEdits), which
-// is what makes this safe without recomputing offsets: changing text length at
-// one position invalidates every position after it, so the only ordering that
-// needs no bookkeeping is last-to-first.
+// Nothing is written until every file has been read and every edit in every file
+// has been validated and applied in memory (lsp.ApplyTextEdits rejects ranges out
+// of bounds, backwards, overlapping or off a UTF-16 boundary). The old shape —
+// skip an edit that does not fit and write the rest — left a half-applied rename
+// or fix with a success message on top. A disk error part-way through the writes
+// themselves rolls the files already written back to their original bytes.
+//
+// Edits arrive sorted descending by position (see lsp.decodeWorkspaceEdit),
+// which is what makes applying them safe without recomputing offsets.
 func applyWorkspaceEdits(edits map[string][]lsp.TextEdit) (files, count int, err error) {
 	paths := make([]string, 0, len(edits))
 	for p := range edits {
@@ -180,34 +186,38 @@ func applyWorkspaceEdits(edits map[string][]lsp.TextEdit) (files, count int, err
 	}
 	sort.Strings(paths)
 
+	type pending struct {
+		path          string
+		before, after []byte
+		mode          os.FileMode
+	}
+	var plan []pending
 	for _, path := range paths {
 		raw, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return files, count, fmt.Errorf("%s: %w", filepath.Base(path), readErr)
+			return 0, 0, fmt.Errorf("%s: %w", filepath.Base(path), readErr)
 		}
-		lines := strings.Split(string(raw), "\n")
-		for _, ed := range edits[path] {
-			l := ed.Range.Start.Line
-			if l < 0 || l >= len(lines) || ed.Range.End.Line != l {
-				// Multi-line replacements are rare for a rename and applying one
-				// wrongly corrupts the file. Skip rather than guess.
-				continue
-			}
-			runes := []rune(lines[l])
-			s := lsp.UTF16ToRuneCol(lines[l], ed.Range.Start.Character)
-			en := lsp.UTF16ToRuneCol(lines[l], ed.Range.End.Character)
-			if s < 0 || en > len(runes) || s > en {
-				continue
-			}
-			lines[l] = string(runes[:s]) + ed.NewText + string(runes[en:])
-			count++
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return 0, 0, fmt.Errorf("%s: %w", filepath.Base(path), statErr)
 		}
-		if writeErr := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644); writeErr != nil {
-			return files, count, fmt.Errorf("%s: %w", filepath.Base(path), writeErr)
+		out, applyErr := lsp.ApplyTextEdits(string(raw), edits[path])
+		if applyErr != nil {
+			return 0, 0, fmt.Errorf("%s: %w (nothing was changed)", filepath.Base(path), applyErr)
 		}
-		files++
+		plan = append(plan, pending{path: path, before: raw, after: []byte(out), mode: info.Mode().Perm()})
+		count += len(edits[path])
 	}
-	return files, count, nil
+
+	for i, pf := range plan {
+		if writeErr := os.WriteFile(pf.path, pf.after, pf.mode); writeErr != nil {
+			for _, done := range plan[:i] {
+				_ = os.WriteFile(done.path, done.before, done.mode)
+			}
+			return 0, 0, fmt.Errorf("%s: %w (earlier files were restored)", filepath.Base(pf.path), writeErr)
+		}
+	}
+	return len(plan), count, nil
 }
 
 // symbolAtCursor returns the identifier under the cursor, for prompts and
