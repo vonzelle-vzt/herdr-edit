@@ -21,7 +21,6 @@ package app
 
 import (
 	"bytes"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -57,7 +56,7 @@ func loadGitStatus(rootDir string) gitStatus {
 	// we're in a git work tree at all (non-zero exit otherwise) and
 	// gives us the absolute path of the repo root, which is the prefix
 	// every porcelain path is reported relative to.
-	topBytes, err := exec.Command("git", "-C", rootDir, "rev-parse", "--show-toplevel").Output()
+	topBytes, err := runGit(rootDir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return gitStatus{}
 	}
@@ -66,7 +65,7 @@ func loadGitStatus(rootDir string) gitStatus {
 		return gitStatus{}
 	}
 
-	out, err := exec.Command("git", "-C", rootDir, "status", "--porcelain").Output()
+	out, err := runGit(rootDir, "status", "--porcelain")
 	if err != nil {
 		// We *are* in a repo (rev-parse succeeded) but couldn't read
 		// status. Mark the result as a repo with no known dirty files
@@ -126,10 +125,10 @@ func loadGitBranch(rootDir string) string {
 	if rootDir == "" {
 		return ""
 	}
-	if out, err := exec.Command("git", "-C", rootDir, "symbolic-ref", "--short", "HEAD").Output(); err == nil {
+	if out, err := runGit(rootDir, "symbolic-ref", "--short", "HEAD"); err == nil {
 		return strings.TrimRight(string(out), "\n\r")
 	}
-	if out, err := exec.Command("git", "-C", rootDir, "rev-parse", "--short", "HEAD").Output(); err == nil {
+	if out, err := runGit(rootDir, "rev-parse", "--short", "HEAD"); err == nil {
 		return strings.TrimRight(string(out), "\n\r")
 	}
 	return ""
@@ -290,7 +289,7 @@ func gitUnmergedPaths(rootDir string) map[string]bool {
 	if rootDir == "" {
 		return nil
 	}
-	topBytes, err := exec.Command("git", "-C", rootDir, "rev-parse", "--show-toplevel").Output()
+	topBytes, err := runGit(rootDir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return nil
 	}
@@ -302,7 +301,7 @@ func gitUnmergedPaths(rootDir string) map[string]bool {
 	// current directory's subtree, and --full-name only changes how the paths
 	// are PRINTED. Rooted at a subdirectory, an editor asking from rootDir
 	// would report no conflict for an open tab that lives above it.
-	out, err := exec.Command("git", "-C", toplevel, "ls-files", "-u", "--full-name", "-z").Output()
+	out, err := runGit(toplevel, "ls-files", "-u", "--full-name", "-z")
 	if err != nil {
 		return nil
 	}
@@ -324,7 +323,7 @@ func loadGitLineChanges(rootDir, path string) map[int]editor.GitLineChange {
 	if rootDir == "" || path == "" {
 		return nil
 	}
-	out, err := exec.Command("git", "-C", rootDir, "diff", "--unified=0", "HEAD", "--", path).Output()
+	out, err := runGit(rootDir, "diff", "--unified=0", "HEAD", "--", path)
 	if err != nil || len(out) == 0 {
 		return nil
 	}
@@ -336,7 +335,7 @@ func loadGitHunkPreview(rootDir, path string, line int) []string {
 	if rootDir == "" || path == "" || line < 0 {
 		return nil
 	}
-	out, err := exec.Command("git", "-C", rootDir, "diff", "--unified=3", "HEAD", "--", path).Output()
+	out, err := runGit(rootDir, "diff", "--unified=3", "HEAD", "--", path)
 	if err != nil || len(out) == 0 {
 		return nil
 	}

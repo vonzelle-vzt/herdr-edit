@@ -205,3 +205,36 @@ func TestFinder_PathsReturnsIndependentCopy(t *testing.T) {
 		t.Fatalf("mutating the returned slice corrupted the cache: %v", fresh)
 	}
 }
+
+// TestFinder_SearchServesOldPathsWhileRebuilding pins the no-blank-flicker rule: the app
+// invalidates the index every refresh tick, and an open finder must keep showing the previous
+// results during the rebuild instead of dropping to "Indexing…". Only a finder that has never
+// built anything returns nil.
+func TestFinder_SearchServesOldPathsWhileRebuilding(t *testing.T) {
+	f := New(t.TempDir())
+	if got := f.Search("", 10); got != nil {
+		t.Fatalf("never-built finder: got %v, want nil", got)
+	}
+	f.SetIndex([]string{"a.go", "b.go"}, true)
+	f.Invalidate()
+	if f.State() != StateIdle {
+		t.Fatalf("state: got %v, want StateIdle", f.State())
+	}
+	if got := f.Search("", 10); len(got) != 2 {
+		t.Fatalf("Search during invalidated rebuild: got %v, want the 2 old paths", got)
+	}
+	if got := f.Search("b", 10); len(got) != 1 || got[0].Path != "b.go" {
+		t.Fatalf("scored Search during rebuild: got %v", got)
+	}
+}
+
+// TestFinder_SetIndexMarksReady pins SetIndex: a precomputed index is served immediately and the
+// state is Ready, with no goroutine and no exec.
+func TestFinder_SetIndexMarksReady(t *testing.T) {
+	f := New(t.TempDir())
+	f.SetIndex([]string{"x.go"}, true)
+	state, total, viaGit := f.Stats()
+	if state != StateReady || total != 1 || !viaGit {
+		t.Fatalf("Stats: got (%v, %d, %v), want (Ready, 1, true)", state, total, viaGit)
+	}
+}

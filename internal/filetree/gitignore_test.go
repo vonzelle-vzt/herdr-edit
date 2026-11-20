@@ -186,3 +186,71 @@ func TestHardcodedHidesStillApply(t *testing.T) {
 		t.Errorf(".git must stay hidden regardless of the git filter, got %v", names(tr))
 	}
 }
+
+// TestSwapIgnoreInstallsChangedSetAndReloadDirsRefilters pins the background-refresh handoff: the
+// directory reload runs against the OLD ignore set (so a brand-new untracked file is not yet
+// visible), SwapIgnore reports that the set changed, and one more ReloadDirs shows it. Surviving
+// nodes keep their identity throughout, which is what keeps expanded folders open.
+func TestSwapIgnoreInstallsChangedSetAndReloadDirsRefilters(t *testing.T) {
+	root := repo(t, "ignored/\n", "keep.go", "ignored/x.go")
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.IgnoringGitignore() {
+		t.Fatal("precondition: the git filter should be active in a repo")
+	}
+	var keep *Node
+	for _, c := range tr.Root.Children {
+		if c.Name == "keep.go" {
+			keep = c
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "fresh.go"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tr.ReloadDirs()
+	if has(names(tr), "fresh.go") {
+		t.Fatal("fresh.go must stay hidden until the new ignore set arrives")
+	}
+
+	out, err := exec.Command("git", "-C", root, "ls-files", "--cached", "--others", "--exclude-standard", "-z").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.SwapIgnore(IgnoreSnapshotFromLsFiles(root, out)) {
+		t.Fatal("SwapIgnore should report a changed set")
+	}
+	tr.ReloadDirs()
+	if !has(names(tr), "fresh.go") {
+		t.Fatalf("fresh.go should appear after the swap, got %v", names(tr))
+	}
+	for _, c := range tr.Root.Children {
+		if c.Name == "keep.go" && c != keep {
+			t.Fatal("ReloadDirs must preserve node identity for surviving entries")
+		}
+	}
+	if tr.SwapIgnore(IgnoreSnapshotFromLsFiles(root, out)) {
+		t.Fatal("an identical set must report no change, so steady state skips the second reload")
+	}
+}
+
+// TestSwapIgnoreIgnoresInactiveSnapshots pins the safe failure mode: a nil snapshot or one built
+// from empty ls-files output (indistinguishable from a git failure) never replaces a working set.
+func TestSwapIgnoreIgnoresInactiveSnapshots(t *testing.T) {
+	root := repo(t, "ignored/\n", "keep.go", "ignored/x.go")
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.SwapIgnore(nil) {
+		t.Fatal("nil snapshot must be a no-op")
+	}
+	if tr.SwapIgnore(IgnoreSnapshotFromLsFiles(root, nil)) {
+		t.Fatal("empty output must not replace the active set")
+	}
+	if !tr.IgnoringGitignore() {
+		t.Fatal("the filter must still be active")
+	}
+}
