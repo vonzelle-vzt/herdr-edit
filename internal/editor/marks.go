@@ -150,6 +150,11 @@ func copyMarks(m map[int]Mark) map[int]Mark {
 	return out
 }
 
+// bookmarkGlyph is the gutter glyph for a bookmarked line. Plain BMP Unicode
+// like every other gutter glyph here, so it needs no Nerd Font and has the same
+// ASCII-terminal behaviour as the breakpoint dot.
+const bookmarkGlyph = '▪'
+
 // markGlyph returns the gutter glyph for m.Kind. A disabled breakpoint stays
 // visible as a hollow dot rather than disappearing — the same way VS Code
 // shows you it's there but inert, instead of making it look cleared.
@@ -213,6 +218,12 @@ func (t *Tab) gutterMarker(th theme.Theme, lineIdx int) (r rune, color tcell.Col
 	}
 	if marker, gok := t.GitLines[lineIdx]; gok && marker != GitLineNone {
 		return gitLineMarkerRune(marker), gitLineMarkerColor(th, marker), true
+	}
+	// Bookmarks come LAST: a bookmark is the user's own navigation aid and the
+	// weakest signal in this cell, so it never hides a breakpoint, a conflict
+	// or a git change. Same helper, so the wrapped path gets it for free.
+	if t.Bookmarks[lineIdx] {
+		return bookmarkGlyph, th.Accent, true
 	}
 	return 0, 0, false
 }

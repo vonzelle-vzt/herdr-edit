@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cloudmanic/spice-edit/internal/theme"
 )
 
 // linesOf builds a buffer with n numbered lines, enough for the shift/drop
@@ -182,5 +184,26 @@ func TestReloadClampsMarksToTheNewLineCount(t *testing.T) {
 	}
 	if m.Verified || m.VerifiedLine != -1 {
 		t.Fatalf("Verified state survived a reload: %+v — it describes the OLD content", m)
+	}
+}
+
+// TestGutterMarker_BookmarkIsLowestPriority pins the full precedence order by
+// calling the shared resolver: bookmark shows alone, and yields to a git bar and
+// to a breakpoint on the same line.
+func TestGutterMarker_BookmarkIsLowestPriority(t *testing.T) {
+	th := theme.Default()
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer(linesOf(4))
+	tab.Bookmarks = map[int]bool{1: true}
+	if r, _, ok := tab.gutterMarker(th, 1); !ok || r != bookmarkGlyph {
+		t.Fatalf("lone bookmark = %q ok=%v, want %q", string(r), ok, string(bookmarkGlyph))
+	}
+	tab.GitLines = map[int]GitLineChange{1: GitLineModified}
+	if r, _, _ := tab.gutterMarker(th, 1); r == bookmarkGlyph {
+		t.Error("bookmark hid a git change bar")
+	}
+	tab.SetMark(1, Mark{Kind: MarkBreakpoint, Enabled: true})
+	if r, _, _ := tab.gutterMarker(th, 1); r != '●' {
+		t.Errorf("breakpoint lost to a bookmark, got %q", string(r))
 	}
 }

@@ -3040,6 +3040,7 @@ func (a *App) draw() {
 
 	if tab := a.activeTabPtr(); tab != nil {
 		ex, ey, ew, eh := a.editorRect()
+		tab.Bookmarks = a.bookmarkedLines(tab.Path)
 		tab.Render(a.screen, a.theme, ex, ey, ew, eh)
 		// Document highlight draws BEFORE diagnostics: a squiggle under an actual
 		// mistake must always win the eye over a tint that's just saying "this word

@@ -723,9 +723,3 @@ func adjustInputScroll(scroll *int, cursor, width int) {
 		*scroll = 0
 	}
 }
-
-// adjustFindScroll keeps the query input's caret visible. Kept as a thin
-// wrapper over adjustInputScroll for the existing callers and tests.
-func (a *App) adjustFindScroll(width int) {
-	adjustInputScroll(&a.findScroll, a.findCursor, width)
-}
