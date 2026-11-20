@@ -187,10 +187,10 @@ func TestReloadClampsMarksToTheNewLineCount(t *testing.T) {
 	}
 }
 
-// TestGutterMarker_BookmarkIsLowestPriority pins the full precedence order by
-// calling the shared resolver: bookmark shows alone, and yields to a git bar and
-// to a breakpoint on the same line.
-func TestGutterMarker_BookmarkIsLowestPriority(t *testing.T) {
+// TestGutterMarker_BookmarkPrecedence pins the order breakpoint > conflict >
+// bookmark > git through the shared resolver. A bookmark must beat the git bar:
+// bookmarking a line you just edited is the commonest case, and it showed nothing.
+func TestGutterMarker_BookmarkPrecedence(t *testing.T) {
 	th := theme.Default()
 	tab, _ := NewTab("")
 	tab.Buffer = NewBuffer(linesOf(4))
@@ -199,9 +199,14 @@ func TestGutterMarker_BookmarkIsLowestPriority(t *testing.T) {
 		t.Fatalf("lone bookmark = %q ok=%v, want %q", string(r), ok, string(bookmarkGlyph))
 	}
 	tab.GitLines = map[int]GitLineChange{1: GitLineModified}
-	if r, _, _ := tab.gutterMarker(th, 1); r == bookmarkGlyph {
-		t.Error("bookmark hid a git change bar")
+	if r, _, _ := tab.gutterMarker(th, 1); r != bookmarkGlyph {
+		t.Errorf("a bookmark on an edited line was hidden by the git bar, got %q", string(r))
 	}
+	tab.Bookmarks = nil
+	if r, _, _ := tab.gutterMarker(th, 1); r == bookmarkGlyph || r == 0 {
+		t.Errorf("with the bookmark gone the git bar must show, got %q", string(r))
+	}
+	tab.Bookmarks = map[int]bool{1: true}
 	tab.SetMark(1, Mark{Kind: MarkBreakpoint, Enabled: true})
 	if r, _, _ := tab.gutterMarker(th, 1); r != '●' {
 		t.Errorf("breakpoint lost to a bookmark, got %q", string(r))

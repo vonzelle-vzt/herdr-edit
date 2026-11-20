@@ -32,6 +32,10 @@ builds:
     ignore:
       - goos: windows
         goarch: arm64
+    # Same flags as the Makefile's GOBUILD_FLAGS, so a local `make build` and a
+    # release binary are built the same way.
+    flags:
+      - -trimpath
     ldflags:
       - -s -w
 

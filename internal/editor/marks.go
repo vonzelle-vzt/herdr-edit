@@ -216,14 +216,16 @@ func (t *Tab) gutterMarker(th theme.Theme, lineIdx int) (r rune, color tcell.Col
 		// unresolved conflict BLOCKS work and must not read as an ordinary edit.
 		return conflictGlyph, th.Error, true
 	}
-	if marker, gok := t.GitLines[lineIdx]; gok && marker != GitLineNone {
-		return gitLineMarkerRune(marker), gitLineMarkerColor(th, marker), true
-	}
-	// Bookmarks come LAST: a bookmark is the user's own navigation aid and the
-	// weakest signal in this cell, so it never hides a breakpoint, a conflict
-	// or a git change. Same helper, so the wrapped path gets it for free.
+	// A bookmark outranks the git bar but not a breakpoint or a conflict. It is
+	// something the user placed deliberately; the git bar is passive and is
+	// repeated across every changed line. With git last-but-one, bookmarking a
+	// line you just edited, which is the commonest case, would show nothing at all.
+	// Same helper, so the wrapped path gets it for free.
 	if t.Bookmarks[lineIdx] {
 		return bookmarkGlyph, th.Accent, true
+	}
+	if marker, gok := t.GitLines[lineIdx]; gok && marker != GitLineNone {
+		return gitLineMarkerRune(marker), gitLineMarkerColor(th, marker), true
 	}
 	return 0, 0, false
 }

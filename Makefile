@@ -8,7 +8,7 @@
 BINARY := herdr-edit
 
 # GOBUILD_FLAGS is the ONE place build flags live, matching .goreleaser.yml:
-# goreleaser passes -trimpath by default and `ldflags: -s -w` explicitly, so a
+# .goreleaser.yml sets `flags: -trimpath` and `ldflags: -s -w` explicitly, so a
 # local build is the same binary shape as a release. build and build-linux both
 # read it, which is what stops the two drifting apart (build used to omit them).
 GOBUILD_FLAGS := -trimpath -ldflags='-s -w'
