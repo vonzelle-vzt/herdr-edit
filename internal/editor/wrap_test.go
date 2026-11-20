@@ -254,6 +254,39 @@ func TestRenderWrappedPaintsContinuationRows(t *testing.T) {
 	}
 }
 
+// TestRenderWrappedFindMatchStylingLandsOnMatchedCells is the Wrap=true twin
+// of the unwrapped find-styling test. The line is narrow enough to wrap, so
+// matches land on continuation rows; the painted cells under the match
+// colours must still spell exactly the matched text, current match loud.
+func TestRenderWrappedFindMatchStylingLandsOnMatchedCells(t *testing.T) {
+	w, h := 16, 12
+	scr := newSimScreen(t, w, h)
+	defer scr.Fini()
+	th := theme.Default()
+
+	tab := wrapTab("alpha foo beta Foo gamma foo delta", "FOO at the end")
+	tab.SetFindQuery("foo")
+	if len(tab.FindMatches) != 4 {
+		t.Fatalf("setup: want 4 matches, got %d", len(tab.FindMatches))
+	}
+	tab.FindIndex = 2 // the lowercase "foo" after gamma
+
+	tab.Render(scr, th, 0, 0, w, h)
+	scr.Show()
+
+	rows := screenRows(scr, w, h)
+	if !strings.Contains(strings.Join(rows, "\n"), "↪") {
+		t.Fatalf("setup: expected the long line to wrap:\n%s", strings.Join(rows, "\n"))
+	}
+	others, current := findHighlightText(scr, w, h, th)
+	if current != "foo" {
+		t.Fatalf("current-match cells spell %q, want %q\n%s", current, "foo", strings.Join(rows, "\n"))
+	}
+	if others != "fooFooFOO" {
+		t.Fatalf("other-match cells spell %q, want %q\n%s", others, "fooFooFOO", strings.Join(rows, "\n"))
+	}
+}
+
 // TestRenderUnwrappedStillClips is the regression guard for the mode that already worked: with Wrap
 // off, the original geometry must be untouched, overflow marker and all.
 func TestRenderUnwrappedStillClips(t *testing.T) {

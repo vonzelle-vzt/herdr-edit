@@ -20,6 +20,7 @@ package editor
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -309,18 +310,22 @@ func (t *Tab) FindPrev() {
 
 // matchAtRune returns the index into FindMatches of the match that
 // covers (line, col), or -1 when none does. The renderer calls this once
-// per visible cell, so the implementation has to stay cheap — a linear
-// scan is fine for realistic file sizes (hundreds of matches at most),
-// and avoids the overhead of building a per-line index. If this ever
-// shows up in a profile, switch to a sorted-by-line bsearch.
+// per painted cell, so it has to stay cheap even with 100k matches (a
+// search for "e" in a large file): a binary search for the first match
+// that ends after (line, col), then one coverage check.
+//
+// This relies on the invariant Matches already guarantees: the list is
+// in document order, single-line and non-overlapping (a hit advances
+// past its own run), so "ends after the cell" is monotonic across it. A
+// linear scan here used to make a frame O(matches x cells).
 func (t *Tab) matchAtRune(line, col int) int {
-	for i, m := range t.FindMatches {
-		if m.Line != line {
-			continue
-		}
-		if col >= m.Col && col < m.Col+m.Width {
-			return i
-		}
+	ms := t.FindMatches
+	i := sort.Search(len(ms), func(i int) bool {
+		m := ms[i]
+		return m.Line > line || (m.Line == line && m.Col+m.Width > col)
+	})
+	if i < len(ms) && ms[i].Line == line && col >= ms[i].Col {
+		return i
 	}
 	return -1
 }
