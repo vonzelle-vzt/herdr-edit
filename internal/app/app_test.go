@@ -2774,3 +2774,24 @@ func TestMenuScroll_KeyboardKeepsSelectionVisible(t *testing.T) {
 		}
 	}
 }
+
+// probeApplyEvent records that handleEvent dispatched it through the
+// selfApplyingEvent seam.
+type probeApplyEvent struct{ applied *bool }
+
+// When satisfies tcell.Event.
+func (e *probeApplyEvent) When() time.Time { return time.Time{} }
+
+// apply marks the probe as dispatched.
+func (e *probeApplyEvent) apply(a *App) { *e.applied = true }
+
+// TestHandleEventDispatchesSelfApplyingEvents pins the seam background
+// features use to reach the main loop without editing handleEvent's switch.
+func TestHandleEventDispatchesSelfApplyingEvents(t *testing.T) {
+	applied := false
+	a := &App{}
+	a.handleEvent(&probeApplyEvent{applied: &applied})
+	if !applied {
+		t.Fatal("handleEvent did not dispatch a selfApplyingEvent")
+	}
+}

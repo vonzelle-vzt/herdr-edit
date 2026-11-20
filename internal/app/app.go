@@ -1155,7 +1155,18 @@ func (a *App) handleEvent(ev tcell.Event) {
 		}
 	case *searchResultsEvent:
 		a.handleSearchResults(e)
+	case selfApplyingEvent:
+		e.apply(a)
 	}
+}
+
+// selfApplyingEvent is a posted event that knows how to apply itself to the
+// App on the main loop. New background-work events implement it in their own
+// file instead of adding another case above, so parallel features do not all
+// edit this one switch. apply runs on the UI goroutine, like every case here.
+type selfApplyingEvent interface {
+	tcell.Event
+	apply(a *App)
 }
 
 // refreshTreeNow re-runs the same refresh pipeline the 10s timer
