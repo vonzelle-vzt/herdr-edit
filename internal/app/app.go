@@ -641,6 +641,8 @@ type App struct {
 	docHighlightScrollY   int
 	docHighlightHeight    int
 	docHighlightVersion   uint64
+
+	blame *blameScheduler // inline-blame debounce + single-flight; see blame.go
 	docHighlightMatches   []editor.Match
 
 	// Highest open-request sequence already honoured. See consumeOpenRequest.

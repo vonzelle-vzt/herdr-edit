@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -95,17 +94,13 @@ type blameScheduler struct {
 	post  func(ev tcell.Event) // nil means App.post
 }
 
-// blameSchedulers maps each App to its scheduler.
-var blameSchedulers sync.Map
-
 // blameSched returns the App's scheduler, creating it with the real runner and
-// delay on first use.
+// delay on first use. Only the UI goroutine calls it, so no locking.
 func (a *App) blameSched() *blameScheduler {
-	if v, ok := blameSchedulers.Load(a); ok {
-		return v.(*blameScheduler)
+	if a.blame == nil {
+		a.blame = &blameScheduler{run: runGitBlameLine, delay: blameRestDelay}
 	}
-	v, _ := blameSchedulers.LoadOrStore(a, &blameScheduler{run: runGitBlameLine, delay: blameRestDelay})
-	return v.(*blameScheduler)
+	return a.blame
 }
 
 // cancel invalidates any armed timer so it can no longer act, and forgets the
