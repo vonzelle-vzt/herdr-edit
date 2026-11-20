@@ -1,8 +1,8 @@
 // =============================================================================
 // File: internal/lsp/protocol.go
-// Author: Spicer Matthews <spicer@cloudmanic.com>
+// Author: Vonzelle Brown
 // Created: 2026-07-29
-// Copyright: 2026 Cloudmanic, LLC. All rights reserved.
+// Copyright: 2026 Vonzelle Brown. All rights reserved.
 // =============================================================================
 
 // Package lsp is a minimal Language Server Protocol client: enough to get
