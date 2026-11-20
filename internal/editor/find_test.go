@@ -515,3 +515,44 @@ func TestMatchAtRune_HitAndMiss(t *testing.T) {
 		t.Fatalf("col 9 should be inside match 1, got %d", got)
 	}
 }
+
+// TestMatchAtRune_AgreesWithBruteForce checks the binary-search probe against
+// an obviously-correct linear scan over every cell of a multi-line buffer,
+// including cells past each line's end, lines with no hits, and a regex
+// query with variable-width matches. The scan below is the old
+// implementation, kept here as the oracle.
+func TestMatchAtRune_AgreesWithBruteForce(t *testing.T) {
+	brute := func(tab *Tab, line, col int) int {
+		for i, m := range tab.FindMatches {
+			if m.Line == line && col >= m.Col && col < m.Col+m.Width {
+				return i
+			}
+		}
+		return -1
+	}
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("eee e\n\nxyz\nsee the tree\n  e\naaaa")
+	for _, q := range []string{"e", "ee", "a", "zzz"} {
+		tab.SetFindQuery(q)
+		for line := -1; line <= len(tab.Buffer.Lines); line++ {
+			for col := -1; col < 30; col++ {
+				if got, want := tab.matchAtRune(line, col), brute(tab, line, col); got != want {
+					t.Fatalf("query %q cell (%d,%d): matchAtRune=%d brute=%d", q, line, col, got, want)
+				}
+			}
+		}
+	}
+	tab.SetFindOptions(false, false, true)
+	tab.SetFindQuery("e+")
+	for line := 0; line < len(tab.Buffer.Lines); line++ {
+		for col := 0; col < 30; col++ {
+			if got, want := tab.matchAtRune(line, col), brute(tab, line, col); got != want {
+				t.Fatalf("regex cell (%d,%d): matchAtRune=%d brute=%d", line, col, got, want)
+			}
+		}
+	}
+	tab.ClearFind()
+	if got := tab.matchAtRune(0, 0); got != -1 {
+		t.Fatalf("no matches should always miss, got %d", got)
+	}
+}
