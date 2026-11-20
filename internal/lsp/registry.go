@@ -33,6 +33,7 @@ type Manager struct {
 	clients map[string]*Client // language id -> client
 	failed  map[string]bool    // do not retry a server that already failed to start
 	docs    map[string]string  // uri -> language id, so DidClose reaches the right server
+	stopped bool               // set by Stop: a launch finishing afterwards must not register
 
 	// OnDiagnostics and OnLog are forwarded from every managed client. Called
 	// from background goroutines: the app must marshal to its event loop.
@@ -115,6 +116,10 @@ func NewManager(root string) *Manager {
 	}
 }
 
+// startClient launches a server. A variable so a test can hold a launch open
+// across Manager.Stop and prove the late client is not orphaned.
+var startClient = Start
+
 // serverFor finds the table entry handling a language.
 func serverFor(lang string) (Server, bool) {
 	for _, s := range DefaultServers {
@@ -176,6 +181,10 @@ func (m *Manager) clientFor(ctx context.Context, lang string) *Client {
 	}
 
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return nil
+	}
 	if c, ok := m.clients[s.Name]; ok {
 		m.mu.Unlock()
 		return c
@@ -194,7 +203,7 @@ func (m *Manager) clientFor(ctx context.Context, lang string) *Client {
 		return nil
 	}
 
-	c, err := Start(ctx, s.Name, argv, URI(m.root))
+	c, err := startClient(ctx, s.Name, argv, URI(m.root))
 	if err != nil {
 		m.mu.Lock()
 		m.failed[s.Name] = true
@@ -208,6 +217,12 @@ func (m *Manager) clientFor(ctx context.Context, lang string) *Client {
 	c.OnLog = m.OnLog
 
 	m.mu.Lock()
+	if m.stopped {
+		// Quit raced the launch: nobody would ever stop this server.
+		m.mu.Unlock()
+		c.Stop()
+		return nil
+	}
 	// Another goroutine may have won the race while we were starting; keep the
 	// winner and shut ours down rather than leaking a second server.
 	if existing, ok := m.clients[s.Name]; ok {
@@ -399,6 +414,7 @@ func (m *Manager) Stop() {
 		clients = append(clients, c)
 	}
 	m.clients = make(map[string]*Client)
+	m.stopped = true
 	m.mu.Unlock()
 
 	var wg sync.WaitGroup

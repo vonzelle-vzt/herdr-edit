@@ -2774,3 +2774,41 @@ func TestMenuScroll_KeyboardKeepsSelectionVisible(t *testing.T) {
 		}
 	}
 }
+
+// probeApplyEvent records that handleEvent dispatched it through the
+// selfApplyingEvent seam.
+type probeApplyEvent struct{ applied *bool }
+
+// When satisfies tcell.Event.
+func (e *probeApplyEvent) When() time.Time { return time.Time{} }
+
+// apply marks the probe as dispatched.
+func (e *probeApplyEvent) apply(a *App) { *e.applied = true }
+
+// TestHandleEventDispatchesSelfApplyingEvents pins the seam background
+// features use to reach the main loop without editing handleEvent's switch.
+func TestHandleEventDispatchesSelfApplyingEvents(t *testing.T) {
+	applied := false
+	a := &App{}
+	a.handleEvent(&probeApplyEvent{applied: &applied})
+	if !applied {
+		t.Fatal("handleEvent did not dispatch a selfApplyingEvent")
+	}
+}
+
+// TestMain points the whole package at a throwaway state directory. Run
+// registers the editor in the liveness registry and publishes active.json;
+// without this a test that drives Run would announce a phantom editor in the
+// developer's real ~/.local/state, and a real CLI would then report a request
+// as queued for an editor that does not exist.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "herdr-edit-app-state-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Setenv("XDG_STATE_HOME", dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}

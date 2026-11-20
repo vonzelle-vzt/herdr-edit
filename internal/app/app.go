@@ -416,10 +416,12 @@ type App struct {
 
 	// lsp owns the language servers for this project; diagnostics is the latest published set
 	// per absolute path. Both nil when no server is available, which every call site tolerates.
-	lsp         *lsp.Manager
-	diagnostics map[string][]lsp.Diagnostic
-	lspSentText map[string]string // last text each document was sent with, to skip no-op syncs
-	lspSyncedAt time.Time
+	lsp            *lsp.Manager
+	diagnostics    map[string][]lsp.Diagnostic
+	lspSentVersion map[string]uint64 // Buffer.Version each document was last synced at, to skip no-op syncs
+	lspWakeArmed   bool              // a trailing-edge sync wake is scheduled (lspsync.go)
+	lspWakeTimer   *time.Timer       // the armed wake, kept so shutdown can stop it (lifecycle.go)
+	lspSyncedAt    time.Time
 
 	// startRows maps start-page rows back to files so a click can open them. Rebuilt each draw.
 	startRows []startRow
@@ -572,6 +574,8 @@ type App struct {
 
 	// treeRefreshStop signals the background tree-refresh goroutine to exit.
 	treeRefreshStop chan struct{}
+	// refresh is the bookkeeping for the background git half of the 10s refresh (refresh.go).
+	refresh refreshState
 
 	// gitBranch is the current branch name for the project root (or a
 	// short commit SHA when HEAD is detached). Empty when the root isn't
@@ -614,6 +618,10 @@ type App struct {
 	// carrying an older value is dropped.
 	completionGen    uint64
 	completionCancel context.CancelFunc
+	// completionTimer is the armed debounce, kept so shutdown can stop it (lifecycle.go).
+	completionTimer *time.Timer
+	// life is shutdown bookkeeping: liveness registration and tracked subprocess jobs (lifecycle.go).
+	life lifecycle
 	// completionAutoOff is config.json's completion.auto=false, inverted so the
 	// zero value (and every test App) keeps the default ON.
 	completionAutoOff bool
@@ -633,12 +641,14 @@ type App struct {
 	// every event including bare mouse motion, and an uncached scan on each
 	// of those would be a stall the user reads as the editor hanging. See
 	// dochighlight.go.
-	docHighlightPath      string
-	docHighlightSym       string
-	docHighlightScrollY   int
-	docHighlightHeight    int
-	docHighlightLineCount int
-	docHighlightMatches   []editor.Match
+	docHighlightPath    string
+	docHighlightSym     string
+	docHighlightScrollY int
+	docHighlightHeight  int
+	docHighlightVersion uint64
+
+	blame               *blameScheduler // inline-blame debounce + single-flight; see blame.go
+	docHighlightMatches []editor.Match
 
 	// Highest open-request sequence already honoured. See consumeOpenRequest.
 	lastOpenSeq int64
@@ -906,10 +916,20 @@ func (a *App) refreshGitStatus() {
 	a.refreshGitLineChanges()
 }
 
-// refreshGitLineChanges refreshes git state for every open text tab.
+// refreshGitLineChanges refreshes git state for every open text tab. The
+// repo-wide unmerged set is identical for every tab, so it is computed once
+// here and handed to each, not re-run per tab.
 func (a *App) refreshGitLineChanges() {
+	var unmerged map[string]bool
+	computed := false
 	for _, tab := range a.tabs {
-		a.refreshTabGitState(tab)
+		if !tabHasGitState(tab) {
+			continue
+		}
+		if !computed {
+			unmerged, computed = gitUnmergedPaths(a.rootDir), true
+		}
+		a.refreshTabGitStateWith(tab, unmerged)
 	}
 }
 
@@ -925,16 +945,42 @@ func (a *App) refreshGitLineChanges() {
 //
 // Deliberately not called for image or synthetic tabs — neither has a path git
 // has an opinion about.
+//
+// The unmerged set is repo-wide, so loops over many tabs (and the background
+// refresh) compute it once and call refreshTabGitStateWith / installTabGitState
+// instead of paying for it per tab. installTabGitState is still the ONE place
+// that assigns the two facts.
 func (a *App) refreshTabGitState(t *editor.Tab) {
-	if t == nil || t.Path == "" || t.IsImage() || t.Synthetic {
+	if !tabHasGitState(t) {
 		return
 	}
-	t.GitLines = loadGitLineChanges(a.rootDir, t.Path)
+	a.refreshTabGitStateWith(t, gitUnmergedPaths(a.rootDir))
+}
+
+// refreshTabGitStateWith is refreshTabGitState for a caller that already holds
+// the repo's unmerged set: it loads this tab's line changes and installs both.
+func (a *App) refreshTabGitStateWith(t *editor.Tab, unmerged map[string]bool) {
+	if !tabHasGitState(t) {
+		return
+	}
+	a.installTabGitState(t, loadGitLineChanges(a.rootDir, t.Path), unmerged)
+}
+
+// tabHasGitState reports whether git has an opinion about this tab at all.
+func tabHasGitState(t *editor.Tab) bool {
+	return t != nil && t.Path != "" && !t.IsImage() && !t.Synthetic
+}
+
+// installTabGitState is the single assignment site for a tab's git facts: the
+// line change bars and the unmerged flag, kept in step, then the conflict rescan.
+// Both the synchronous callers and the background refresh's apply end here.
+func (a *App) installTabGitState(t *editor.Tab, lines map[int]editor.GitLineChange, unmerged map[string]bool) {
+	t.GitLines = lines
 	// 🔴 git is the authority on WHETHER; the scanner only says WHERE. Without
 	// this line any file containing a well-formed marker sequence — a test
 	// fixture, a merge-tool README, this editor's own conflict_test.go — would
 	// light up as conflicted in a perfectly clean checkout.
-	t.GitUnmerged = gitUnmergedPaths(a.rootDir)[t.Path]
+	t.GitUnmerged = unmerged[t.Path]
 	t.RescanConflicts()
 }
 
@@ -971,8 +1017,10 @@ func (a *App) stopTreeRefresh() {
 
 // Close releases the terminal back to the user. Always call this before exit.
 func (a *App) Close() {
-	a.stopTreeRefresh()
-	a.stopAutoScroll()
+	a.shutdownBackground()
+	if a.lsp != nil {
+		a.lsp.Stop() // idempotent; covers a Run that never reached its own exit path
+	}
 	if a.screen != nil {
 		a.screen.Fini()
 	}
@@ -982,6 +1030,8 @@ func (a *App) Close() {
 // each event, redraws, and exits when a.quit is set.
 func (a *App) Run() error {
 	a.width, a.height = a.screen.Size()
+	a.beginLifecycle()
+	a.startRequestWatch()
 	a.startLSP()
 	if tab := a.activeTabPtr(); tab != nil {
 		a.lspDidOpen(tab.Path, tab.Buffer.String())
@@ -1021,6 +1071,7 @@ func (a *App) Run() error {
 	// adapter does not advertise a terminate request, so this is what actually
 	// kills it. See debug.go / dap.Client.Disconnect.
 	a.stopDebugSession()
+	a.shutdownBackground() // withdraw from the liveness registry before the slower LSP stop
 	if a.lsp != nil {
 		a.lsp.Stop()
 	}
@@ -1102,6 +1153,9 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleAutoScroll()
 	case *treeRefreshEvent:
 		a.refreshTreeNow()
+		// The registry heartbeat rides the same 10s tick: an entry whose beat
+		// is older than state.EditorStaleAfter stops counting as a live editor.
+		_ = beatEditor()
 	case *lspHoverEvent:
 		a.handleLSPHover(e)
 	case *lspJumpEvent:
@@ -1155,21 +1209,36 @@ func (a *App) handleEvent(ev tcell.Event) {
 		}
 	case *searchResultsEvent:
 		a.handleSearchResults(e)
+	case selfApplyingEvent:
+		e.apply(a)
 	}
+}
+
+// selfApplyingEvent is a posted event that knows how to apply itself to the
+// App on the main loop. New background-work events implement it in their own
+// file instead of adding another case above, so parallel features do not all
+// edit this one switch. apply runs on the UI goroutine, like every case here.
+type selfApplyingEvent interface {
+	tcell.Event
+	apply(a *App)
 }
 
 // refreshTreeNow re-runs the same refresh pipeline the 10s timer
 // fires: rescan the file tree (preserving expansion state), reconcile
-// any open tabs with disk, refresh git status, and invalidate the
-// finder index so a freshly-pulled file shows up everywhere at once.
-// Called from the periodic event and from runCustomAction's success
-// path so a Copy-from-remote action's output is visible immediately
-// instead of after the next tick.
+// any open tabs with disk, then refresh git status, per-tab git state
+// and the finder index. Called from the periodic event and from
+// runCustomAction's success path so a Copy-from-remote action's output
+// is visible immediately instead of after the next tick.
+//
+// Only the cheap local half (directory reload, mtime stats) runs here on
+// the UI goroutine. Everything that forks git runs in the background and
+// lands as one event (see refresh.go), so a slow repo cannot freeze input.
 func (a *App) refreshTreeNow() {
-	a.refreshTree()
+	if a.tree != nil {
+		a.tree.ReloadDirs()
+	}
 	a.reconcileOpenTabsWithDisk()
-	a.refreshGitStatus()
-	a.invalidateFinder()
+	a.startGitRefresh()
 }
 
 // handleCustomActionDone surfaces the result of an async custom-action

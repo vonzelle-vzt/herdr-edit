@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/chroma/v2"
 	"github.com/gdamore/tcell/v2"
 
 	"github.com/cloudmanic/spice-edit/internal/langconf"
@@ -187,6 +188,26 @@ type Tab struct {
 	// number and only carries the visible rows.
 	lastHighlightScrollY int
 	lastHighlightHeight  int
+
+	// Highlight caches, owned by refreshStyles (highlight.go). hlLexer is the
+	// coalesced lexer resolved for hlLexerKey (the HighlightKey it was matched
+	// against). hlLead is the lexed lead window [hlLeadStart, hlLeadEnd) that
+	// the viewport rows are sliced from, valid for hlKey / hlTheme / hlLines;
+	// a pure scroll inside it re-slices instead of re-lexing. hlFillStart/End
+	// are the Styles rows last populated, so they can be cleared without
+	// reallocating the outer slice. hlRuns counts tokenisations (test hook).
+	hlLexer     chroma.Lexer
+	hlLexerKey  string
+	hlLead      [][]tcell.Style
+	hlLeadStart int
+	hlLeadEnd   int
+	hlKey       string
+	hlTheme     theme.Theme
+	hlLines     int
+	hlValid     bool
+	hlFillStart int
+	hlFillEnd   int
+	hlRuns      int
 
 	// lastWrapContentW is the content width Render last drew at. Scroll and the app's wheel handler
 	// have no rect, and wrapped scrolling needs one to know how many rows a line occupies.
@@ -907,12 +928,7 @@ func (t *Tab) Render(scr tcell.Screen, th theme.Theme, x, y, w, h int) {
 	// moves, would re-tokenise the visible rows for nothing. The grid is
 	// indexed by absolute line number and only carries the visible rows, so
 	// a scroll change means different rows must be filled.
-	if t.StyleStale || t.ScrollY != t.lastHighlightScrollY || h != t.lastHighlightHeight {
-		t.Styles = HighlightVisible(t.HighlightKey(), t.Buffer.Lines, t.ScrollY, h, th)
-		t.StyleStale = false
-		t.lastHighlightScrollY = t.ScrollY
-		t.lastHighlightHeight = h
-	}
+	t.refreshStyles(h, th)
 
 	bg := th.BG
 	bgStyle := tcell.StyleDefault.Background(bg).Foreground(th.Text)

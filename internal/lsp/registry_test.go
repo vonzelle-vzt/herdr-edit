@@ -133,3 +133,62 @@ func TestResolveFindsServersOutsidePATH(t *testing.T) {
 		t.Fatalf("resolve returned %q, want %q", got[0], probe)
 	}
 }
+
+// TestManager_StopDuringStartDoesNotOrphanServer pins the quit race: a server
+// still launching when Stop runs used to be registered AFTER the sweep, leaving
+// a language-server process nobody would ever stop.
+func TestManager_StopDuringStartDoesNotOrphanServer(t *testing.T) {
+	argv := withHelper(t, "ok")
+	release := make(chan struct{})
+	started := make(chan *Client, 1)
+	orig := startClient
+	startClient = func(ctx context.Context, name string, _ []string, root string) (*Client, error) {
+		<-release
+		c, err := Start(ctx, name, argv, root)
+		if err == nil {
+			started <- c
+		}
+		return c, err
+	}
+	t.Cleanup(func() { startClient = orig })
+
+	// A project-local stand-in makes m.resolve succeed on any machine; the
+	// seam above ignores the argv it resolves to.
+	root := t.TempDir()
+	bin := filepath.Join(root, "node_modules", ".bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "gopls"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(root)
+	got := make(chan *Client, 1)
+	go func() { got <- m.clientFor(context.Background(), "go") }()
+	time.Sleep(100 * time.Millisecond)
+	m.Stop()
+	close(release)
+
+	select {
+	case c := <-got:
+		if c != nil {
+			t.Fatal("clientFor returned a live client after Stop")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("clientFor did not return")
+	}
+	if n := len(m.Running()); n != 0 {
+		t.Fatalf("%d server(s) registered after Stop", n)
+	}
+	select {
+	case c := <-started:
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if !closed {
+			t.Fatal("late-started client was left running")
+		}
+	default:
+	}
+}

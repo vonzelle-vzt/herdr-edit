@@ -538,6 +538,51 @@ is quarantined rather than threaded through the old one.
   two differ in their innermost loop (offset by `ScrollX` vs divide into rows),
   and the unwrapped one is the path that must not regress.
 
+### The handoff contract with vzt-orca-flow and herdr-extensions (fork)
+
+Panels and vzt-orca-flow drive the editor through files in `$XDG_STATE_HOME/spiceedit`.
+Each rule below shipped broken at least once, and none of the failures logs anything.
+
+- 🔴 **Exit 0 from `--open-at` / `--debug` means QUEUED, never "opened".** The CLI exits 0
+  when the request was written while at least one live editor was registered, and **3**
+  when none was. There is no consumption acknowledgement and no choice of which editor takes
+  it: requests are a broadcast, and each editor claims only paths inside its own root
+  (`withinRoot`, which resolves symlinks on both sides). Copy in any consumer says "sent" or
+  "queued". `TestHandoffExitZeroMeansQueuedNotOpened` pins it. On exit 3 the two kinds
+  DIFFER: the next editor started replays an `--open-at`, but never a `--debug` request,
+  because `debugRequestFloor` exists precisely so a stale `stop` cannot fire.
+- 🔴 **The liveness registry (`internal/state/editors.go`) needs a live pid AND a fresh
+  beat.** A pid alone believes a crashed editor once the OS recycles its pid. The beat rides
+  the 10s tree tick (`beatEditor` in the `treeRefreshEvent` case). Reads never mutate the
+  directory, so `--capabilities` is side-effect free; pruning happens on register.
+- 🔴 **`debug-session.json` is heartbeated while non-idle.** Consumers call a stopped session
+  older than `staleAfter` (60s) STALE. `DebugPublisher` used to write only on change, so
+  sitting at a breakpoint for a minute hid the stop location in every panel.
+- 🔴 **An idle write never clobbers another live editor's session.** Opening or quitting a
+  second editor used to reset a live session from another project to idle. The guard keys on
+  the optional `pid` field.
+- 🔴 **A remote `start` never opens the TUI picker.** The CLI has already exited 0 by then,
+  so nothing would ever start. It honours `FILE` and `--config NAME`, and otherwise uses the
+  remembered or only configuration, or flashes an error.
+- **`--capabilities`** is the versioned probe (`capabilitiesSchema`). Its verbs come from
+  `state.DebugActions()` and are never restated. Gate new consumer features on its booleans.
+- **An idle editor answers within about 150ms** (`requestwake.go`). Before that the polled
+  consumers only ran on the next event, which was up to the 10s tick away.
+- ⚠️ **Known limitation:** a `start` with no FILE is still a broadcast, so every running
+  editor starts a session. Routing by root and a consumption ack are deliberate follow-ups,
+  not oversights.
+
+### Background work stays off the UI thread (fork)
+
+The 10s refresh used to run `5 + 3N` blocking git execs on the UI goroutine. Git and ignore
+work now runs in `refresh.go` and lands as one posted event. New background results use the
+`selfApplyingEvent` seam in `app.go`: implement `apply(*App)` instead of adding a case to
+`handleEvent`. Every timer and goroutine is stopped or bounded by `shutdownBackground`
+(`lifecycle.go`), and `TestRunAndCloseLeaveNoGoroutinesBehind` is the guard.
+`Buffer.Version()` is the change stamp: any code that writes `Buffer.Lines` directly must call
+`Touch()`, or the LSP sync and the highlight memo miss the edit. Undo and the comment toggle
+both missed it once.
+
 ### Polled call sites, not scattered hooks (fork)
 `publishActive()` and `maybeSyncLSP()` are each called from ONE place in
 the Run loop. The cursor moves and the buffer mutates from dozens of sites;

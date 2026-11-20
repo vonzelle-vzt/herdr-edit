@@ -95,6 +95,9 @@ type Tree struct {
 	// only the existing chevron (the legacy look) — important for
 	// terminals or fonts that can't render the private-use glyphs.
 	IconsEnabled bool
+
+	// fit memoises FitWidth per percentile; see fitFingerprint for how it is invalidated.
+	fit fitCache
 }
 
 // New creates a tree rooted at root and pre-loads its top-level children so
@@ -374,6 +377,100 @@ func (t *Tree) FitWidth(percentile int) int {
 	if t == nil || t.Root == nil {
 		return 0
 	}
+	// Clamp first so 0, 1 and -5 share a cache slot exactly as they share a result.
+	if percentile < 1 {
+		percentile = 1
+	}
+	if percentile > 100 {
+		percentile = 100
+	}
+	fp := t.fitFingerprint()
+	if !t.fit.valid || t.fit.fp != fp {
+		t.fit = fitCache{valid: true, fp: fp}
+	}
+	if w, ok := t.fit.byPct[percentile]; ok {
+		return w
+	}
+	w := t.fitWidthUncached(percentile)
+	if t.fit.byPct == nil {
+		t.fit.byPct = make(map[int]int, 2)
+	}
+	t.fit.byPct[percentile] = w
+	return w
+}
+
+// fitCache holds FitWidth results for one tree state, identified by fp.
+type fitCache struct {
+	valid bool
+	fp    uint64
+	byPct map[int]int
+}
+
+// fitFingerprint hashes everything FitWidth's answer depends on: the root name, IconsEnabled, and
+// for every row the walk would flatten, the name, IsDir, Expanded and nesting.
+//
+// Why a fingerprint rather than a generation counter bumped at each mutation site: Node.Expanded,
+// Node.Children and Tree.IconsEnabled are exported and are written directly (by the app and by
+// tests), and Node.reload has no pointer back to its Tree. A counter would silently go stale the
+// first time someone assigned one of those fields; hashing what is actually there cannot. The walk
+// allocates nothing and does no rune conversion, icon lookup or sorting, which is where the cost was.
+func (t *Tree) fitFingerprint() uint64 {
+	h := fnvOffset
+	h = fnvString(h, t.Root.Name)
+	if t.IconsEnabled {
+		h = fnvByte(h, 1)
+	} else {
+		h = fnvByte(h, 0)
+	}
+	for _, c := range t.Root.Children {
+		h = fingerprintNode(c, h)
+	}
+	return h
+}
+
+const (
+	fnvOffset uint64 = 14695981039346656037
+	fnvPrime  uint64 = 1099511628211
+)
+
+// fnvByte folds one byte into an FNV-1a hash.
+func fnvByte(h uint64, b byte) uint64 { return (h ^ uint64(b)) * fnvPrime }
+
+// fnvString folds a string, plus a terminator so "ab","c" differs from "a","bc".
+func fnvString(h uint64, s string) uint64 {
+	for i := 0; i < len(s); i++ {
+		h = fnvByte(h, s[i])
+	}
+	return fnvByte(h, 0xff)
+}
+
+// fingerprintNode mirrors flattenInto's traversal, folding each visited row (and the open/close of
+// an expanded directory, so nesting is part of the hash) into h.
+func fingerprintNode(n *Node, h uint64) uint64 {
+	if n == nil {
+		return h
+	}
+	h = fnvString(h, n.Name)
+	var flags byte
+	if n.IsDir {
+		flags |= 1
+	}
+	if n.Expanded {
+		flags |= 2
+	}
+	h = fnvByte(h, flags)
+	if n.IsDir && n.Expanded {
+		h = fnvByte(h, '(')
+		for _, c := range n.Children {
+			h = fingerprintNode(c, h)
+		}
+		h = fnvByte(h, ')')
+	}
+	return h
+}
+
+// fitWidthUncached is the real FitWidth computation; FitWidth only memoises it.
+func (t *Tree) fitWidthUncached(percentile int) int {
 
 	// The two header rows: " EXPLORER" and the project name. Always a floor -- a truncated project
 	// name in the header is disorienting in a way a truncated row is not.

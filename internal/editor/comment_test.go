@@ -387,3 +387,20 @@ func TestToggleLineCommentStillUsesItsOwnTable(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+// TestToggleLineComment_MovesBufferVersion pins that the in-place rewrite of
+// Lines bumps Buffer.Version. The LSP sync and the document-highlight memo key
+// off Version, so a toggle that did not move it would never reach the
+// language server and would leave stale highlights on screen.
+func TestToggleLineComment_MovesBufferVersion(t *testing.T) {
+	tab := commentTestTab("main.go", "package main\nfunc main() {}\n")
+	tab.Cursor = Position{Line: 1, Col: 0}
+	tab.Anchor = tab.Cursor
+	before := tab.Buffer.Version()
+	if changed, ok := tab.ToggleLineComment(); !ok || !changed {
+		t.Fatal("toggle did not apply")
+	}
+	if tab.Buffer.Version() == before {
+		t.Fatal("ToggleLineComment rewrote Lines without moving Buffer.Version")
+	}
+}

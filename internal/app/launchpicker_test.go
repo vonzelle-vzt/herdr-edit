@@ -17,6 +17,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	"github.com/cloudmanic/spice-edit/internal/dap"
+	"github.com/cloudmanic/spice-edit/internal/state"
 )
 
 // writeLaunchJSON drops a .vscode/launch.json into root and returns its path.
@@ -545,5 +546,111 @@ func TestAttachConfigurationSendsAttachOnTheWire(t *testing.T) {
 	}
 	if !sawAttach {
 		t.Errorf("the root never sent `attach`; commands were %v", cmds)
+	}
+}
+
+// twoConfigs is a launch.json with two distinguishable Go configurations.
+const twoConfigs = `{"configurations": [
+  {"name": "Alpha", "type": "go", "request": "launch", "program": "${workspaceFolder}/alpha"},
+  {"name": "Beta", "type": "go", "request": "launch", "program": "${workspaceFolder}/beta"}
+]}`
+
+// TestRemoteStartWithConfigRunsThatConfigWithoutThePicker pins the CLI path:
+// a named configuration is resolved through the same launch.json resolution as
+// the picker and started, with the picker never opened. The spec that reached
+// the start path is read off a.debug.config (spec.Target).
+func TestRemoteStartWithConfigRunsThatConfigWithoutThePicker(t *testing.T) {
+	a, _ := launchFixture(t, twoConfigs)
+	t.Cleanup(a.stopDebugSession)
+
+	remoteStart(t, a, state.DebugRequest{Config: "Beta"})
+
+	if a.paletteOpen {
+		t.Fatal("the interactive picker opened for a remote start")
+	}
+	if a.debug == nil || !strings.HasSuffix(a.debug.config, "beta") {
+		t.Fatalf("session = %+v, want Beta's program (…/beta)", a.debug)
+	}
+}
+
+// TestRemoteStartWithUnknownConfigErrorsWithoutPickerOrFallback pins that a
+// name that does not resolve stops: no picker, and no fallback to the file
+// path, which would debug something the caller did not ask for.
+func TestRemoteStartWithUnknownConfigErrorsWithoutPickerOrFallback(t *testing.T) {
+	a, _ := launchFixture(t, twoConfigs)
+
+	remoteStart(t, a, state.DebugRequest{Config: "Gamma"})
+
+	if a.paletteOpen || a.debug != nil {
+		t.Fatalf("picker=%v session=%+v, want neither", a.paletteOpen, a.debug)
+	}
+	if !strings.Contains(a.statusMsg, "Gamma") {
+		t.Errorf("status = %q, want it to name the config", a.statusMsg)
+	}
+}
+
+// TestRemoteStartWithCompoundNameIsRefusedByName pins that a compound is
+// refused with its name rather than reported as missing or run.
+func TestRemoteStartWithCompoundNameIsRefusedByName(t *testing.T) {
+	a, _ := launchFixture(t, `{"configurations": [
+  {"name": "Alpha", "type": "go", "request": "launch", "program": "${workspaceFolder}"}],
+ "compounds": [{"name": "Both", "configurations": ["Alpha"]}]}`)
+
+	remoteStart(t, a, state.DebugRequest{Config: "Both"})
+
+	if a.paletteOpen || a.debug != nil || !strings.Contains(a.statusMsg, "Both") {
+		t.Fatalf("picker=%v session=%+v status=%q", a.paletteOpen, a.debug, a.statusMsg)
+	}
+}
+
+// TestRemoteStartWithMalformedLaunchJSONStops pins that a named start against a
+// broken launch.json stops and says so.
+func TestRemoteStartWithMalformedLaunchJSONStops(t *testing.T) {
+	a, _ := launchFixture(t, `{"configurations": [`)
+
+	remoteStart(t, a, state.DebugRequest{Config: "Alpha"})
+
+	if a.paletteOpen || a.debug != nil || !strings.Contains(a.statusMsg, "launch.json") {
+		t.Fatalf("picker=%v session=%+v status=%q", a.paletteOpen, a.debug, a.statusMsg)
+	}
+}
+
+// TestRemoteStartWithTwoConfigsAndNoNameErrorsNotPicker is the original bug: a
+// remote start with several configurations opened the TUI picker, the CLI
+// exited 0 and nothing ever started.
+func TestRemoteStartWithTwoConfigsAndNoNameErrorsNotPicker(t *testing.T) {
+	a, _ := launchFixture(t, twoConfigs)
+
+	remoteStart(t, a, state.DebugRequest{})
+
+	if a.paletteOpen || a.debug != nil {
+		t.Fatalf("picker=%v session=%+v, want neither", a.paletteOpen, a.debug)
+	}
+	want := "remote start needs --config NAME (2 configurations in launch.json)"
+	if a.statusMsg != want {
+		t.Errorf("status = %q, want %q", a.statusMsg, want)
+	}
+}
+
+// TestRemoteStartUsesRememberedOrOnlyConfig pins the two no-name cases that do
+// start: a choice already remembered, and exactly one configuration.
+func TestRemoteStartUsesRememberedOrOnlyConfig(t *testing.T) {
+	a, _ := launchFixture(t, twoConfigs)
+	t.Cleanup(a.stopDebugSession)
+	if _, err := a.launchFile(); err != nil { // first load resets the choice
+		t.Fatal(err)
+	}
+	a.launch.choice = "Alpha"
+	remoteStart(t, a, state.DebugRequest{})
+	if a.debug == nil || !strings.HasSuffix(a.debug.config, "alpha") {
+		t.Fatalf("remembered: session = %+v, want Alpha", a.debug)
+	}
+
+	b, _ := launchFixture(t, `{"configurations": [
+  {"name": "Only", "type": "go", "request": "launch", "program": "${workspaceFolder}/only"}]}`)
+	t.Cleanup(b.stopDebugSession)
+	remoteStart(t, b, state.DebugRequest{})
+	if b.debug == nil || !strings.HasSuffix(b.debug.config, "only") {
+		t.Fatalf("single: session = %+v, want Only", b.debug)
 	}
 }

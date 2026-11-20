@@ -260,6 +260,7 @@ func (t *Tab) ToggleLineComment() (changed bool, ok bool) {
 		}
 		t.Buffer.Lines[i] = commentLine(line, prefix)
 	}
+	t.Buffer.Touch() // lines were rewritten in place, so Version must move
 	t.Cursor = t.Buffer.Clamp(t.Cursor)
 	t.Anchor = t.Buffer.Clamp(t.Anchor)
 	t.Dirty = true

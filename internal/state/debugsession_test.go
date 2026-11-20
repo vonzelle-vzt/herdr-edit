@@ -148,9 +148,16 @@ func TestDebugSessionIdleCarriesNoLocation(t *testing.T) {
 // Asserted from the FILE (mtime and ts), never from the publisher's own fields:
 // reading those without the lock is a data race against the debounce timer, and
 // the thing worth pinning is the syscall that did or did not happen.
+//
+// Its meaning narrowed when the heartbeat arrived: unchanged content does not
+// rewrite PER Set CALL, but a live session is re-stamped on the heartbeat
+// timer — TestDebugSessionHeartbeats covers that. The interval is pinned long
+// here so only the per-call behaviour is under test.
 func TestDebugSessionComparesIgnoringTimestamp(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	p := NewDebugPublisher()
+	p.hbInterval = time.Hour
+	defer p.Close()
 	snap := DebugSession{State: DebugStateRunning, Adapter: "delve", Root: "/proj"}
 
 	p.Set(snap)
@@ -274,5 +281,170 @@ func TestDebugSessionLeavesNoTempFiles(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Errorf("state directory holds %d entries, want just debug-session.json", len(entries))
+	}
+}
+
+// waitFor polls cond until it holds or two seconds pass, failing with msg.
+func waitFor(t *testing.T, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// peekSession is readSession without the failure: a zero session when the file
+// is not there yet, for polling until the debounce timer publishes.
+func peekSession() DebugSession {
+	var got DebugSession
+	if raw, err := os.ReadFile(DebugSessionFile()); err == nil {
+		_ = json.Unmarshal(raw, &got)
+	}
+	return got
+}
+
+// heartbeatArmed reports whether the publisher currently holds a heartbeat
+// timer, under the lock.
+func heartbeatArmed(p *DebugPublisher) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hb != nil
+}
+
+// TestDebugSessionHeartbeats pins the staleness fix: a session paused at a
+// breakpoint changes nothing, yet its ts must keep moving or a reader's
+// StaleAfter check declares a healthy session dead. Once idle, the file must
+// stop being rewritten — an idle heartbeat would be noise.
+func TestDebugSessionHeartbeats(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	p := NewDebugPublisher()
+	p.hbInterval = 20 * time.Millisecond
+	defer p.Close()
+
+	stopped := DebugSession{State: DebugStateStopped, File: "/proj/main.go", Line: 4}
+	p.Set(stopped)
+	waitFor(t, "stopped session never reached disk", func() bool { return peekSession().State == DebugStateStopped })
+	first := readSession(t).TS
+	// Content is unchanged throughout; only the heartbeat can move ts.
+	waitFor(t, "ts never advanced for an unchanged stopped session", func() bool {
+		p.Set(stopped)
+		return readSession(t).TS > first
+	})
+
+	p.Set(DebugSession{State: DebugStateIdle})
+	waitFor(t, "idle never reached disk", func() bool { return peekSession().State == DebugStateIdle })
+	time.Sleep(60 * time.Millisecond) // let any in-flight beat land
+	idleTS := readSession(t).TS
+	time.Sleep(120 * time.Millisecond)
+	if got := readSession(t).TS; got != idleTS {
+		t.Errorf("idle session was heartbeated: ts %d -> %d", idleTS, got)
+	}
+	if heartbeatArmed(p) {
+		t.Error("heartbeat timer still armed while idle")
+	}
+}
+
+// TestDebugSessionCloseStopsHeartbeat pins that Close leaves no timer running:
+// the editor exiting must not leave a goroutine re-writing the file.
+func TestDebugSessionCloseStopsHeartbeat(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	p := NewDebugPublisher()
+	p.hbInterval = 15 * time.Millisecond
+	p.Set(DebugSession{State: DebugStateRunning})
+	waitFor(t, "never published", func() bool { return peekSession().State == DebugStateRunning })
+	p.Close()
+	time.Sleep(40 * time.Millisecond)
+	ts := readSession(t).TS
+	time.Sleep(80 * time.Millisecond)
+	if got := readSession(t).TS; got != ts {
+		t.Errorf("heartbeat survived Close: ts %d -> %d", ts, got)
+	}
+	p.Set(DebugSession{State: DebugStateStopped}) // must be a no-op, not a re-arm
+	if heartbeatArmed(p) {
+		t.Error("Set after Close re-armed the heartbeat")
+	}
+}
+
+// TestDebugSessionStampsPID pins that the writer's pid is on the wire.
+func TestDebugSessionStampsPID(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	p := NewDebugPublisher()
+	defer p.Close()
+	p.Set(DebugSession{State: DebugStateStopped})
+	p.Flush()
+	if got := readSession(t).PID; got != os.Getpid() {
+		t.Errorf("pid = %d, want %d", got, os.Getpid())
+	}
+}
+
+// writeForeign plants a session file as though another editor (pid) wrote it.
+func writeForeign(t *testing.T, state string, pid int) {
+	t.Helper()
+	blob, _ := json.Marshal(DebugSession{State: state, Adapter: "delve", File: "/other/x.go", Line: 9, PID: pid, TS: 1})
+	if err := os.MkdirAll(Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(DebugSessionFile(), blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIdleDoesNotClobberAnotherEditorsLiveSession is the ownership guard: a
+// second editor starting up (or quitting) publishes idle, and that must not
+// erase the stopped session of a different, running editor.
+func TestIdleDoesNotClobberAnotherEditorsLiveSession(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// pid 1 is alive and is never us.
+	writeForeign(t, DebugStateStopped, 1)
+	p := NewDebugPublisher()
+	defer p.Close()
+	p.Set(DebugSession{State: DebugStateIdle})
+	p.Flush()
+	got := readSession(t)
+	if got.State != DebugStateStopped || got.PID != 1 || got.File != "/other/x.go" {
+		t.Fatalf("idle write clobbered a live foreign session: %+v", got)
+	}
+
+	// The editor that is actually debugging always wins.
+	p.Set(DebugSession{State: DebugStateRunning})
+	p.Flush()
+	if got := readSession(t); got.State != DebugStateRunning || got.PID != os.Getpid() {
+		t.Fatalf("a live write lost to a foreign session: %+v", got)
+	}
+}
+
+// TestIdleOverwritesDeadOrUnownedSessions pins every case in which an idle
+// write is allowed: dead owner, own pid, already idle, pid-less legacy file,
+// unparseable file, and no file at all.
+func TestIdleOverwritesDeadOrUnownedSessions(t *testing.T) {
+	garbage := func(t *testing.T) {
+		writeForeign(t, DebugStateStopped, 1)
+		if err := os.WriteFile(DebugSessionFile(), []byte("{nope"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[string]func(t *testing.T){
+		"dead pid": func(t *testing.T) { writeForeign(t, DebugStateStopped, deadPID(t)) },
+		"own pid":  func(t *testing.T) { writeForeign(t, DebugStateStopped, os.Getpid()) },
+		"idle":     func(t *testing.T) { writeForeign(t, DebugStateIdle, 1) },
+		"no pid":   func(t *testing.T) { writeForeign(t, DebugStateStopped, 0) },
+		"garbage":  garbage,
+		"no file":  func(t *testing.T) {},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			setup(t)
+			p := NewDebugPublisher()
+			defer p.Close()
+			p.Set(DebugSession{State: DebugStateIdle})
+			p.Flush()
+			if got := readSession(t); got.State != DebugStateIdle || got.PID != os.Getpid() {
+				t.Fatalf("idle write was refused: %+v", got)
+			}
+		})
 	}
 }

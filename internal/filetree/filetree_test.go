@@ -14,8 +14,10 @@
 package filetree
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gdamore/tcell/v2"
@@ -1323,4 +1325,168 @@ func TestFitWidthIgnoresOutliers(t *testing.T) {
 		t.Fatalf("percentile clamping wrong: 0->%d 1000->%d max=%d",
 			tr.FitWidth(0), tr.FitWidth(1000), max)
 	}
+}
+
+// bigFitTree builds a tree with dirs directories of perDir files each, every directory expanded,
+// so FitWidth sees dirs*(perDir+1) rows. Shared by the benchmark and the invalidation tests.
+func bigFitTree(tb testing.TB, dirs, perDir int) *Tree {
+	tb.Helper()
+	root := tb.TempDir()
+	for d := 0; d < dirs; d++ {
+		dir := filepath.Join(root, fmt.Sprintf("dir%03d", d))
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			tb.Fatal(err)
+		}
+		for f := 0; f < perDir; f++ {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%03d.go", f)), nil, 0o644); err != nil {
+				tb.Fatal(err)
+			}
+		}
+	}
+	tr, err := New(root)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for _, d := range tr.Root.Children {
+		tr.Toggle(d)
+	}
+	return tr
+}
+
+// BenchmarkFitWidth measures FitWidth on a ~2000-row fully expanded tree with icons on, the shape
+// of the per-draw hot path (sidebarW is called many times per frame).
+func BenchmarkFitWidth(b *testing.B) {
+	tr := bigFitTree(b, 20, 99)
+	tr.IconsEnabled = true
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tr.FitWidth(85)
+	}
+}
+
+// TestFitWidthCache_AgreesWithUncached pins that memoising never changes a value: every
+// percentile, asked twice (miss then hit), equals the uncached computation.
+func TestFitWidthCache_AgreesWithUncached(t *testing.T) {
+	tr := bigFitTree(t, 5, 20)
+	for _, withIcons := range []bool{false, true} {
+		tr.IconsEnabled = withIcons
+		for _, pct := range []int{-3, 0, 1, 50, 85, 100, 500} {
+			clamped := pct
+			if clamped < 1 {
+				clamped = 1
+			}
+			if clamped > 100 {
+				clamped = 100
+			}
+			want := tr.fitWidthUncached(clamped)
+			for i := 0; i < 2; i++ {
+				if got := tr.FitWidth(pct); got != want {
+					t.Fatalf("icons=%v pct=%d call %d: got %d, want %d", withIcons, pct, i, got, want)
+				}
+			}
+		}
+	}
+}
+
+// TestFitWidthCache_InvalidatesOnExpandCollapse warms the cache, then expands and collapses a
+// directory holding a very long filename; the width must follow each change, not the stale value.
+func TestFitWidthCache_InvalidatesOnExpandCollapse(t *testing.T) {
+	root := mkFiles(t, map[string]string{
+		"d/" + strings.Repeat("x", 60) + ".go": "",
+		"d/a.go":                               "",
+		"top.go":                               "",
+	})
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collapsed := tr.FitWidth(100)
+	tr.Toggle(tr.Root.Children[0])
+	expanded := tr.FitWidth(100)
+	if expanded <= collapsed {
+		t.Fatalf("expand did not widen: collapsed=%d expanded=%d", collapsed, expanded)
+	}
+	tr.Toggle(tr.Root.Children[0])
+	if got := tr.FitWidth(100); got != collapsed {
+		t.Fatalf("collapse did not restore width: got %d, want %d", got, collapsed)
+	}
+}
+
+// TestFitWidthCache_InvalidatesOnRefresh adds a longer filename on disk after a warm read;
+// Refresh must make the new width visible.
+func TestFitWidthCache_InvalidatesOnRefresh(t *testing.T) {
+	root := mkFiles(t, map[string]string{"short.go": ""})
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := tr.FitWidth(100)
+	long := strings.Repeat("y", 70) + ".go"
+	if err := os.WriteFile(filepath.Join(root, long), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr.Refresh()
+	if after := tr.FitWidth(100); after <= before {
+		t.Fatalf("refresh adding a longer name did not widen: before=%d after=%d", before, after)
+	}
+}
+
+// TestFitWidthCache_InvalidatesOnIconToggle flips IconsEnabled directly (as the app does) and
+// expects the glyph column to be added to, then removed from, the width.
+func TestFitWidthCache_InvalidatesOnIconToggle(t *testing.T) {
+	root := mkFiles(t, map[string]string{"a.go": ""})
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Name long enough that the row, not the header floor, sets the width.
+	if err := os.WriteFile(filepath.Join(root, strings.Repeat("z", 40)+".go"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr.Refresh()
+	off := tr.FitWidth(100)
+	tr.IconsEnabled = true
+	on := tr.FitWidth(100)
+	if on <= off {
+		t.Fatalf("enabling icons did not widen: off=%d on=%d", off, on)
+	}
+	tr.IconsEnabled = false
+	if got := tr.FitWidth(100); got != off {
+		t.Fatalf("disabling icons did not restore width: got %d, want %d", got, off)
+	}
+}
+
+// TestFitWidthCache_InvalidatesOnDirectExpandedWrite covers the exported-field path: a caller
+// assigning Node.Expanded without going through Toggle must still see a fresh answer.
+func TestFitWidthCache_InvalidatesOnDirectExpandedWrite(t *testing.T) {
+	root := mkFiles(t, map[string]string{"d/" + strings.Repeat("q", 50) + ".go": ""})
+	tr, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := tr.Root.Children[0]
+	if err := loadChildren(d); err != nil {
+		t.Fatal(err)
+	}
+	before := tr.FitWidth(100)
+	d.Expanded = true
+	if after := tr.FitWidth(100); after <= before {
+		t.Fatalf("direct Expanded write ignored: before=%d after=%d", before, after)
+	}
+}
+
+// mkFiles writes the given relative-path -> content map under a fresh TempDir (creating parent
+// directories) and returns the root.
+func mkFiles(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	for rel, body := range files {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, p, body)
+	}
+	return root
 }

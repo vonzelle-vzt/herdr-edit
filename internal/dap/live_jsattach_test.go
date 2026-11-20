@@ -195,6 +195,7 @@ func startInspectBrkDebuggee(t *testing.T, file string) int {
 // too, and Adapter.UsesChildSessions routing breakpoints to the leaf is as
 // load-bearing here as it is for launch.
 func TestLiveJsAttachStopsAtBreakpoint(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file, lines := jsAttachFixture(t)
 	requireJsDebug(t, root)
 	port := startInspectBrkDebuggee(t, file)

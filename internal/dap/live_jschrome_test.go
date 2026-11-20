@@ -216,6 +216,7 @@ func chromeLaunchConfig(adapter Adapter, root, url, chrome string) map[string]in
 // It is the only test in the repo that can fail when __workspaceFolder is
 // dropped, because every layer beneath it succeeds without it.
 func TestLiveJsDebugChromeStopsInABrowserScript(t *testing.T) {
+	skipLiveUnderShort(t)
 	chrome := requireChrome(t)
 
 	root, script, lines, url := chromeFixture(t)

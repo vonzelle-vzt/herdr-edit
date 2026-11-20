@@ -16,7 +16,6 @@ package editor
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
@@ -1157,8 +1156,8 @@ func TestGutterWidthFor(t *testing.T) {
 // the visible rows when something actually changed. Without this gate every
 // redraw, including mouse moves, would re-tokenise for nothing, and the
 // StyleStale flag set by every edit would be written but never read. We
-// detect recompute by comparing the styles grid's backing array: a fresh
-// make per recompute vs. reuse on skip.
+// count tokenisations (hlRuns) rather than comparing the outer slice, since
+// the slice is deliberately reused across recomputes now.
 func TestTab_RenderSkipsHighlightWhenNotStale(t *testing.T) {
 	scr := newSimScreen(t, 40, 10)
 	defer scr.Fini()
@@ -1171,50 +1170,202 @@ func TestTab_RenderSkipsHighlightWhenNotStale(t *testing.T) {
 	if tab.Styles == nil {
 		t.Fatal("expected first render to highlight")
 	}
-	firstPtr := reflect.ValueOf(tab.Styles).Pointer()
+	runs := tab.hlRuns
+	if runs != 1 {
+		t.Fatalf("first render should tokenise once, got %d", runs)
+	}
 
 	// Second render with no content, scroll, or height change: should reuse
 	// the existing styles grid instead of re-tokenising.
 	tab.Render(scr, theme.Default(), 0, 0, 40, 10)
-	if reflect.ValueOf(tab.Styles).Pointer() != firstPtr {
+	if tab.hlRuns != runs {
 		t.Fatal("expected Render to skip re-highlight when nothing changed")
 	}
 
 	// An edit marks styles stale, so the next render must recompute.
 	tab.StyleStale = true
 	tab.Render(scr, theme.Default(), 0, 0, 40, 10)
-	if reflect.ValueOf(tab.Styles).Pointer() == firstPtr {
+	if tab.hlRuns != runs+1 {
 		t.Fatal("expected Render to re-highlight after StyleStale set")
 	}
 }
 
-// TestTab_RenderRecomputesHighlightOnScroll confirms Render re-tokenises
-// when the viewport scrolls. The highlight grid is indexed by absolute line
-// number and only carries the visible rows, so a scroll change means
-// different rows must be filled even when the content is unchanged.
+// TestTab_RenderRecomputesHighlightOnScroll confirms a scroll refills the
+// style grid for the new viewport even though the content is unchanged. The
+// grid is indexed by absolute line number and carries only the visible rows,
+// so the new rows must be populated and the old ones dropped. A short scroll
+// inside the lexed lead window is served from it without tokenising again;
+// a jump past the lead margin in a big file must tokenise afresh.
 func TestTab_RenderRecomputesHighlightOnScroll(t *testing.T) {
 	scr := newSimScreen(t, 40, 10)
 	defer scr.Fini()
 
 	tab, _ := NewTab("")
-	tab.Buffer = NewBuffer(strings.Repeat("package main\n", 50))
+	tab.Buffer = NewBuffer(strings.Repeat("package main\n", 2000))
 	tab.StyleStale = true
 
 	tab.Render(scr, theme.Default(), 0, 0, 40, 10) // ScrollY clamps to 0
-	if tab.Styles == nil {
-		t.Fatal("expected first render to highlight")
+	if tab.Styles == nil || tab.Styles[0] == nil {
+		t.Fatal("expected first render to highlight row 0")
 	}
-	firstPtr := reflect.ValueOf(tab.Styles).Pointer()
+	runs := tab.hlRuns
 
-	// Scroll without moving the cursor (cursorMoved=false so EnsureVisible
-	// doesn't snap ScrollY back). The visible rows changed, so Render must
-	// re-tokenise even though StyleStale is false.
+	// Short scroll, cursorMoved=false so EnsureVisible doesn't snap back.
 	tab.ScrollY = 20
 	tab.cursorMoved = false
 	tab.Render(scr, theme.Default(), 0, 0, 40, 10)
-	if reflect.ValueOf(tab.Styles).Pointer() == firstPtr {
-		t.Fatal("expected Render to re-highlight after scroll")
+	if tab.hlRuns != runs {
+		t.Fatalf("scroll inside the lead window should reuse the lexed grid, tokenised %d more time(s)", tab.hlRuns-runs)
 	}
+	if tab.Styles[0] != nil {
+		t.Fatal("row 0 left the viewport and should have been dropped from Styles")
+	}
+	if tab.Styles[20] == nil || tab.Styles[29] == nil {
+		t.Fatal("rows of the new viewport must be populated after a scroll")
+	}
+
+	// A big jump leaves the window and must re-tokenise.
+	tab.ScrollY = 1000
+	tab.cursorMoved = false
+	tab.Render(scr, theme.Default(), 0, 0, 40, 10)
+	if tab.hlRuns != runs+1 {
+		t.Fatalf("scroll past the lead window should tokenise once more, got %d", tab.hlRuns-runs)
+	}
+	if tab.Styles[1000] == nil || tab.Styles[20] != nil {
+		t.Fatal("Styles should carry exactly the new viewport after a long scroll")
+	}
+}
+
+// TestTab_ScrollReuseNeverShowsStaleColours is the safety net for the scroll
+// shortcut: after an edit the reused lead grid must not be consulted, or the
+// edited line would keep the colours of the text it replaced. Line 0 starts
+// as a Go comment (SynComment, italic); typing over it must re-colour it
+// even though the scroll position is unchanged and inside the lead window.
+func TestTab_ScrollReuseNeverShowsStaleColours(t *testing.T) {
+	scr := newSimScreen(t, 40, 10)
+	defer scr.Fini()
+	th := theme.Default()
+
+	tab, _ := NewTab("")
+	tab.Path = "x.go"
+	tab.Buffer = NewBuffer("// note\n" + strings.Repeat("var a = 1\n", 100))
+	tab.StyleStale = true
+	tab.Render(scr, th, 0, 0, 40, 10)
+
+	commentFG, _, _ := tab.Styles[0][0].Decompose()
+	if commentFG != th.SynComment {
+		t.Fatalf("setup: line 0 should start as a comment, fg=%v", commentFG)
+	}
+
+	// Scroll away and back inside the lead window: reuse, no tokenising.
+	runs := tab.hlRuns
+	tab.ScrollY = 5
+	tab.cursorMoved = false
+	tab.Render(scr, th, 0, 0, 40, 10)
+	tab.ScrollY = 0
+	tab.Render(scr, th, 0, 0, 40, 10)
+	if tab.hlRuns != runs {
+		t.Fatalf("setup: scrolling inside the window should reuse, tokenised %d times", tab.hlRuns-runs)
+	}
+
+	// Edit line 0 so it is no longer a comment, then render at the same scroll.
+	tab.Buffer.Lines[0] = "var z = 2"
+	tab.StyleStale = true
+	tab.Render(scr, th, 0, 0, 40, 10)
+	if tab.hlRuns != runs+1 {
+		t.Fatalf("an edit must force a re-tokenise, runs went %d -> %d", runs, tab.hlRuns)
+	}
+	fg, _, _ := tab.Styles[0][0].Decompose()
+	if fg == th.SynComment {
+		t.Fatal("line 0 kept its stale comment colour after the edit")
+	}
+
+	// A change in line count with StyleStale lost must still not reuse.
+	tab.Buffer.Lines = append(tab.Buffer.Lines, "var q = 3")
+	tab.ScrollY = 3
+	tab.cursorMoved = false
+	runs = tab.hlRuns
+	tab.Render(scr, th, 0, 0, 40, 10)
+	if tab.hlRuns != runs+1 {
+		t.Fatal("a changed line count must invalidate the retained lead grid")
+	}
+	if len(tab.Styles) != len(tab.Buffer.Lines) {
+		t.Fatalf("Styles must be re-sized to the buffer: %d vs %d", len(tab.Styles), len(tab.Buffer.Lines))
+	}
+}
+
+// TestTab_LexerCacheInvalidatesOnKeyChange pins the lexer cache's contract:
+// it is reused while HighlightKey is unchanged, and a rename (new key) both
+// drops it and re-colours the buffer even though StyleStale was never set.
+// Go's `func` is a keyword; in plain text it is not, so the colour differs.
+func TestTab_LexerCacheInvalidatesOnKeyChange(t *testing.T) {
+	scr := newSimScreen(t, 40, 10)
+	defer scr.Fini()
+	th := theme.Default()
+
+	tab, _ := NewTab("")
+	tab.Path = "a.go"
+	tab.Buffer = NewBuffer("func main() {}")
+	tab.StyleStale = true
+	tab.Render(scr, th, 0, 0, 40, 10)
+
+	if tab.hlLexer == nil || tab.hlLexerKey != "a.go" {
+		t.Fatalf("lexer should be cached under a.go, got key %q", tab.hlLexerKey)
+	}
+	cached := tab.hlLexer
+	if got := tab.lexerFor("a.go", "ignored"); got != cached {
+		t.Fatal("same key must return the cached lexer")
+	}
+	fg, _, _ := tab.Styles[0][0].Decompose()
+	if fg != th.SynKeyword {
+		t.Fatalf("setup: `func` should be a keyword in a.go, fg=%v", fg)
+	}
+
+	// Rename to plain text with no edit: key change alone must re-highlight.
+	tab.Path = "a.txt"
+	tab.cursorMoved = false
+	tab.Render(scr, th, 0, 0, 40, 10)
+	if tab.hlLexerKey != "a.txt" {
+		t.Fatalf("cache should now be keyed a.txt, got %q", tab.hlLexerKey)
+	}
+	fg, _, _ = tab.Styles[0][0].Decompose()
+	if fg == th.SynKeyword {
+		t.Fatal("renamed to .txt but `func` is still coloured as a Go keyword")
+	}
+
+	// A content-sniffed (unmatched) key is never cached.
+	tab.Path = ""
+	tab.StyleStale = true
+	tab.Render(scr, th, 0, 0, 40, 10)
+	if tab.hlLexer != nil || tab.hlLexerKey != "" {
+		t.Fatal("a lexer chosen by content sniffing must not be cached")
+	}
+}
+
+// BenchmarkHighlightScroll measures the steady-state cost of scrolling one
+// line at a time through a 20k-line Go file. Almost every step stays inside
+// the lexed lead window and so should cost a re-slice, not a tokenise; the
+// periodic re-centre is included so the number is honest.
+func BenchmarkHighlightScroll(b *testing.B) {
+	scr := tcell.NewSimulationScreen("UTF-8")
+	if err := scr.Init(); err != nil {
+		b.Fatal(err)
+	}
+	defer scr.Fini()
+	scr.SetSize(120, 40)
+
+	tab, _ := NewTab("")
+	tab.Path = "big.go"
+	tab.Buffer = NewBuffer(strings.Repeat("func f() { return 1 } // comment\n", 20000))
+	th := theme.Default()
+	tab.Render(scr, th, 0, 0, 120, 40)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tab.ScrollY = 5000 + i%4000
+		tab.cursorMoved = false
+		tab.Render(scr, th, 0, 0, 120, 40)
+	}
+	b.ReportMetric(float64(tab.hlRuns)/float64(b.N), "lex/op")
 }
 
 // TestTab_Render_GitMarkerDoesNotOverlapLineNumber is the regression test for
@@ -1487,5 +1638,94 @@ func TestSurroundSelectionFollowsTheLanguage(t *testing.T) {
 	goTab.InsertRune('<')
 	if goTab.Buffer.Lines[0] != "<" {
 		t.Errorf("go: < should replace the selection, got %q", goTab.Buffer.Lines[0])
+	}
+}
+
+// manyLinesBuffer returns n lines of ordinary prose, each containing many
+// "e" runes, for benchmarks that need a big file with a huge match list.
+func manyLinesBuffer(n int) string {
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = "the quick brown fox jumps over the lazy dog // line"
+	}
+	return strings.Join(lines, "\n")
+}
+
+// findHighlightText reads a rendered SimulationScreen and returns the text
+// that sits under the "other match" background and under the "current
+// match" background, each in row-major (reading) order. It looks only at
+// what was actually painted, so a highlight landing one cell off shows up as
+// the wrong text rather than being hidden by a copy of the layout formula.
+func findHighlightText(scr tcell.SimulationScreen, w, h int, th theme.Theme) (others, current string) {
+	cells, _, _ := scr.GetContents()
+	var o, c strings.Builder
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			cell := cells[y*w+x]
+			_, bg, _ := cell.Style.Decompose()
+			switch bg {
+			case th.FindMatch:
+				o.WriteRune(cell.Runes[0])
+			case th.FindCurrent:
+				c.WriteRune(cell.Runes[0])
+			}
+		}
+	}
+	return o.String(), c.String()
+}
+
+// TestTab_Render_FindMatchStylingLandsOnMatchedCells renders the unwrapped
+// path with a case-insensitive query and asserts, from the painted cells,
+// that exactly the matched text is tinted, the focused match gets the loud
+// colour and the rest the soft one.
+func TestTab_Render_FindMatchStylingLandsOnMatchedCells(t *testing.T) {
+	w, h := 40, 8
+	scr := newSimScreen(t, w, h)
+	defer scr.Fini()
+	th := theme.Default()
+
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer("Foo bar foo\nxx FOO yy\nnothing here\nlast foo")
+	tab.SetFindQuery("foo")
+	if len(tab.FindMatches) != 4 {
+		t.Fatalf("setup: want 4 matches, got %d", len(tab.FindMatches))
+	}
+	tab.FindIndex = 1 // the lowercase "foo" on line 0
+
+	tab.Render(scr, th, 0, 0, w, h)
+	scr.Show()
+
+	others, current := findHighlightText(scr, w, h, th)
+	if current != "foo" {
+		t.Fatalf("current-match cells spell %q, want %q", current, "foo")
+	}
+	if others != "FooFOOfoo" {
+		t.Fatalf("other-match cells spell %q, want %q (matched text only, in reading order)", others, "FooFOOfoo")
+	}
+}
+
+// BenchmarkRenderWithManyFindMatches renders one frame of a 20k-line
+// buffer while the find bar holds the query "e" (tens of thousands of
+// matches). It is the regression guard for matchAtRune: the old linear
+// scan made each painted cell cost O(matches), so a frame took seconds.
+func BenchmarkRenderWithManyFindMatches(b *testing.B) {
+	scr := tcell.NewSimulationScreen("UTF-8")
+	if err := scr.Init(); err != nil {
+		b.Fatal(err)
+	}
+	defer scr.Fini()
+	scr.SetSize(120, 40)
+
+	tab, _ := NewTab("")
+	tab.Buffer = NewBuffer(manyLinesBuffer(20000))
+	tab.SetFindQuery("e")
+	tab.ScrollY = 10000
+	tab.FindIndex = 0
+	th := theme.Default()
+	tab.Render(scr, th, 0, 0, 120, 40)
+	b.ReportMetric(float64(len(tab.FindMatches)), "matches")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tab.Render(scr, th, 0, 0, 120, 40)
 	}
 }

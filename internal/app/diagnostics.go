@@ -119,6 +119,9 @@ func (a *App) lspDidChange(path, text string) {
 	if a.lsp == nil || path == "" {
 		return
 	}
+	if lspChangeObserver != nil {
+		lspChangeObserver(path, text)
+	}
 	a.lsp.DidChange(path, text)
 }
 
@@ -147,15 +150,22 @@ const lspSyncInterval = 400 * time.Millisecond
 //
 // Called from the event loop next to publishActive, for the same reason: the
 // editor mutates text from many places, and one polled call site cannot miss an
-// edit the way a set of hand-placed hooks would. The interval guard means the
-// buffer is only walked while the user is actually typing, and the length check
-// makes the common "nothing changed" case free.
+// edit the way a set of hand-placed hooks would. "Changed" is a Buffer.Version
+// compare, so the common nothing-changed case is free and the buffer is only
+// serialised when a change is actually being sent.
+//
+// An edit that lands inside the throttle window is not dropped: the skip arms a
+// single trailing-edge wake (see lspsync.go) that turns the loop once the window
+// closes, so the last keystrokes before a pause still get synced.
 func (a *App) maybeSyncLSP() {
 	if a.lsp == nil {
 		return
 	}
 	now := time.Now()
-	if now.Sub(a.lspSyncedAt) < lspSyncInterval {
+	if since := now.Sub(a.lspSyncedAt); since < lspSyncInterval {
+		if a.lspChangePending() {
+			a.scheduleLSPWake(lspSyncInterval - since)
+		}
 		return
 	}
 	a.lspSyncedAt = now
@@ -164,15 +174,14 @@ func (a *App) maybeSyncLSP() {
 	if tab == nil || tab.Path == "" || tab.IsImage() {
 		return
 	}
-	text := tab.Buffer.String()
-	if a.lspSentText == nil {
-		a.lspSentText = make(map[string]string)
-	}
-	if a.lspSentText[tab.Path] == text {
+	if !a.lspChangePending() {
 		return
 	}
-	a.lspSentText[tab.Path] = text
-	a.lspDidChange(tab.Path, text)
+	if a.lspSentVersion == nil {
+		a.lspSentVersion = make(map[string]uint64)
+	}
+	a.lspSentVersion[tab.Path] = tab.Buffer.Version()
+	a.lspDidChange(tab.Path, tab.Buffer.String())
 }
 
 // diagnosticsFor returns the diagnostics for a tab, newest publish wins.
@@ -266,8 +275,25 @@ func (a *App) drawDiagnostics() {
 			Foreground(a.diagnosticColor(d.Severity)).
 			Underline(true)
 
-		for line := d.Range.Start.Line; line <= d.Range.End.Line; line++ {
+		// Clip to the viewport BEFORE touching any line. A diagnostic can span
+		// thousands of lines (an unterminated comment or string, a file-wide
+		// parse error), and this pass runs on every redraw including bare mouse
+		// motion; walking the whole span to paint only the visible rows is the
+		// same stall conflictview.go's tintLines clip exists to prevent.
+		firstLine, lastLine := d.Range.Start.Line, d.Range.End.Line
+		if firstLine < tab.ScrollY {
+			firstLine = tab.ScrollY
+		}
+		if lastLine >= tab.ScrollY+eh {
+			lastLine = tab.ScrollY + eh - 1
+		}
+		if lastLine >= len(tab.Buffer.Lines) {
+			lastLine = len(tab.Buffer.Lines) - 1
+		}
+
+		for line := firstLine; line <= lastLine; line++ {
 			text := tab.LineText(line)
+			runes := []rune(text)
 			// The server speaks UTF-16; the buffer is rune-indexed. Converting
 			// per line is what keeps a squiggle under the right characters on a
 			// line containing an emoji or CJK text.
@@ -275,7 +301,7 @@ func (a *App) drawDiagnostics() {
 			if line == d.Range.Start.Line {
 				startCol = lsp.UTF16ToRuneCol(text, d.Range.Start.Character)
 			}
-			endCol := tab.LineRuneLen(line)
+			endCol := len(runes)
 			if line == d.Range.End.Line {
 				endCol = lsp.UTF16ToRuneCol(text, d.Range.End.Character)
 			}
@@ -285,10 +311,26 @@ func (a *App) drawDiagnostics() {
 				endCol = startCol + 1
 			}
 
+			// The visual column is carried along the walk instead of being
+			// recomputed from column 0 per cell (what ScreenPos does, and what
+			// made this loop quadratic in line length). It is the SAME
+			// arithmetic as Tab.ScreenPos — LineVisualCol relative to ScrollX,
+			// offset from contentStart — and TestDrawDiagnosticsAgreesWithScreenPos
+			// holds the two together against ScreenPos itself.
+			contentStart := tab.GutterWidth() + 1
+			scrollVis := editor.LineVisualCol(runes, tab.ScrollX)
+			vis := editor.LineVisualCol(runes, startCol)
+			dy := line - tab.ScrollY
 			for col := startCol; col < endCol; col++ {
-				dx, dy, ok := tab.ScreenPos(line, col, ew, eh)
-				if !ok {
-					continue
+				dx := contentStart + vis - scrollVis
+				if col < len(runes) {
+					vis += editor.RuneVisualWidth(runes[col], vis)
+				}
+				if dx < contentStart {
+					continue // scrolled off to the left
+				}
+				if dx >= ew {
+					break // everything further right is off screen too
 				}
 				sx, sy := ex+dx, ey+dy
 				// Repaint the existing rune with the diagnostic style so the

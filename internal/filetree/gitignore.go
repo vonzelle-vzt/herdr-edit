@@ -58,7 +58,14 @@ func newIgnoreSet(root string) *ignoreSet {
 	if err != nil {
 		return &ignoreSet{} // not a repo, or no git — show everything, as before
 	}
+	return ignoreSetFromLsFiles(root, out)
+}
 
+// ignoreSetFromLsFiles builds the allowed-path set from the raw NUL-separated output of
+// `git ls-files --cached --others --exclude-standard -z` run with root as the working directory.
+// Split out of newIgnoreSet so the app's background refresh can run that command ONCE and feed
+// the same bytes to both this and the fuzzy finder, instead of each exec'ing git for itself.
+func ignoreSetFromLsFiles(root string, out []byte) *ignoreSet {
 	allowed := make(map[string]bool, 1024)
 	allowed[root] = true
 	for _, raw := range bytes.Split(out, []byte{0}) {
@@ -83,6 +90,54 @@ func newIgnoreSet(root string) *ignoreSet {
 		return &ignoreSet{}
 	}
 	return &ignoreSet{active: true, allowed: allowed}
+}
+
+// IgnoreSnapshot is an ignore set computed off the UI goroutine, waiting to be installed with
+// Tree.SwapIgnore. It is opaque on purpose: the only thing a caller may do with one is hand it back.
+type IgnoreSnapshot struct {
+	set *ignoreSet
+}
+
+// IgnoreSnapshotFromLsFiles computes an IgnoreSnapshot from the raw output of
+// `git ls-files --cached --others --exclude-standard -z` run in root. Pure: safe on any goroutine.
+func IgnoreSnapshotFromLsFiles(root string, out []byte) *IgnoreSnapshot {
+	return &IgnoreSnapshot{set: ignoreSetFromLsFiles(root, out)}
+}
+
+// SwapIgnore installs a snapshot computed in the background, in place (every Node shares the
+// pointer), and reports whether the allowed set actually changed so the caller can re-filter the
+// already-loaded directories only when it must. An inactive or nil snapshot is ignored, the same
+// way Refresh keeps the old set when a fresh computation comes back inactive.
+func (t *Tree) SwapIgnore(s *IgnoreSnapshot) bool {
+	if s == nil || s.set == nil || !s.set.active || t.ignore == nil || !t.ignore.active {
+		return false
+	}
+	if sameAllowed(t.ignore.allowed, s.set.allowed) {
+		return false
+	}
+	*t.ignore = *s.set
+	return true
+}
+
+// sameAllowed reports whether two allowed-path sets hold exactly the same keys.
+func sameAllowed(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// ReloadDirs re-reads every loaded directory from disk against the CURRENT ignore set, without
+// touching git. It is Refresh minus the ignore rebuild: the app's background refresh calls it on
+// the UI goroutine (identity-preserving, so open folders stay open) and swaps the new ignore set
+// in later with SwapIgnore.
+func (t *Tree) ReloadDirs() {
+	refreshNode(t.Root)
 }
 
 // RespectGitignore turns the filter on or off for this tree and rebuilds it. Off restores the

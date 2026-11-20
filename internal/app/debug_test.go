@@ -795,11 +795,21 @@ func TestDebugGutterPaintsOnWrappedTabs(t *testing.T) {
 // the row by reading the screen rather than by recomputing wrap geometry.
 func fmtLineNo(n int) string { return strconv.Itoa(n) }
 
+// skipLiveAppUnderShort skips the app-level live debugger oracles under -short
+// (they start a real delve or debugpy), unless HERDR_REQUIRE_DAP=1 demands them.
+func skipLiveAppUnderShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() && os.Getenv("HERDR_REQUIRE_DAP") != "1" {
+		t.Skip("SKIPPED live oracle under -short (real debugger, slow); run without -short or set HERDR_REQUIRE_DAP=1 to run it")
+	}
+}
+
 // requireDlvForApp is the anti-skip gate for the app-level live oracle, matching
 // internal/dap/live_dlv_test.go: skip when delve is absent so a fresh clone
 // stays green, fail when HERDR_REQUIRE_DAP=1 says it must be there.
 func requireDlvForApp(t *testing.T) {
 	t.Helper()
+	skipLiveAppUnderShort(t)
 	if _, err := exec.LookPath("dlv"); err != nil {
 		msg := "dlv is not installed — `go install github.com/go-delve/delve/cmd/dlv@latest`"
 		if os.Getenv("HERDR_REQUIRE_DAP") == "1" {
@@ -1552,6 +1562,7 @@ func TestRemovingTheLastBreakpointClearsTheFileOnTheAdapter(t *testing.T) {
 // requireDlvForApp uses, because a skipped end-to-end oracle reads as a pass.
 func requireDebugpyForApp(t *testing.T, root string) {
 	t.Helper()
+	skipLiveAppUnderShort(t)
 	if cmd := dap.LocateDebugpy(root); cmd != nil {
 		t.Logf("debugpy resolved from %s: %v", cmd.Origin, cmd.Argv)
 		return
@@ -3743,5 +3754,119 @@ func TestDebugVizRefusesWhileAStopEventIsPending(t *testing.T) {
 	out := runDebugViz(context.Background(), tgt, debugVizRequest{Command: debugVizEvaluate, Expression: "x"}, dap.DefaultEvalLimits())
 	if !strings.Contains(string(out), dap.ErrEvalResumed.Error()) {
 		t.Fatalf("evaluate ran against a stop whose continued event was still pending: %s", out)
+	}
+}
+
+// remoteStart writes a start request with the real sequence stamp and lets the
+// editor consume it, exactly as the poll in Run does.
+func remoteStart(t *testing.T, a *App, req state.DebugRequest) {
+	t.Helper()
+	panelStateDir(t, a)
+	a.lastDebugSeq = debugRequestFloor
+	req.Action = state.DebugActionStart
+	req.Seq = time.Now().UnixNano()
+	writeRawDebugRequest(t, req)
+	a.consumeDebugRequest()
+}
+
+// TestRemoteStartHonoursTheRequestedFile pins that a CLI "start" with a file
+// starts the session FOR THAT FILE. It used to drop req.File and debug whatever
+// tab was active (here main.go under delve) — callers worked around it by
+// sending an open request first.
+func TestRemoteStartHonoursTheRequestedFile(t *testing.T) {
+	a, _ := debugFixture(t)
+	t.Cleanup(a.stopDebugSession)
+	py := filepath.Join(a.rootDir, "script.py")
+	if err := os.WriteFile(py, []byte("print('hi')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteStart(t, a, state.DebugRequest{File: py})
+
+	if tab := a.activeTabPtr(); tab == nil || tab.Path != py {
+		t.Fatalf("active tab after remote start = %+v, want %s", tab, py)
+	}
+	if a.debug == nil || a.debug.adapter != "debugpy" {
+		t.Fatalf("session = %+v, want a debugpy session for the requested .py file", a.debug)
+	}
+}
+
+// TestWithinRootResolvesSymlinks pins that a request spelled through a symlink
+// to the project (or the project reached through one) is still "inside". The
+// root is filepath.Abs, not symlink-resolved, so a plain Rel check consumed such
+// a request and silently ignored it.
+func TestWithinRootResolvesSymlinks(t *testing.T) {
+	real, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(real, "main.go")
+	if err := os.WriteFile(file, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newTestApp(t, link) // root displayed as the symlink
+	if !a.withinRoot(file) {
+		t.Error("real path of a file in a symlinked root was judged outside the project")
+	}
+	if !a.withinRoot(filepath.Join(real, "not-yet.go")) {
+		t.Error("a not-yet-existing file under the root was judged outside")
+	}
+	b := newTestApp(t, real)
+	if !b.withinRoot(filepath.Join(link, "main.go")) {
+		t.Error("symlinked path to a file in the real root was judged outside the project")
+	}
+	if b.withinRoot(filepath.Join(t.TempDir(), "x.go")) || b.withinRoot(filepath.Join(real, "..", "x.go")) {
+		t.Error("a genuinely outside path was judged inside")
+	}
+}
+
+// TestRemoteStartForAnotherProjectDoesNotResumeAPausedSession pins the
+// broadcast guard on the continue path. Debug requests reach every running
+// editor, and a remote start with a FILE is how a caller aims at one project.
+// remoteDebugStart used to resume a paused session BEFORE checking the file was
+// in its root, so "start projectA/main.py" resumed the program paused in
+// projectB's editor. A start for a file outside this root must do nothing.
+func TestRemoteStartForAnotherProjectDoesNotResumeAPausedSession(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	a.debug = &debugSession{stopped: true}
+	elsewhere := filepath.Join(t.TempDir(), "main.py")
+	if err := os.WriteFile(elsewhere, []byte("print('a')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.statusMsg = ""
+
+	a.remoteDebugStart(state.DebugRequest{Action: state.DebugActionStart, File: elsewhere})
+
+	if a.statusMsg != "" {
+		t.Fatalf("a start aimed at another project acted on this editor: status %q", a.statusMsg)
+	}
+	if !a.debug.stopped {
+		t.Fatal("a start aimed at another project resumed this editor's paused session")
+	}
+}
+
+// TestRemoteStartInsideRootStillResumesAPausedSession pins the other half:
+// the guard must not break the existing "start while paused = continue" for a
+// request aimed at THIS project, or for a bare start with no file.
+func TestRemoteStartInsideRootStillResumesAPausedSession(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	inside := filepath.Join(a.rootDir, "main.py")
+	if err := os.WriteFile(inside, []byte("print('a')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{inside, ""} {
+		a.debug = &debugSession{stopped: true}
+		a.statusMsg = ""
+		a.remoteDebugStart(state.DebugRequest{Action: state.DebugActionStart, File: file})
+		// No client in this fixture, so menuDebugContinue reaches its
+		// "No debug session" flash. Reaching it is the evidence it ran.
+		if !strings.Contains(a.statusMsg, "No debug session") {
+			t.Errorf("file=%q: continue path not taken (status %q)", file, a.statusMsg)
+		}
 	}
 }

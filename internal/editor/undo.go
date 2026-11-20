@@ -94,6 +94,7 @@ func (t *Tab) applySnapshot(s snapshot) {
 		t.Buffer = NewBuffer("")
 	}
 	t.Buffer.Lines = lines
+	t.Buffer.Touch() // a restore is an edit: the LSP sync and highlight memo key off Version
 	t.Cursor = s.Cursor
 	t.Anchor = s.Anchor
 	t.Marks = copyMarks(s.Marks)

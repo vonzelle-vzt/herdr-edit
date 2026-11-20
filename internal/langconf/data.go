@@ -10,7 +10,7 @@
 //	Copyright (c) Microsoft Corporation. All rights reserved.
 //	Licensed under the MIT License.
 //
-// Extracted from Visual Studio Code 1.140.0. See NOTICE at the repository root
+// Extracted from Visual Studio Code 1.147.0. See NOTICE at the repository root
 // for the full attribution and the OSS-repository / binary-distribution
 // distinction.
 // -----------------------------------------------------------------------------
@@ -20,7 +20,7 @@ package langconf
 // SourceVersion is the Visual Studio Code release the table below was
 // extracted from, recorded so the provenance in NOTICE can be checked rather
 // than taken on trust.
-const SourceVersion = "1.140.0"
+const SourceVersion = "1.147.0"
 
 // configs is the compiled-in language table, keyed by VS Code language id.
 // 69 languages.
@@ -102,7 +102,7 @@ var configs = map[string]Config{
 			{Open: "~", Close: "~"},
 			{Open: "$", Close: "$"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b.*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
 	},
 	"clojure": {
 		ID:       "clojure",
@@ -249,7 +249,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\""},
 			{Open: "'", Close: "'"},
 		},
-		Folding: Folding{Start: "^\\s*\\/\\*\\s*#region\\b\\s*(.*?)\\s*\\*\\/", End: "^\\s*\\/\\*\\s*#endregion\\b.*\\*\\/"},
+		Folding: Folding{Start: "^\\s*\\/\\*\\s*#region\\b\\s*(?<label>.*?)\\s*\\*\\/", End: "^\\s*\\/\\*\\s*#endregion\\b.*\\*\\/"},
 	},
 	"cuda-cpp": {
 		ID:       "cuda-cpp",
@@ -405,7 +405,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\""},
 			{Open: "'", Close: "'"},
 		},
-		Folding: Folding{Start: "^\\s*//\\s*#region\\b|^\\s*\\(\\*\\s*#region(.*)\\*\\)", End: "^\\s*//\\s*#endregion\\b|^\\s*\\(\\*\\s*#endregion\\s*\\*\\)"},
+		Folding: Folding{Start: "^\\s*//\\s*#region\\b|^\\s*\\(\\*\\s*#region\\s*(?<label>.*?)\\s*\\*\\)", End: "^\\s*//\\s*#endregion\\b|^\\s*\\(\\*\\s*#endregion\\s*\\*\\)"},
 	},
 	"git-commit": {
 		ID:       "git-commit",
@@ -562,7 +562,7 @@ var configs = map[string]Config{
 			{Open: "(", Close: ")"},
 			{Open: "<", Close: ">"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#region\\b.*-->", End: "^\\s*<!--\\s*#endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#endregion\\b.*-->"},
 	},
 	"ignore": {
 		ID:       "ignore",
@@ -626,7 +626,7 @@ var configs = map[string]Config{
 			{Open: "~", Close: "~"},
 			{Open: "$", Close: "$"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b.*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
 	},
 	"jade": {
 		ID:       "jade",
@@ -974,7 +974,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\""},
 			{Open: "'", Close: "'"},
 		},
-		Folding: Folding{Start: "^\\s*\\/\\*\\s*#region\\b\\s*(.*?)\\s*\\*\\/", End: "^\\s*\\/\\*\\s*#endregion\\b.*\\*\\/"},
+		Folding: Folding{Start: "^\\s*\\/\\*\\s*#region\\b\\s*(?<label>.*?)\\s*\\*\\/", End: "^\\s*\\/\\*\\s*#endregion\\b.*\\*\\/"},
 	},
 	"lua": {
 		ID:       "lua",
@@ -1042,7 +1042,7 @@ var configs = map[string]Config{
 			{Open: "~", Close: "~"},
 			{Open: "$", Close: "$"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b.*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
 	},
 	"markdown_latex_combined": {
 		ID:       "markdown_latex_combined",
@@ -1154,7 +1154,7 @@ var configs = map[string]Config{
 			{Open: "_", Close: "_"},
 			{Open: "*", Close: "*"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b.*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
 	},
 	"objective-c": {
 		ID:       "objective-c",
@@ -1308,7 +1308,7 @@ var configs = map[string]Config{
 			{Open: "~", Close: "~"},
 			{Open: "$", Close: "$"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b.*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
 	},
 	"properties": {
 		ID:       "properties",
@@ -1541,7 +1541,7 @@ var configs = map[string]Config{
 			{Open: "\"", Close: "\""},
 			{Open: "'", Close: "'"},
 		},
-		Folding: Folding{Start: "^\\s*\\/\\*\\s*#region\\b\\s*(.*?)\\s*\\*\\/", End: "^\\s*\\/\\*\\s*#endregion\\b.*\\*\\/"},
+		Folding: Folding{Start: "^\\s*\\/\\*\\s*#region\\b\\s*(?<label>.*?)\\s*\\*\\/", End: "^\\s*\\/\\*\\s*#endregion\\b.*\\*\\/"},
 	},
 	"shaderlab": {
 		ID:       "shaderlab",
@@ -1588,7 +1588,7 @@ var configs = map[string]Config{
 			{Open: "'", Close: "'"},
 			{Open: "`", Close: "`"},
 		},
-		Folding: Folding{Start: "^\\s*#\\s*#?region\\b.*", End: "^\\s*#\\s*#?endregion\\b.*"},
+		Folding: Folding{Start: "^\\s*#\\s*#?region\\b", End: "^\\s*#\\s*#?endregion\\b.*"},
 	},
 	"skill": {
 		ID:       "skill",
@@ -1617,7 +1617,7 @@ var configs = map[string]Config{
 			{Open: "~", Close: "~"},
 			{Open: "$", Close: "$"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b.*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#?region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#?endregion\\b.*-->"},
 	},
 	"snippets": {
 		ID:       "snippets",
@@ -1909,7 +1909,7 @@ var configs = map[string]Config{
 			{Open: "(", Close: ")"},
 			{Open: "<", Close: ">"},
 		},
-		Folding: Folding{Start: "^\\s*<!--\\s*#region\\b.*-->", End: "^\\s*<!--\\s*#endregion\\b.*-->"},
+		Folding: Folding{Start: "^\\s*<!--\\s*#region\\b\\s*(?<label>.*?)\\s*-->", End: "^\\s*<!--\\s*#endregion\\b.*-->"},
 	},
 	"xsl": {
 		ID:       "xsl",

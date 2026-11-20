@@ -120,6 +120,7 @@ func pyrightManager(t *testing.T) (*Manager, string, func() []Diagnostic) {
 // TestLivePyright_Diagnostics is the squiggle: the deliberate str-into-int
 // assignment must come back as an error on its own line.
 func TestLivePyright_Diagnostics(t *testing.T) {
+	skipLiveUnderShort(t)
 	_, _, diags := pyrightManager(t)
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -138,6 +139,7 @@ func TestLivePyright_Diagnostics(t *testing.T) {
 // TestLivePyright_Completion proves completion after "g." offers Greeter's
 // members, in whichever of the two response shapes the server chose.
 func TestLivePyright_Completion(t *testing.T) {
+	skipLiveUnderShort(t)
 	m, file, _ := pyrightManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -157,6 +159,7 @@ func TestLivePyright_Completion(t *testing.T) {
 
 // TestLivePyright_HoverAndDefinition hovers the call and jumps to the def.
 func TestLivePyright_HoverAndDefinition(t *testing.T) {
+	skipLiveUnderShort(t)
 	m, file, _ := pyrightManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -187,6 +190,7 @@ func TestLivePyright_HoverAndDefinition(t *testing.T) {
 
 // TestLivePyright_References: greet is declared once and called twice.
 func TestLivePyright_References(t *testing.T) {
+	skipLiveUnderShort(t)
 	m, file, _ := pyrightManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -202,6 +206,7 @@ func TestLivePyright_References(t *testing.T) {
 
 // TestLivePyright_SignatureHelp checks the parameter list survives decoding.
 func TestLivePyright_SignatureHelp(t *testing.T) {
+	skipLiveUnderShort(t)
 	m, file, _ := pyrightManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -218,6 +223,7 @@ func TestLivePyright_SignatureHelp(t *testing.T) {
 // TestLivePyright_DocumentSymbol guards the flat-vs-nested shape trap: every
 // symbol at line 0 means the payload was mis-decoded.
 func TestLivePyright_DocumentSymbol(t *testing.T) {
+	skipLiveUnderShort(t)
 	m, file, _ := pyrightManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

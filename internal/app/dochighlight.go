@@ -88,22 +88,25 @@ func (a *App) drawDocumentHighlights() {
 	}
 
 	ex, ey, ew, eh := a.editorRect()
-	lineCount := len(tab.Buffer.Lines)
+	// The memo's text component: Buffer.Version moves on every edit, which a
+	// line count does not (typing the symbol onto another line leaves it
+	// unchanged, and the highlights would go stale).
+	textKey := tab.Buffer.Version()
 
-	// 🔴 Memoized on (path, sym, ScrollY, height, lineCount). draw() clears
+	// 🔴 Memoized on (path, sym, ScrollY, height, text). draw() clears
 	// and repaints the WHOLE screen on every event this app handles,
 	// including bare mouse motion — an uncached full editor.Matches scan on
 	// every one of those is a stall the user reads as the editor hanging,
 	// not as a feature working correctly.
 	if a.docHighlightPath != tab.Path || a.docHighlightSym != sym ||
 		a.docHighlightScrollY != tab.ScrollY || a.docHighlightHeight != eh ||
-		a.docHighlightLineCount != lineCount {
+		a.docHighlightVersion != textKey {
 		a.docHighlightMatches = a.visibleOccurrences(tab, sym, tab.ScrollY, eh)
 		a.docHighlightPath = tab.Path
 		a.docHighlightSym = sym
 		a.docHighlightScrollY = tab.ScrollY
 		a.docHighlightHeight = eh
-		a.docHighlightLineCount = lineCount
+		a.docHighlightVersion = textKey
 	}
 
 	for _, m := range a.docHighlightMatches {

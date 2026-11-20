@@ -35,6 +35,8 @@ type Client struct {
 	stdout *bufio.Reader
 
 	mu       sync.Mutex
+	wmu      sync.Mutex    // serialises frames on stdin; separate from mu so a blocked write cannot wedge Stop
+	readDone chan struct{} // closed when readLoop returns
 	nextID   int
 	pending  map[int]chan rpcResponse
 	docs     map[string]int // uri -> version, so didChange is never sent out of order
@@ -108,6 +110,8 @@ func Start(ctx context.Context, name string, argv []string, rootURI string) (*Cl
 		stdout:  bufio.NewReaderSize(stdout, 64*1024),
 		pending: make(map[int]chan rpcResponse),
 		docs:    make(map[string]int),
+
+		readDone: make(chan struct{}),
 	}
 
 	go c.readLoop()
@@ -195,6 +199,14 @@ func (c *Client) initialize(ctx context.Context, rootURI string) error {
 	return nil
 }
 
+// Bounds on Client.Stop. A language server that will not exit must never keep
+// the editor from quitting, so every phase is time-limited.
+const (
+	stopShutdownWait = 1500 * time.Millisecond
+	stopExitWait     = 2 * time.Second
+	stopReadWait     = 500 * time.Millisecond
+)
+
 // Stop shuts the server down. Best-effort by design: a language server that
 // will not exit must never keep the editor from quitting, so we ask politely
 // once and then kill.
@@ -207,19 +219,37 @@ func (c *Client) Stop() {
 	c.closed = true
 	c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_, _ = c.call(ctx, "shutdown", nil)
-	_ = c.notify("exit", nil)
+	// shutdown/exit run on their own goroutine because write blocks while a
+	// wedged server's stdin pipe is full, and ctx only bounds the wait for the
+	// reply, not the write. Closing stdin below is what releases a stuck write.
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, _ = c.call(ctx, "shutdown", nil)
+		_ = c.notify("exit", nil)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(stopShutdownWait):
+	}
 
 	done := make(chan struct{})
 	go func() { _ = c.cmd.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(stopExitWait):
 		_ = c.cmd.Process.Kill()
 	}
 	_ = c.stdin.Close()
+
+	// readLoop ends when the process's stdout closes; give it a moment so Stop
+	// returning means the client's goroutines are gone, but never wait forever.
+	select {
+	case <-c.readDone:
+	case <-time.After(stopReadWait):
+	}
 }
 
 // DidOpen tells the server about a document. Diagnostics for a file generally
@@ -456,8 +486,8 @@ func (c *Client) write(req rpcRequest) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	if _, err := fmt.Fprintf(c.stdin, "Content-Length: %d\r\n\r\n", len(body)); err != nil {
 		return err
 	}
@@ -468,6 +498,9 @@ func (c *Client) write(req rpcRequest) error {
 // readLoop demultiplexes everything the server sends: replies go to whoever is
 // waiting, notifications are dispatched.
 func (c *Client) readLoop() {
+	if c.readDone != nil {
+		defer close(c.readDone)
+	}
 	for {
 		body, err := readMessage(c.stdout)
 		if err != nil {

@@ -1668,7 +1668,7 @@ func (a *App) consumeDebugRequest() {
 
 	switch req.Action {
 	case state.DebugActionStart:
-		a.menuDebugStartOrContinue()
+		a.remoteDebugStart(req)
 	case state.DebugActionContinue:
 		a.menuDebugContinue()
 	case state.DebugActionNext:
@@ -1735,12 +1735,66 @@ func (a *App) toggleBreakpointAt(file string, line int) {
 // request files are GLOBAL — one editor per project, one file for all of them —
 // so each has to decide whether a request is addressed to it. Two copies of the
 // rule would drift into two different answers to "is this mine".
+//
+// 🔴 Both sides are symlink-RESOLVED for the comparison. The editor's root is
+// filepath.Abs, not EvalSymlinks, so a request written through the other spelling
+// of the same directory (/tmp vs /private/tmp, a symlinked checkout) was
+// "outside" a project it was plainly inside — consumed and silently ignored.
+// Only the comparison resolves; the displayed root is unchanged.
 func (a *App) withinRoot(path string) bool {
 	if a.rootDir == "" {
 		return true
 	}
-	rel, err := filepath.Rel(a.rootDir, path)
-	return err == nil && !strings.HasPrefix(rel, "..")
+	rel, err := filepath.Rel(resolveForCompare(a.rootDir), resolveForCompare(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveForCompare returns path with symlinks resolved. When the path does not
+// exist yet it resolves the deepest existing parent and re-appends the rest; if
+// nothing resolves it falls back to the cleaned path.
+func resolveForCompare(path string) string {
+	path = filepath.Clean(path)
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		return r
+	}
+	dir, base := filepath.Split(path)
+	dir = filepath.Clean(dir)
+	if dir == path || dir == "." {
+		return path
+	}
+	return filepath.Join(resolveForCompare(dir), base)
+}
+
+// remoteDebugStart honours a "start" from the CLI/panel. Unlike F5 it can never
+// ask a question — there is nobody at the keyboard — so it opens the requested
+// file first (so a language-keyed start is for THAT file) and routes through
+// startDebugRouted with remote=true, which refuses instead of opening a picker.
+func (a *App) remoteDebugStart(req state.DebugRequest) {
+	// The root check comes FIRST: requests are a broadcast, so a start aimed
+	// at another project must not resume the session paused in this one.
+	if req.File != "" && !a.withinRoot(req.File) {
+		return // another editor's project — see consumeDebugRequest
+	}
+	if a.debug != nil && a.debug.stopped {
+		a.menuDebugContinue()
+		return
+	}
+	if req.File != "" {
+		if _, err := os.Stat(req.File); err != nil {
+			a.flash("Cannot open " + filepath.Base(req.File))
+			return
+		}
+		a.openFile(req.File)
+		tab := a.activeTabPtr()
+		if tab == nil {
+			a.flash("Could not open " + filepath.Base(req.File))
+			return
+		}
+		if req.Line > 0 {
+			tab.MoveCursorTo(editor.Position{Line: bufLineFromAdapter(req.Line), Col: 0}, false)
+		}
+	}
+	a.startDebugRouted(true, req.Config)
 }
 
 // debugStatus is the one-line status-bar summary of the session — the sibling

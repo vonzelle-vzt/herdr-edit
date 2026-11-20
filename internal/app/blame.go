@@ -68,10 +68,90 @@ func (a *App) inlineBlameLabel() string {
 	return "Show inline blame"
 }
 
-// maybeRequestBlame kicks a lookup for the cursor's line if one is not cached
-// and not already running. Polled from the draw path like publishActive and
-// maybeSyncLSP — one call site cannot miss a case, whereas hooks scattered
-// across every cursor mutation would.
+// blameRestDelay is how long the cursor must sit on a line before it is
+// blamed. Holding an arrow key crosses dozens of lines a second, and a git
+// process per line is the exact load this delay exists to avoid.
+const blameRestDelay = 250 * time.Millisecond
+
+// blameScheduler is the debounce and single-flight state for inline blame.
+//
+// It lives beside the App rather than in it (a package-level registry keyed by
+// *App) so this change does not touch App's field list; there is one App per
+// process, so the registry holds one entry outside of tests. Every field is
+// read and written on the UI goroutine only: the timer goroutine just posts a
+// blameRestEvent carrying the generation it was armed under.
+type blameScheduler struct {
+	gen      uint64   // bumped whenever the wanted line changes; stale timers compare against it
+	wanted   blameKey // the line the cursor is resting on (or about to rest on)
+	hasWant  bool     // wanted is meaningful
+	timer    *time.Timer
+	inflight bool      // one git process is running
+	pending  *blameKey // latest rested line that arrived while one was in flight
+
+	// Seams, so tests count git invocations without a repo or real time.
+	run   func(path string, line int) string
+	delay time.Duration
+	post  func(ev tcell.Event) // nil means App.post
+}
+
+// blameSched returns the App's scheduler, creating it with the real runner and
+// delay on first use. Only the UI goroutine calls it, so no locking.
+func (a *App) blameSched() *blameScheduler {
+	if a.blame == nil {
+		a.blame = &blameScheduler{run: runGitBlameLine, delay: blameRestDelay}
+	}
+	return a.blame
+}
+
+// cancel invalidates any armed timer so it can no longer act, and forgets the
+// wanted line.
+func (s *blameScheduler) cancel() {
+	s.gen++
+	s.hasWant = false
+	s.pending = nil
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+}
+
+// blameRestEvent says the cursor stayed on one line for the full delay. It
+// carries the generation it was armed under so a timer that raced a later
+// cursor move is dropped rather than blaming a line the user has left.
+type blameRestEvent struct {
+	gen  uint64
+	key  blameKey
+	when time.Time
+}
+
+// When satisfies tcell.Event.
+func (e *blameRestEvent) When() time.Time { return e.when }
+
+// apply runs on the UI goroutine: if the cursor is still where the timer was
+// armed, ask for the blame.
+func (e *blameRestEvent) apply(a *App) {
+	s := a.blameSched()
+	if e.gen != s.gen {
+		return
+	}
+	s.timer = nil
+	tab := a.activeTabPtr()
+	if !a.blameEnabled || tab == nil || tab.Dirty || tab.Path != e.key.path || tab.Cursor.Line != e.key.line {
+		// The world moved on between arming and firing. Forget the line so the
+		// next draw re-arms rather than waiting on a timer that is gone.
+		s.hasWant = false
+		return
+	}
+	a.startBlame(e.key)
+}
+
+// maybeRequestBlame arms a rest timer for the cursor's line when it is not
+// cached. Polled from the draw path like publishActive and maybeSyncLSP — one
+// call site cannot miss a case, whereas hooks scattered across every cursor
+// mutation would. It never starts git itself: only a line the cursor has
+// rested on for blameRestDelay is blamed, so holding an arrow key costs
+// nothing. Draw runs on every event, including bare mouse motion, so it must
+// not re-arm the timer for a line it is already waiting on.
 func (a *App) maybeRequestBlame() {
 	if !a.blameEnabled {
 		return
@@ -87,20 +167,63 @@ func (a *App) maybeRequestBlame() {
 		a.blameCache = make(map[blameKey]string)
 		a.blameInflight = make(map[blameKey]bool)
 	}
+	s := a.blameSched()
+	if _, ok := a.blameCache[key]; ok {
+		// Answered already; cancel any timer armed for a line we left.
+		if !s.hasWant || s.wanted != key {
+			s.cancel()
+			s.wanted, s.hasWant = key, true
+		}
+		return
+	}
+	if s.hasWant && s.wanted == key {
+		return // already waiting on, or running, this line
+	}
+	s.cancel()
+	s.wanted, s.hasWant = key, true
+	gen := s.gen
+	post := s.post
+	if post == nil {
+		post = a.post
+	}
+	s.timer = time.AfterFunc(s.delay, func() {
+		post(&blameRestEvent{gen: gen, key: key, when: time.Now()})
+	})
+}
+
+// startBlame runs git for key unless a lookup is already in flight, in which
+// case it remembers key and handleBlame requests it on completion. At most one
+// git process exists at a time.
+func (a *App) startBlame(key blameKey) {
+	s := a.blameSched()
 	if _, ok := a.blameCache[key]; ok {
 		return
 	}
-	if a.blameInflight[key] {
+	if s.inflight {
+		k := key
+		s.pending = &k
 		return
 	}
+	s.inflight = true
+	if a.blameInflight == nil {
+		a.blameInflight = make(map[blameKey]bool)
+	}
 	a.blameInflight[key] = true
+	run := s.run
+	post := s.post
+	if post == nil {
+		post = a.post
+	}
+	done := a.trackJob()
 	go func() {
-		text := runGitBlameLine(key.path, key.line)
-		a.post(&blameEvent{key: key, text: text, when: time.Now()})
+		defer done()
+		text := run(key.path, key.line)
+		post(&blameEvent{key: key, text: text, when: time.Now()})
 	}()
 }
 
-// handleBlame stores a finished lookup.
+// handleBlame stores a finished lookup, then requests the line the cursor
+// rested on while it ran, if that is still where the cursor is.
 func (a *App) handleBlame(e *blameEvent) {
 	if a.blameCache == nil {
 		a.blameCache = make(map[blameKey]string)
@@ -108,7 +231,15 @@ func (a *App) handleBlame(e *blameEvent) {
 	if a.blameInflight != nil {
 		delete(a.blameInflight, e.key)
 	}
+	s := a.blameSched()
+	s.inflight = false
 	a.blameCache[e.key] = e.text
+	if p := s.pending; p != nil {
+		s.pending = nil
+		if s.hasWant && s.wanted == *p {
+			a.startBlame(*p)
+		}
+	}
 }
 
 // invalidateBlame drops the cache for a path. Called after a save, because the
@@ -118,6 +249,11 @@ func (a *App) invalidateBlame(path string) {
 		if k.path == path {
 			delete(a.blameCache, k)
 		}
+	}
+	// Forget the wanted line too, or the next draw would see "already waiting
+	// on this line" and never re-request the answer just thrown away.
+	if s := a.blameSched(); s.hasWant && s.wanted.path == path {
+		s.cancel()
 	}
 }
 

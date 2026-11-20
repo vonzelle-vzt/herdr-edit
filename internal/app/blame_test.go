@@ -10,8 +10,11 @@ package app
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gdamore/tcell/v2"
 )
 
 // TestFormatBlamePorcelain_Commit renders a normal commit: author, a coarse
@@ -132,5 +135,165 @@ func TestBlame_InvalidateOnSave(t *testing.T) {
 	}
 	if a.blameCache[blameKey{path: "/b.go", line: 1}] != "z" {
 		t.Error("invalidating one path dropped another path's entry")
+	}
+}
+
+// blameHarness wires a scheduler to a fake runner and a captured event queue,
+// so the tests count "git invocations" without a repo or a real screen.
+type blameHarness struct {
+	a      *App
+	s      *blameScheduler
+	events chan tcell.Event
+	runs   atomic.Int32
+	cur    atomic.Int32
+	max    atomic.Int32
+	gate   chan struct{} // nil means the runner returns immediately
+}
+
+// newBlameHarness builds an App with a short rest delay and a counting runner.
+func newBlameHarness(t *testing.T, delay time.Duration) *blameHarness {
+	t.Helper()
+	h := &blameHarness{a: seedNavApp(t, "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n"), events: make(chan tcell.Event, 64)}
+	h.a.blameEnabled = true
+	h.s = h.a.blameSched()
+	h.s.delay = delay
+	h.s.post = func(ev tcell.Event) { h.events <- ev }
+	h.s.run = func(path string, line int) string {
+		h.runs.Add(1)
+		n := h.cur.Add(1)
+		for {
+			m := h.max.Load()
+			if n <= m || h.max.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		if h.gate != nil {
+			<-h.gate
+		}
+		h.cur.Add(-1)
+		return fmt.Sprintf("blamed line %d", line)
+	}
+	return h
+}
+
+// next waits for one posted event.
+func (h *blameHarness) next(t *testing.T) tcell.Event {
+	t.Helper()
+	select {
+	case ev := <-h.events:
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatal("no event posted")
+		return nil
+	}
+}
+
+// TestBlame_RapidMovesRunNoGitUntilRest is the regression for the per-line
+// process storm: crossing ten lines in a burst must start ZERO git runs, and
+// after the cursor rests only the final line is blamed.
+func TestBlame_RapidMovesRunNoGitUntilRest(t *testing.T) {
+	h := newBlameHarness(t, 60*time.Millisecond)
+	tab := h.a.activeTabPtr()
+	for line := 0; line < 10; line++ {
+		tab.Cursor.Line = line
+		h.a.maybeRequestBlame()
+	}
+	if got := h.runs.Load(); got != 0 {
+		t.Fatalf("%d git runs during a rapid move, want 0", got)
+	}
+	ev := h.next(t).(*blameRestEvent)
+	ev.apply(h.a)
+	if ev.key.line != 9 {
+		t.Fatalf("rested on line %d, want the last (9)", ev.key.line)
+	}
+	be := h.next(t).(*blameEvent)
+	h.a.handleBlame(be)
+	if got := h.runs.Load(); got != 1 {
+		t.Fatalf("%d git runs after rest, want exactly 1", got)
+	}
+	if h.a.blameCache[blameKey{path: tab.Path, line: 9}] == "" {
+		t.Fatal("the rested line was not cached")
+	}
+}
+
+// TestBlame_StaleRestEventDropped pins the generation guard: a timer event that
+// raced a later cursor move must not blame the line the user has left.
+func TestBlame_StaleRestEventDropped(t *testing.T) {
+	h := newBlameHarness(t, time.Hour)
+	tab := h.a.activeTabPtr()
+	tab.Cursor.Line = 2
+	h.a.maybeRequestBlame()
+	stale := &blameRestEvent{gen: h.s.gen, key: blameKey{path: tab.Path, line: 2}}
+	tab.Cursor.Line = 3
+	h.a.maybeRequestBlame()
+	stale.apply(h.a)
+	if h.runs.Load() != 0 || h.s.inflight {
+		t.Fatal("a stale timer event started a blame")
+	}
+}
+
+// TestBlame_RedrawDoesNotRearm pins that draw, which runs on every event
+// including mouse motion, does not push the rest timer out forever.
+func TestBlame_RedrawDoesNotRearm(t *testing.T) {
+	h := newBlameHarness(t, 30*time.Millisecond)
+	h.a.activeTabPtr().Cursor.Line = 4
+	for i := 0; i < 5; i++ {
+		h.a.maybeRequestBlame()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := h.next(t).(*blameRestEvent); !ok {
+		t.Fatal("repeated draws on one line starved the rest timer")
+	}
+}
+
+// TestBlame_AtMostOneInFlight pins single-flight: a second rested line arriving
+// while git runs is remembered and requested only on completion, so concurrency
+// never exceeds one.
+func TestBlame_AtMostOneInFlight(t *testing.T) {
+	h := newBlameHarness(t, time.Millisecond)
+	h.gate = make(chan struct{})
+	tab := h.a.activeTabPtr()
+
+	tab.Cursor.Line = 1
+	h.a.maybeRequestBlame()
+	h.next(t).(*blameRestEvent).apply(h.a) // starts line 1, blocks on the gate
+
+	tab.Cursor.Line = 2
+	h.a.maybeRequestBlame()
+	h.next(t).(*blameRestEvent).apply(h.a) // must wait, not start
+	time.Sleep(20 * time.Millisecond)
+	if got := h.runs.Load(); got != 1 {
+		t.Fatalf("%d runs while one was in flight, want 1", got)
+	}
+
+	h.gate <- struct{}{} // finish line 1
+	h.a.handleBlame(h.next(t).(*blameEvent))
+	h.gate <- struct{}{} // the remembered line 2 now runs
+	h.a.handleBlame(h.next(t).(*blameEvent))
+
+	if got := h.runs.Load(); got != 2 {
+		t.Fatalf("%d runs total, want 2", got)
+	}
+	if got := h.max.Load(); got != 1 {
+		t.Fatalf("max concurrency %d, want 1", got)
+	}
+	if h.a.blameCache[blameKey{path: tab.Path, line: 2}] == "" {
+		t.Fatal("the remembered line was never blamed")
+	}
+}
+
+// TestBlame_InvalidateRearms pins that dropping the cache after a save lets the
+// same line be requested again instead of being treated as already pending.
+func TestBlame_InvalidateRearms(t *testing.T) {
+	h := newBlameHarness(t, time.Millisecond)
+	tab := h.a.activeTabPtr()
+	tab.Cursor.Line = 5
+	h.a.maybeRequestBlame()
+	h.next(t).(*blameRestEvent).apply(h.a)
+	h.a.handleBlame(h.next(t).(*blameEvent))
+	h.a.invalidateBlame(tab.Path)
+	h.a.maybeRequestBlame()
+	if _, ok := h.next(t).(*blameRestEvent); !ok {
+		t.Fatal("invalidate did not allow a fresh request")
 	}
 }

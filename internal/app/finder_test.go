@@ -348,3 +348,21 @@ func TestOpenFinder_NoOpInSingleFileMode(t *testing.T) {
 		t.Fatal("expected a flash explaining the finder is unavailable")
 	}
 }
+
+// TestInvalidateFinder_KeepsResultsWhileRebuilding pins the no-flicker rule at the UI seam: the
+// 10s refresh invalidates the index, and an open finder must keep its previous results instead of
+// blanking to "Indexing…" until the rebuild lands.
+func TestInvalidateFinder_KeepsResultsWhileRebuilding(t *testing.T) {
+	a, _ := withFinder(t)
+	a.openFinder()
+	before := len(a.finderResults)
+	if before == 0 {
+		t.Fatal("precondition: warm finder should have results")
+	}
+
+	a.finder.Invalidate() // what invalidateFinder does first; the rebuild is asynchronous
+	a.refreshFinderResults()
+	if len(a.finderResults) != before {
+		t.Fatalf("results while rebuilding: got %d, want the previous %d", len(a.finderResults), before)
+	}
+}

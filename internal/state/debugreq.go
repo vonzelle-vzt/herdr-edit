@@ -32,6 +32,7 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,6 +41,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -121,6 +123,9 @@ type DebugRequest struct {
 	File   string `json:"file"`
 	Line   int    `json:"line"`
 	Node   string `json:"node,omitempty"`
+	// Config names a launch.json configuration for a remote "start", so the
+	// editor never has to open its interactive picker for a CLI caller.
+	Config string `json:"config,omitempty"`
 	Seq    int64  `json:"seq"`
 
 	ID       string `json:"id,omitempty"`
@@ -156,6 +161,15 @@ func WriteDebugRequest(action, file string, line int, node ...string) error {
 		return errors.New("test needs a file and pytest node")
 	}
 	req := DebugRequest{Action: action, File: file, Line: line, Node: testNode, Seq: time.Now().UnixNano()}
+	return writeStateJSON(req, "debug-request-*.tmp", DebugRequestFile())
+}
+
+// WriteDebugStart asks the editor to start a debug session, optionally at a
+// location and naming a launch.json configuration. It is WriteDebugRequest's
+// "start" with the one field that function's signature cannot carry, so the CLI
+// never makes the editor open its interactive picker.
+func WriteDebugStart(file string, line int, config string) error {
+	req := DebugRequest{Action: DebugActionStart, File: file, Line: line, Config: config, Seq: time.Now().UnixNano()}
 	return writeStateJSON(req, "debug-request-*.tmp", DebugRequestFile())
 }
 
@@ -268,11 +282,25 @@ func ParseDebugQuery(action string, args []string) (DebugRequest, error) {
 // ABSENT rather than as an error. The editor polls this several times a second;
 // a panel that wrote junk — or a half-finished file from some other tool — must
 // cost nothing more than a poll that found nothing.
+//
+// Cached against the file's stat signature (see polledFile), because Run polls
+// this on every event; a changed file is always re-read and re-validated.
 func ReadDebugRequest() (DebugRequest, bool) {
-	raw, err := os.ReadFile(DebugRequestFile())
-	if err != nil {
-		return DebugRequest{}, false
+	req, ok := debugRequestCache.get(DebugRequestFile(), parseDebugRequest)
+	if ok && req.FrameID != nil {
+		// Hand each caller its own copy so a caller cannot mutate the cache.
+		n := *req.FrameID
+		req.FrameID = &n
 	}
+	return req, ok
+}
+
+// debugRequestCache is ReadDebugRequest's memory.
+var debugRequestCache polledFile[DebugRequest]
+
+// parseDebugRequest decodes and validates one debug-request.json payload. It is
+// the whole of what used to run on every poll.
+func parseDebugRequest(raw []byte) (DebugRequest, bool) {
 	var req DebugRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return DebugRequest{}, false
@@ -339,7 +367,58 @@ func RegisterDebugInstance(inst DebugInstance) error {
 	if !validDebugName(inst.ID) {
 		return fmt.Errorf("invalid debug instance id %q", inst.ID)
 	}
-	return writeStateJSON(inst, "instance-*.tmp", filepath.Join(debugInstanceDir(), inst.ID+".json"))
+	file := filepath.Join(debugInstanceDir(), inst.ID+".json")
+	err := writeStateJSON(inst, "instance-*.tmp", file)
+	if err == nil {
+		instanceMemo.set(file, true)
+	}
+	return err
+}
+
+// instanceMemoTTL bounds how long DebugInstanceRegistered trusts memory. Only
+// this process registers and unregisters its own id, so memory is normally
+// exact; the bound is the self-heal for the one thing it cannot see — somebody
+// deleting the state directory while the editor runs — which is noticed within
+// this long instead of never.
+const instanceMemoTTL = 5 * time.Second
+
+// instanceMemo remembers, per registration file, the last answer this process
+// gave or caused, so the per-event poll in Run does not stat a file only it
+// writes. now is a seam for the TTL.
+var instanceMemo = instanceMemoTable{now: time.Now}
+
+// instanceMemoTable is the table behind instanceMemo.
+type instanceMemoTable struct {
+	mu  sync.Mutex
+	now func() time.Time
+	m   map[string]instanceMemoEntry
+}
+
+// instanceMemoEntry is one remembered answer and when it was learned.
+type instanceMemoEntry struct {
+	registered bool
+	at         time.Time
+}
+
+// set records that file is (or is not) registered, as of now.
+func (t *instanceMemoTable) set(file string, registered bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.m == nil {
+		t.m = make(map[string]instanceMemoEntry)
+	}
+	t.m[file] = instanceMemoEntry{registered: registered, at: t.now()}
+}
+
+// get returns the remembered answer if it is still within the TTL.
+func (t *instanceMemoTable) get(file string) (registered, fresh bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.m[file]
+	if !ok || t.now().Sub(e.at) > instanceMemoTTL {
+		return false, false
+	}
+	return e.registered, true
 }
 
 // UnregisterDebugInstance removes id's registration and any queries still
@@ -348,16 +427,28 @@ func UnregisterDebugInstance(id string) {
 	if !validDebugName(id) {
 		return
 	}
-	os.Remove(filepath.Join(debugInstanceDir(), id+".json"))
+	file := filepath.Join(debugInstanceDir(), id+".json")
+	os.Remove(file)
 	os.RemoveAll(debugQueryDir(id))
+	instanceMemo.set(file, false)
 }
 
 // DebugInstanceRegistered reports whether id is registered.
+//
+// Answered from memory when this process registered or unregistered id within
+// instanceMemoTTL, and from a stat otherwise (a stat result is remembered too).
+// serveDebugQueries asks on every event in Run, and the only writer of an
+// editor's own registration is that editor.
 func DebugInstanceRegistered(id string) bool {
 	if !validDebugName(id) {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(debugInstanceDir(), id+".json"))
+	file := filepath.Join(debugInstanceDir(), id+".json")
+	if reg, fresh := instanceMemo.get(file); fresh {
+		return reg
+	}
+	_, err := os.Stat(file)
+	instanceMemo.set(file, err == nil)
 	return err == nil
 }
 
@@ -536,20 +627,56 @@ func ReadDebugReply(id string) (json.RawMessage, bool) {
 	return r.Reply, true
 }
 
+// Backoff bounds for AwaitDebugReplyContext. A fast reply is seen within 10ms;
+// a slow one (an idle editor turns its loop every 10s) settles at 100ms instead
+// of waking 50 times a second for the whole wait.
+const (
+	awaitReplyMinPoll = 10 * time.Millisecond
+	awaitReplyMaxPoll = 100 * time.Millisecond
+)
+
 // AwaitDebugReply polls for the answer to the query id sent to instance until
 // timeout. On timeout the query is withdrawn if no editor has taken it yet.
 func AwaitDebugReply(instance, id string, timeout time.Duration) (json.RawMessage, error) {
+	return AwaitDebugReplyContext(context.Background(), instance, id, timeout)
+}
+
+// AwaitDebugReplyContext is AwaitDebugReply that also stops when ctx ends. The
+// poll interval starts at 10ms and doubles to a 100ms cap. On timeout or
+// cancellation the query is withdrawn if no editor has taken it yet, so a side
+// effect never runs for a caller that already gave up.
+func AwaitDebugReplyContext(ctx context.Context, instance, id string, timeout time.Duration) (json.RawMessage, error) {
 	deadline := time.Now().Add(timeout)
+	withdraw := func() {
+		if validDebugName(instance) && validDebugName(id) {
+			os.Remove(filepath.Join(debugQueryDir(instance), id+".json"))
+		}
+	}
+	poll := awaitReplyMinPoll
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
 	for {
 		if r, ok := ReadDebugReply(id); ok {
 			return r, nil
 		}
-		if time.Now().After(deadline) {
-			if validDebugName(instance) && validDebugName(id) {
-				os.Remove(filepath.Join(debugQueryDir(instance), id+".json"))
-			}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			withdraw()
 			return nil, fmt.Errorf("debug session %s did not answer within %s", instance, timeout)
 		}
-		time.Sleep(20 * time.Millisecond)
+		wait := poll
+		if wait > remaining {
+			wait = remaining
+		}
+		timer.Reset(wait)
+		select {
+		case <-ctx.Done():
+			withdraw()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		if poll *= 2; poll > awaitReplyMaxPoll {
+			poll = awaitReplyMaxPoll
+		}
 	}
 }

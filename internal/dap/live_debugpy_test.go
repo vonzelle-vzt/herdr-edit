@@ -309,6 +309,7 @@ func (s *debugpySession) countStoppedEvents() int {
 // against an adapter that shares none of delve's implementation choices. Passing
 // both is the only evidence that the layer between them is an abstraction.
 func TestLiveDebugpyStopsAtBreakpoint(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), debugpyTimeout)
 	defer cancel()
 
@@ -378,6 +379,7 @@ func TestLiveDebugpyStopsAtBreakpoint(t *testing.T) {
 
 // TestLiveDebugpyDebugsAPytestTest proves the synthesized module launch stops inside one pytest node.
 func TestLiveDebugpyDebugsAPytestTest(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), debugpyTimeout)
 	defer cancel()
 
@@ -458,6 +460,7 @@ func TestLiveDebugpyDebugsAPytestTest(t *testing.T) {
 // moment a naive client would have blocked on it, which is the only way to show
 // the deadlock is real and not defensive programming.
 func TestLiveDebugpyWithholdsTheLaunchResponse(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), debugpyTimeout)
 	defer cancel()
 
@@ -532,6 +535,7 @@ func TestLiveDebugpyWithholdsTheLaunchResponse(t *testing.T) {
 // against two independent implementations is what turns "our client sends
 // `condition`" into "conditional breakpoints work".
 func TestLiveDebugpyConditionalBreakpointFiresOnce(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), debugpyTimeout)
 	defer cancel()
 
@@ -597,6 +601,7 @@ func (s *debugpySession) awaitFinished(t *testing.T) bool {
 // `output` EVENTS instead, and the sentinel is a string only the fixture can
 // produce, so this cannot pass against the adapter's own chatter.
 func TestLiveDebugpyProgramOutputArrivesAsEvents(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), debugpyTimeout)
 	defer cancel()
 
