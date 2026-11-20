@@ -20,14 +20,8 @@
 package app
 
 import (
-	"strconv"
 	"time"
 )
-
-// lspWakeKey is the reserved lspSentText key that records "a wake timer is
-// already armed". The empty path is never synced (maybeSyncLSP skips pathless
-// tabs), so it cannot collide with a document.
-const lspWakeKey = ""
 
 // lspChangeObserver, when non-nil, sees every didChange maybeSyncLSP sends.
 // It exists so tests can observe the sync without a language-server process.
@@ -44,12 +38,7 @@ func (e *lspWakeEvent) When() time.Time { return e.when }
 // apply runs on the UI goroutine and disarms the timer marker so a later
 // throttled edit can arm a fresh one.
 func (e *lspWakeEvent) apply(a *App) {
-	delete(a.lspSentText, lspWakeKey)
-}
-
-// lspVersionStamp renders a buffer version for storage in lspSentText.
-func lspVersionStamp(v uint64) string {
-	return "v" + strconv.FormatUint(v, 10)
+	a.lspWakeArmed = false
 }
 
 // lspChangePending reports whether the active document has edits the server has
@@ -59,7 +48,8 @@ func (a *App) lspChangePending() bool {
 	if tab == nil || tab.Path == "" || tab.IsImage() {
 		return false
 	}
-	return a.lspSentText[tab.Path] != lspVersionStamp(tab.Buffer.Version())
+	sent, ok := a.lspSentVersion[tab.Path]
+	return !ok || sent != tab.Buffer.Version()
 }
 
 // scheduleLSPWake arms exactly one timer that posts an lspWakeEvent after d.
@@ -70,13 +60,10 @@ func (a *App) scheduleLSPWake(d time.Duration) {
 	if a.screen == nil {
 		return
 	}
-	if a.lspSentText == nil {
-		a.lspSentText = make(map[string]string)
-	}
-	if _, armed := a.lspSentText[lspWakeKey]; armed {
+	if a.lspWakeArmed {
 		return
 	}
-	a.lspSentText[lspWakeKey] = "armed"
+	a.lspWakeArmed = true
 	scr := a.screen
 	time.AfterFunc(d, func() {
 		_ = scr.PostEvent(&lspWakeEvent{when: time.Now()})

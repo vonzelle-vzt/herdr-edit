@@ -418,7 +418,8 @@ type App struct {
 	// per absolute path. Both nil when no server is available, which every call site tolerates.
 	lsp         *lsp.Manager
 	diagnostics map[string][]lsp.Diagnostic
-	lspSentText map[string]string // last text each document was sent with, to skip no-op syncs
+	lspSentVersion map[string]uint64 // Buffer.Version each document was last synced at, to skip no-op syncs
+	lspWakeArmed   bool              // a trailing-edge sync wake is scheduled (lspsync.go)
 	lspSyncedAt time.Time
 
 	// startRows maps start-page rows back to files so a click can open them. Rebuilt each draw.
@@ -639,7 +640,7 @@ type App struct {
 	docHighlightSym       string
 	docHighlightScrollY   int
 	docHighlightHeight    int
-	docHighlightLineCount int
+	docHighlightVersion   uint64
 	docHighlightMatches   []editor.Match
 
 	// Highest open-request sequence already honoured. See consumeOpenRequest.

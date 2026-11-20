@@ -136,7 +136,7 @@ func TestThrottledSkipWithNothingPendingArmsNoWake(t *testing.T) {
 	tab.Buffer.InsertString(editor.Position{}, "a")
 	a.maybeSyncLSP() // sent
 	a.maybeSyncLSP() // throttled, nothing new
-	if _, armed := a.lspSentText[lspWakeKey]; armed {
+	if a.lspWakeArmed {
 		t.Fatal("a wake was armed with no pending change")
 	}
 }
@@ -172,9 +172,9 @@ func TestMaybeSyncLSPUsesVersionNotText(t *testing.T) {
 // TestLSPWakeEventDisarmsTheTimerMarker pins that applying the wake clears the
 // armed marker so the next throttled edit can schedule again.
 func TestLSPWakeEventDisarmsTheTimerMarker(t *testing.T) {
-	a := &App{lspSentText: map[string]string{lspWakeKey: "armed"}}
+	a := &App{lspWakeArmed: true}
 	a.handleEvent(&lspWakeEvent{when: time.Now()})
-	if _, armed := a.lspSentText[lspWakeKey]; armed {
+	if a.lspWakeArmed {
 		t.Fatal("wake event left the marker armed")
 	}
 }

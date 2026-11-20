@@ -546,3 +546,19 @@ func TestUndoRestoresMarkPositions(t *testing.T) {
 		t.Fatalf("expected the mark back on line 10 after undo, marks=%v", tab.Marks)
 	}
 }
+
+// TestUndo_MovesBufferVersion pins that restoring a snapshot bumps
+// Buffer.Version: applySnapshot replaces Lines wholesale, and an undo the LSP
+// sync could not see would leave the server diagnosing text that is gone.
+func TestUndo_MovesBufferVersion(t *testing.T) {
+	tab := &Tab{Buffer: NewBuffer("abc")}
+	tab.Cursor = Position{Line: 0, Col: 3}
+	tab.InsertRune('d')
+	before := tab.Buffer.Version()
+	if !tab.Undo() {
+		t.Fatal("nothing to undo")
+	}
+	if tab.Buffer.Version() == before {
+		t.Fatal("Undo replaced Lines without moving Buffer.Version")
+	}
+}

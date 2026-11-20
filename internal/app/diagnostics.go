@@ -177,10 +177,10 @@ func (a *App) maybeSyncLSP() {
 	if !a.lspChangePending() {
 		return
 	}
-	if a.lspSentText == nil {
-		a.lspSentText = make(map[string]string)
+	if a.lspSentVersion == nil {
+		a.lspSentVersion = make(map[string]uint64)
 	}
-	a.lspSentText[tab.Path] = lspVersionStamp(tab.Buffer.Version())
+	a.lspSentVersion[tab.Path] = tab.Buffer.Version()
 	a.lspDidChange(tab.Path, tab.Buffer.String())
 }
 
