@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cloudmanic/spice-edit/internal/lsp"
+	"github.com/gdamore/tcell/v2"
 )
 
 // TestOutline_LoadsIntoThePalette pins that the outline reuses the palette
@@ -272,6 +273,45 @@ func TestCodeActions_UnavailableIsListedAndExplains(t *testing.T) {
 	}
 	if tab.Buffer.String() != "keep\n" {
 		t.Fatal("an unavailable action changed the buffer")
+	}
+}
+
+// TestCodeActions_UnavailableMarkerSurvivesTruncation reads the RENDERED palette
+// row, not the label field. In the real editor against gopls, a long title with a
+// long kind truncated the label, and "(unavailable)" was at the end, so the row
+// read as runnable: "Show compiler optimization details  source.toggleCompilerOptDetails".
+func TestCodeActions_UnavailableMarkerSurvivesTruncation(t *testing.T) {
+	a := seedNavApp(t, "keep\n")
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(80, 24)
+	a.width, a.height = scr.Size()
+	a.handleCodeActions(&codeActionsEvent{actions: []lsp.CodeAction{{
+		Title:       "Show compiler optimization details",
+		Kind:        "source.toggleCompilerOptDetails",
+		Command:     "gopls.gc_details",
+		Unavailable: "needs workspace/executeCommand (gopls.gc_details), which this editor does not implement",
+	}}, when: time.Now()})
+	a.draw()
+	a.screen.Show()
+
+	cells, w, h := scr.GetContents()
+	found := false
+	for y := 0; y < h; y++ {
+		var row strings.Builder
+		for x := 0; x < w; x++ {
+			if len(cells[y*w+x].Runes) > 0 {
+				row.WriteRune(cells[y*w+x].Runes[0])
+			}
+		}
+		if strings.Contains(row.String(), "toggleCompilerOptDetails") {
+			found = true
+			if !strings.Contains(row.String(), "unavailable") {
+				t.Errorf("rendered row hides that the action is unavailable: %q", strings.TrimSpace(row.String()))
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the action's row was not drawn at all")
 	}
 }
 

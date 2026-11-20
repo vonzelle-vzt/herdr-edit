@@ -251,8 +251,12 @@ func (a *App) handleCodeActions(e *codeActionsEvent) {
 	for _, act := range e.actions {
 		act := act
 		label := act.Title
+		// The marker goes FIRST. The palette truncates a long label to make room
+		// for the kind on the right, and gopls kinds such as
+		// source.toggleCompilerOptDetails are long, so a trailing "(unavailable)"
+		// was the part cut off and a command-only action looked runnable.
 		if act.Unavailable != "" {
-			label += " (unavailable)"
+			label = "(unavailable) " + label
 		}
 		cmds = append(cmds, paletteCommand{
 			label:    label,
