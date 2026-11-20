@@ -256,7 +256,7 @@ func TestHelpNamesTheRealBinary(t *testing.T) {
 	if strings.Contains(help, "spiceedit") || strings.Contains(help, "SpiceEdit") {
 		t.Errorf("--help still names the upstream binary:\n%s", help)
 	}
-	for _, want := range []string{"herdr-edit --capabilities", "--config NAME", "start [FILE[:LINE]]", "Exit codes", "3  the request was written"} {
+	for _, want := range []string{"herdr-edit --capabilities", "--config NAME", "start [FILE[:LINE]]", "Exit codes", "3  the request was QUEUED but no running editor", "not a confirmation that the"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("--help does not mention %q", want)
 		}
