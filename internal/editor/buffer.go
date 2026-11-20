@@ -12,7 +12,10 @@
 // the rendering and tokenisation code uncluttered.
 package editor
 
-import "strings"
+import (
+	"strings"
+	"sync/atomic"
+)
 
 // Position is a buffer location measured in lines and rune-indexed columns.
 // Line is 0-based; Col is 0-based and counts runes (not bytes, not screen
@@ -28,16 +31,38 @@ type Position struct {
 // file sizes this editor actually opens (review + small edits).
 type Buffer struct {
 	Lines []string
+
+	// version is a stamp that changes whenever the text does. See Version.
+	version uint64
 }
+
+// bufferStamp hands out version stamps. It is process-wide rather than
+// per-buffer so that two DIFFERENT buffers never share a stamp: a tab that is
+// reloaded from disk gets a brand-new Buffer, and a per-buffer counter would
+// restart at the value the old one had and look "unchanged" to a caller that
+// compared stamps across the swap.
+var bufferStamp atomic.Uint64
+
+// Version returns a stamp that differs after every mutation made through the
+// Buffer primitives (InsertString, DeleteRange) or an explicit Touch, and that
+// is never shared between two buffers built with NewBuffer. Callers compare it
+// for equality only; it is a cheap "did the text change" test that replaces
+// serialising and comparing the whole document.
+func (b *Buffer) Version() uint64 { return b.version }
+
+// Touch records a mutation made by code that edits Lines directly instead of
+// going through InsertString/DeleteRange (comment toggling, undo restore).
+// Those writers must call it, or Version will not move for their edits.
+func (b *Buffer) Touch() { b.version = bufferStamp.Add(1) }
 
 // NewBuffer constructs a Buffer from a string by splitting on newlines.
 // A trailing newline produces an empty final line, mirroring how files
 // commonly end and what most editors display.
 func NewBuffer(text string) *Buffer {
 	if text == "" {
-		return &Buffer{Lines: []string{""}}
+		return &Buffer{Lines: []string{""}, version: bufferStamp.Add(1)}
 	}
-	return &Buffer{Lines: strings.Split(text, "\n")}
+	return &Buffer{Lines: strings.Split(text, "\n"), version: bufferStamp.Add(1)}
 }
 
 // String serialises the buffer back to a single newline-joined string,
@@ -94,6 +119,7 @@ func (b *Buffer) InsertString(p Position, text string) Position {
 	parts := strings.Split(text, "\n")
 	if len(parts) == 1 {
 		b.Lines[p.Line] = before + parts[0] + after
+		b.Touch()
 		return Position{Line: p.Line, Col: p.Col + len([]rune(parts[0]))}
 	}
 
@@ -111,6 +137,7 @@ func (b *Buffer) InsertString(p Position, text string) Position {
 	out = append(out, newLines...)
 	out = append(out, b.Lines[p.Line+1:]...)
 	b.Lines = out
+	b.Touch()
 
 	return Position{Line: p.Line + len(parts) - 1, Col: len([]rune(last))}
 }
@@ -137,6 +164,7 @@ func (b *Buffer) DeleteRange(a, c Position) Position {
 	out = append(out, head+tail)
 	out = append(out, b.Lines[c.Line+1:]...)
 	b.Lines = out
+	b.Touch()
 	return a
 }
 
