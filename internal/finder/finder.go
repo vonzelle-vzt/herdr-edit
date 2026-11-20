@@ -42,10 +42,10 @@ import (
 type State int
 
 const (
-	StateIdle      State = iota // never built, no rebuild in flight
-	StateBuilding               // first build (or a rebuild) in progress
-	StateReady                  // last build completed successfully
-	StateErrored                // last build returned an error
+	StateIdle     State = iota // never built, no rebuild in flight
+	StateBuilding              // first build (or a rebuild) in progress
+	StateReady                 // last build completed successfully
+	StateErrored               // last build returned an error
 )
 
 // Finder owns the cached project index and the build goroutine.
