@@ -1770,14 +1770,16 @@ func resolveForCompare(path string) string {
 // file first (so a language-keyed start is for THAT file) and routes through
 // startDebugRouted with remote=true, which refuses instead of opening a picker.
 func (a *App) remoteDebugStart(req state.DebugRequest) {
+	// The root check comes FIRST: requests are a broadcast, so a start aimed
+	// at another project must not resume the session paused in this one.
+	if req.File != "" && !a.withinRoot(req.File) {
+		return // another editor's project — see consumeDebugRequest
+	}
 	if a.debug != nil && a.debug.stopped {
 		a.menuDebugContinue()
 		return
 	}
 	if req.File != "" {
-		if !a.withinRoot(req.File) {
-			return // another editor's project — see consumeDebugRequest
-		}
 		if _, err := os.Stat(req.File); err != nil {
 			a.flash("Cannot open " + filepath.Base(req.File))
 			return

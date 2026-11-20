@@ -3824,3 +3824,49 @@ func TestWithinRootResolvesSymlinks(t *testing.T) {
 		t.Error("a genuinely outside path was judged inside")
 	}
 }
+
+// TestRemoteStartForAnotherProjectDoesNotResumeAPausedSession pins the
+// broadcast guard on the continue path. Debug requests reach every running
+// editor, and a remote start with a FILE is how a caller aims at one project.
+// remoteDebugStart used to resume a paused session BEFORE checking the file was
+// in its root, so "start projectA/main.py" resumed the program paused in
+// projectB's editor. A start for a file outside this root must do nothing.
+func TestRemoteStartForAnotherProjectDoesNotResumeAPausedSession(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	a.debug = &debugSession{stopped: true}
+	elsewhere := filepath.Join(t.TempDir(), "main.py")
+	if err := os.WriteFile(elsewhere, []byte("print('a')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.statusMsg = ""
+
+	a.remoteDebugStart(state.DebugRequest{Action: state.DebugActionStart, File: elsewhere})
+
+	if a.statusMsg != "" {
+		t.Fatalf("a start aimed at another project acted on this editor: status %q", a.statusMsg)
+	}
+	if !a.debug.stopped {
+		t.Fatal("a start aimed at another project resumed this editor's paused session")
+	}
+}
+
+// TestRemoteStartInsideRootStillResumesAPausedSession pins the other half:
+// the guard must not break the existing "start while paused = continue" for a
+// request aimed at THIS project, or for a bare start with no file.
+func TestRemoteStartInsideRootStillResumesAPausedSession(t *testing.T) {
+	a := newTestApp(t, t.TempDir())
+	inside := filepath.Join(a.rootDir, "main.py")
+	if err := os.WriteFile(inside, []byte("print('a')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{inside, ""} {
+		a.debug = &debugSession{stopped: true}
+		a.statusMsg = ""
+		a.remoteDebugStart(state.DebugRequest{Action: state.DebugActionStart, File: file})
+		// No client in this fixture, so menuDebugContinue reaches its
+		// "No debug session" flash. Reaching it is the evidence it ran.
+		if !strings.Contains(a.statusMsg, "No debug session") {
+			t.Errorf("file=%q: continue path not taken (status %q)", file, a.statusMsg)
+		}
+	}
+}
