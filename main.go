@@ -51,6 +51,7 @@ const exitNoEditor = 3
 // Wire-format versions advertised by --capabilities. They describe
 // debug-session.json and docs/viz-schema-v1.json; bump only with those.
 const (
+	capabilitiesSchema = 1 // the shape of the --capabilities document itself
 	debugSessionSchema = 1
 	vizSchema          = 1
 )
@@ -239,10 +240,12 @@ Usage:
   herdr-edit --help              Print this help and exit.
 
 Exit codes:
-  0  done (for --open-at and --debug requests: a running editor is registered)
+  0  done. For --open-at and --debug requests: the request was QUEUED while at
+     least one running editor was registered. It is not a confirmation that the
+     file opened; each editor claims only paths inside its own root.
   1  failed (bad arguments, or the request could not be written)
-  3  the request was written but NO running editor took it; it stays queued for
-     the next editor started on this machine
+  3  the request was QUEUED but no running editor was registered at that
+     instant; the next editor started on this machine picks it up
 
 Once running, click ≡ (top-left), right-click anywhere, or double-tap Esc
 for the action menu. See https://github.com/vonzelle-vzt/herdr-edit for
@@ -252,6 +255,7 @@ hotkeys and the full feature list.`)
 // capabilities is the --capabilities document. A struct, not a map, so the key
 // order is stable for anyone diffing the output.
 type capabilities struct {
+	CapabilitiesSchema int      `json:"capabilitiesSchema"`
 	Version            string   `json:"version"`
 	Verbs              []string `json:"verbs"`
 	OpenAt             bool     `json:"openAt"`
@@ -267,6 +271,7 @@ type capabilities struct {
 // what --debug actually accepts.
 func currentCapabilities() capabilities {
 	return capabilities{
+		CapabilitiesSchema: capabilitiesSchema,
 		Version:            version.Version,
 		Verbs:              state.DebugActions(),
 		OpenAt:             true,
@@ -291,7 +296,7 @@ func handoffStatus(errw io.Writer) int {
 	if len(state.LiveEditors()) > 0 {
 		return 0
 	}
-	fmt.Fprintln(errw, "herdr-edit: no running editor took the request (it stays queued for the next editor started on this machine)")
+	fmt.Fprintln(errw, "herdr-edit: request queued, but no running editor is registered (the next editor started on this machine picks it up)")
 	return exitNoEditor
 }
 

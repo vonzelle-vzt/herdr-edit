@@ -350,6 +350,9 @@ func TestCapabilitiesDocument(t *testing.T) {
 			t.Errorf("%s = %v, want true", k, doc[k])
 		}
 	}
+	if doc["capabilitiesSchema"] != float64(1) {
+		t.Errorf("capabilitiesSchema = %v", doc["capabilitiesSchema"])
+	}
 	if doc["debugSessionSchema"] != float64(1) || doc["vizSchema"] != float64(1) {
 		t.Errorf("schemas = %v / %v", doc["debugSessionSchema"], doc["vizSchema"])
 	}
@@ -375,8 +378,8 @@ func TestHandoffStatusIsTruthful(t *testing.T) {
 	if got := handoffStatus(&errw); got != exitNoEditor || exitNoEditor != 3 {
 		t.Fatalf("no editor: status %d, want 3", got)
 	}
-	if !strings.Contains(errw.String(), "no running editor took the request") ||
-		!strings.Contains(errw.String(), "stays queued for the next editor started on this machine") {
+	if !strings.Contains(errw.String(), "request queued, but no running editor is registered") ||
+		!strings.Contains(errw.String(), "the next editor started on this machine picks it up") {
 		t.Errorf("stderr = %q", errw.String())
 	}
 	unreg, err := state.RegisterEditor("/p")
@@ -387,5 +390,48 @@ func TestHandoffStatusIsTruthful(t *testing.T) {
 	errw.Reset()
 	if got := handoffStatus(&errw); got != 0 || errw.Len() != 0 {
 		t.Errorf("with an editor: status %d, stderr %q", got, errw.String())
+	}
+}
+
+// TestCapabilitiesTouchesNoState pins that probing a build is side-effect free:
+// a doctor or an IDE calls --capabilities to decide whether to offer "Open in
+// Herdr", and that probe must not create the state directory, prune the
+// registry, or need any editor to be running.
+func TestCapabilitiesTouchesNoState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", root)
+	if err := printCapabilities(io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("--capabilities created %d entries under the state dir", len(entries))
+	}
+}
+
+// TestHandoffExitZeroMeansQueuedNotOpened pins the semantics callers rely on:
+// with a live editor registered that never consumes anything, the handoff
+// still exits 0 and the request is left QUEUED on disk. Exit 0 is "queued while
+// an editor was registered", never "opened" — there is no consumption ack.
+func TestHandoffExitZeroMeansQueuedNotOpened(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	unreg, err := state.RegisterEditor(t.TempDir()) // registered, never polls
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unreg()
+	target := filepath.Join(t.TempDir(), "x.go")
+	if err := state.WriteOpenRequest(target, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := handoffStatus(io.Discard); got != 0 {
+		t.Fatalf("status %d with a live editor registered, want 0", got)
+	}
+	req, ok := state.ReadOpenRequest()
+	if !ok || req.File != target || req.Line != 3 {
+		t.Fatalf("request not left queued: ok=%v %+v", ok, req)
 	}
 }
