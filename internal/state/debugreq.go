@@ -123,6 +123,9 @@ type DebugRequest struct {
 	File   string `json:"file"`
 	Line   int    `json:"line"`
 	Node   string `json:"node,omitempty"`
+	// Config names a launch.json configuration for a remote "start", so the
+	// editor never has to open its interactive picker for a CLI caller.
+	Config string `json:"config,omitempty"`
 	Seq    int64  `json:"seq"`
 
 	ID       string `json:"id,omitempty"`
