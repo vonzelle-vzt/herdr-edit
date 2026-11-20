@@ -2795,3 +2795,20 @@ func TestHandleEventDispatchesSelfApplyingEvents(t *testing.T) {
 		t.Fatal("handleEvent did not dispatch a selfApplyingEvent")
 	}
 }
+
+// TestMain points the whole package at a throwaway state directory. Run
+// registers the editor in the liveness registry and publishes active.json;
+// without this a test that drives Run would announce a phantom editor in the
+// developer's real ~/.local/state, and a real CLI would then report a request
+// as queued for an editor that does not exist.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "herdr-edit-app-state-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Setenv("XDG_STATE_HOME", dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}

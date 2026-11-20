@@ -1152,6 +1152,9 @@ func (a *App) handleEvent(ev tcell.Event) {
 		a.handleAutoScroll()
 	case *treeRefreshEvent:
 		a.refreshTreeNow()
+		// The registry heartbeat rides the same 10s tick: an entry whose beat
+		// is older than state.EditorStaleAfter stops counting as a live editor.
+		_ = beatEditor()
 	case *lspHoverEvent:
 		a.handleLSPHover(e)
 	case *lspJumpEvent:

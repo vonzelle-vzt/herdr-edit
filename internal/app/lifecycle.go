@@ -22,14 +22,17 @@ package app
 import (
 	"sync"
 	"time"
+
+	"github.com/cloudmanic/spice-edit/internal/state"
 )
 
 // registerEditor announces this editor to the liveness registry and returns
-// the function that withdraws the announcement. It is a package-level seam
-// rather than a direct call so the registry can be pointed at
-// state.RegisterEditor without this file importing it; the integrator replaces
-// the body. The default registers nothing and withdraws nothing.
-var registerEditor = func(root string) (func(), error) { return func() {}, nil }
+// the function that withdraws the announcement. A package-level seam so tests
+// can observe registration without touching a real state directory.
+var registerEditor = state.RegisterEditor
+
+// beatEditor refreshes the registry entry; a seam for the same reason.
+var beatEditor = state.BeatEditor
 
 // jobDrainWait bounds how long shutdown waits for in-flight subprocess jobs
 // (the git refresh and a blame lookup). They finish in milliseconds in

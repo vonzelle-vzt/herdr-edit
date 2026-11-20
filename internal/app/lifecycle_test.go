@@ -199,3 +199,19 @@ func TestDefaultRegisterEditorIsANoOp(t *testing.T) {
 	}
 	unreg()
 }
+
+// TestTreeRefreshTickBeatsTheRegistry pins the heartbeat's one call site: the
+// 10s tick. Without it a registered editor ages past state.EditorStaleAfter in
+// a minute and every handoff starts reporting "no running editor".
+func TestTreeRefreshTickBeatsTheRegistry(t *testing.T) {
+	beats := 0
+	old := beatEditor
+	beatEditor = func() error { beats++; return nil }
+	defer func() { beatEditor = old }()
+
+	a := newTestApp(t, t.TempDir())
+	a.handleEvent(&treeRefreshEvent{})
+	if beats != 1 {
+		t.Fatalf("tick beat the registry %d times, want 1", beats)
+	}
+}
