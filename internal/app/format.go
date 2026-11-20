@@ -397,15 +397,6 @@ func (a *App) handleFormatDone(e *formatDoneEvent) {
 	// Tab was closed before the formatter finished — silent no-op.
 }
 
-// formatHash exposes the current project's format.json hash for tests
-// and is otherwise unused. It returns "" when no config is loaded —
-// the same signal as "no formatting configured". Pulled into a
-// method so tests don't have to re-implement the load path.
-func (a *App) formatHash() string {
-	cfg, _ := format.Load(a.rootDir)
-	return cfg.Hash()
-}
-
 // Compile-time check that formatDoneEvent really is a tcell.Event.
 // Catches signature drift if the interface ever grows a method.
 var _ tcell.Event = (*formatDoneEvent)(nil)
