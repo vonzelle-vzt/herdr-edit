@@ -80,7 +80,11 @@ func newOllama(cfg OllamaConfig) (*ollama, error) {
 			// text to a host the loopback check never saw.
 			// The dial re-resolves and re-checks, so a name that later
 			// resolves elsewhere (DNS rebinding) is refused, not followed.
-			Transport: &http.Transport{Proxy: nil, DialContext: loopbackDial},
+			// No keep-alive: this transport has no idle timeout, so a
+			// pooled socket and its two goroutines would outlive the
+			// request, turning suggestions off, and the editor's shutdown.
+			// One loopback dial per debounced request is microseconds.
+			Transport: &http.Transport{Proxy: nil, DialContext: loopbackDial, DisableKeepAlives: true},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
