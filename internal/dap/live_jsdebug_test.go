@@ -365,6 +365,7 @@ func (s *jsDebugSession) awaitFinished(t *testing.T) bool {
 // adapter whose session is not the connection it was launched on. Passing all
 // three is what makes the layer between them an abstraction rather than a table.
 func TestLiveJsDebugStopsAtBreakpoint(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), jsDebugTimeout)
 	defer cancel()
 
@@ -421,6 +422,7 @@ func TestLiveJsDebugStopsAtBreakpoint(t *testing.T) {
 // this is the test that fails if a future js-debug starts answering honestly and
 // the flag becomes a lie in the other direction.
 func TestLiveJsDebugAnswersProvisionalAndStopsAnyway(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), jsDebugTimeout)
 	defer cancel()
 
@@ -472,6 +474,7 @@ func TestLiveJsDebugAnswersProvisionalAndStopsAnyway(t *testing.T) {
 // the rest of that file's breakpoints quietly stopped firing — and a silent
 // version of either answer would leave that undocumented.
 func TestLiveJsDebugResendKeepsThemBound(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), jsDebugTimeout)
 	defer cancel()
 
@@ -527,6 +530,7 @@ func TestLiveJsDebugResendKeepsThemBound(t *testing.T) {
 // time against a third independent implementation is what keeps "our client
 // sends `condition`" from being mistaken for "conditional breakpoints work".
 func TestLiveJsDebugConditionalBreakpointFiresOnce(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), jsDebugTimeout)
 	defer cancel()
 
@@ -572,6 +576,7 @@ func TestLiveJsDebugConditionalBreakpointFiresOnce(t *testing.T) {
 // would show the user js-debug's telemetry and none of their own console.log —
 // which is the shape of "the debug console is empty and nothing explains it".
 func TestLiveJsDebugProgramOutputArrivesAsEvents(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), jsDebugTimeout)
 	defer cancel()
 
@@ -623,6 +628,7 @@ func TestLiveJsDebugProgramOutputArrivesAsEvents(t *testing.T) {
 // reason for the fallback had quietly evaporated. Same shape as delve's absent
 // supportsTerminateRequest, measured rather than assumed.
 func TestLiveJsDebugReportsNoTerminateSupport(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), jsDebugTimeout)
 	defer cancel()
 

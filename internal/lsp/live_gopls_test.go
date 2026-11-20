@@ -93,6 +93,7 @@ func openManager(t *testing.T, root, file string) (*Manager, string) {
 // TestLive_HoverAndDefinition proves the two requests that sat unreachable for
 // months actually round-trip against a real server.
 func TestLive_HoverAndDefinition(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -124,6 +125,7 @@ func TestLive_HoverAndDefinition(t *testing.T) {
 // gopls answers with a bare array or a CompletionList, and whether our params
 // are spelled the way it expects.
 func TestLive_Completion(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -152,6 +154,7 @@ func TestLive_Completion(t *testing.T) {
 // TestLive_References checks the count is real: Greet is declared once and
 // called twice, and includeDeclaration is on.
 func TestLive_References(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -174,6 +177,7 @@ func TestLive_References(t *testing.T) {
 // NESTED DocumentSymbol[], and a decoder that guessed flat would silently
 // report every symbol at line 0.
 func TestLive_DocumentSymbol(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -214,6 +218,7 @@ func TestLive_DocumentSymbol(t *testing.T) {
 // the field documentSymbol never sets and this request exists specifically to
 // populate.
 func TestLive_WorkspaceSymbol(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -249,6 +254,7 @@ func TestLive_WorkspaceSymbol(t *testing.T) {
 
 // TestLive_Rename proves the edits come back in a shape we can apply.
 func TestLive_Rename(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -282,6 +288,7 @@ func TestLive_Rename(t *testing.T) {
 // TestLive_SignatureHelp checks the request is spelled right and the parameter
 // marker survives whichever label form gopls uses.
 func TestLive_SignatureHelp(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -304,6 +311,7 @@ func TestLive_SignatureHelp(t *testing.T) {
 // legitimate answer for clean code, so this asserts the call SUCCEEDS rather
 // than that fixes exist.
 func TestLive_CodeAction(t *testing.T) {
+	skipLiveUnderShort(t)
 	root, file := goplsFixture(t)
 	m, _ := openManager(t, root, file)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
