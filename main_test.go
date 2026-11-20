@@ -256,7 +256,7 @@ func TestHelpNamesTheRealBinary(t *testing.T) {
 	if strings.Contains(help, "spiceedit") || strings.Contains(help, "SpiceEdit") {
 		t.Errorf("--help still names the upstream binary:\n%s", help)
 	}
-	for _, want := range []string{"herdr-edit --capabilities", "--config NAME", "start [FILE[:LINE]]", "Exit codes", "3  the request was QUEUED but no running editor", "not a confirmation that the"} {
+	for _, want := range []string{"herdr-edit --capabilities", "--config NAME", "start [FILE[:LINE]]", "Exit codes", "3  the request was written but no running editor", "not a confirmation that the"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("--help does not mention %q", want)
 		}
@@ -375,7 +375,7 @@ func TestCapabilitiesDocument(t *testing.T) {
 func TestHandoffStatusIsTruthful(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	var errw strings.Builder
-	if got := handoffStatus(&errw); got != exitNoEditor || exitNoEditor != 3 {
+	if got := handoffStatus(&errw, handoffOpen); got != exitNoEditor || exitNoEditor != 3 {
 		t.Fatalf("no editor: status %d, want 3", got)
 	}
 	if !strings.Contains(errw.String(), "request queued, but no running editor is registered") ||
@@ -388,7 +388,7 @@ func TestHandoffStatusIsTruthful(t *testing.T) {
 	}
 	defer unreg()
 	errw.Reset()
-	if got := handoffStatus(&errw); got != 0 || errw.Len() != 0 {
+	if got := handoffStatus(&errw, handoffOpen); got != 0 || errw.Len() != 0 {
 		t.Errorf("with an editor: status %d, stderr %q", got, errw.String())
 	}
 }
@@ -427,11 +427,27 @@ func TestHandoffExitZeroMeansQueuedNotOpened(t *testing.T) {
 	if err := state.WriteOpenRequest(target, 3, 1); err != nil {
 		t.Fatal(err)
 	}
-	if got := handoffStatus(io.Discard); got != 0 {
+	if got := handoffStatus(io.Discard, handoffOpen); got != 0 {
 		t.Fatalf("status %d with a live editor registered, want 0", got)
 	}
 	req, ok := state.ReadOpenRequest()
 	if !ok || req.File != target || req.Line != 3 {
 		t.Fatalf("request not left queued: ok=%v %+v", ok, req)
+	}
+}
+
+// TestDebugHandoffDoesNotPromiseReplay pins the honest exit-3 message for a
+// debug request: unlike an open-request, a debug request is ignored by an
+// editor started later (debugRequestFloor), so telling the caller "the next
+// editor picks it up" would be false.
+func TestDebugHandoffDoesNotPromiseReplay(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var errw strings.Builder
+	if got := handoffStatus(&errw, handoffDebug); got != exitNoEditor {
+		t.Fatalf("status %d, want %d", got, exitNoEditor)
+	}
+	msg := errw.String()
+	if strings.Contains(msg, "picks it up") || !strings.Contains(msg, "ignores it") {
+		t.Errorf("debug exit-3 message promises a replay that never happens: %q", msg)
 	}
 }

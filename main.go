@@ -244,8 +244,10 @@ Exit codes:
      least one running editor was registered. It is not a confirmation that the
      file opened; each editor claims only paths inside its own root.
   1  failed (bad arguments, or the request could not be written)
-  3  the request was QUEUED but no running editor was registered at that
-     instant; the next editor started on this machine picks it up
+  3  the request was written but no running editor was registered at that
+     instant. An --open-at is picked up by the next editor started on this
+     machine; a --debug request is NOT (an editor ignores debug requests older
+     than itself), so start the editor and resend
 
 Once running, click ≡ (top-left), right-click anywhere, or double-tap Esc
 for the action menu. See https://github.com/vonzelle-vzt/herdr-edit for
@@ -292,13 +294,32 @@ func printCapabilities(w io.Writer) error {
 // 0 when some running editor is registered to pick it up, exitNoEditor (with an
 // explanation on errw) when none is. Truthful, because a bare 0 would tell a
 // caller the request landed when it is only sitting in a file.
-func handoffStatus(errw io.Writer) int {
+//
+// The two request kinds differ in what happens next, and the message must say
+// which. An open-request IS picked up by the next editor started (lastOpenSeq
+// starts at zero). A debug request is NOT: an editor ignores any debug request
+// older than its own start (debugRequestFloor), so a stale "stop" or "start"
+// cannot fire into a session nobody asked for.
+func handoffStatus(errw io.Writer, kind handoffKind) int {
 	if len(state.LiveEditors()) > 0 {
 		return 0
 	}
-	fmt.Fprintln(errw, "herdr-edit: request queued, but no running editor is registered (the next editor started on this machine picks it up)")
+	switch kind {
+	case handoffDebug:
+		fmt.Fprintln(errw, "herdr-edit: no running editor is registered; the debug request was written but an editor started later ignores it, so start the editor first and resend")
+	default:
+		fmt.Fprintln(errw, "herdr-edit: request queued, but no running editor is registered (the next editor started on this machine picks it up)")
+	}
 	return exitNoEditor
 }
+
+// handoffKind says which request handoffStatus is reporting on.
+type handoffKind int
+
+const (
+	handoffOpen  handoffKind = iota // --open-at: replayed by the next editor started
+	handoffDebug                    // --debug <verb>: never replayed into a later editor
+)
 
 // runDebugQuery sends an evaluate or frames request to the running editor,
 // prints the JSON it answers with, and returns the exit status: 0 for a
@@ -371,7 +392,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
 			os.Exit(1)
 		}
-		os.Exit(handoffStatus(os.Stderr))
+		os.Exit(handoffStatus(os.Stderr, handoffOpen))
 	case actionDebug:
 		if res.DebugQuery != nil {
 			os.Exit(runDebugQuery(*res.DebugQuery))
@@ -410,7 +431,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "herdr-edit:", werr)
 			os.Exit(1)
 		}
-		os.Exit(handoffStatus(os.Stderr))
+		os.Exit(handoffStatus(os.Stderr, handoffDebug))
 	}
 
 	// Single-file mode: when the user invoked `spiceedit somefile.md`,

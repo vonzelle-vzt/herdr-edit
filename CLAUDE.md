@@ -548,7 +548,9 @@ Each rule below shipped broken at least once, and none of the failures logs anyt
   when none was. There is no consumption acknowledgement and no choice of which editor takes
   it: requests are a broadcast, and each editor claims only paths inside its own root
   (`withinRoot`, which resolves symlinks on both sides). Copy in any consumer says "sent" or
-  "queued". `TestHandoffExitZeroMeansQueuedNotOpened` pins it.
+  "queued". `TestHandoffExitZeroMeansQueuedNotOpened` pins it. On exit 3 the two kinds
+  DIFFER: the next editor started replays an `--open-at`, but never a `--debug` request,
+  because `debugRequestFloor` exists precisely so a stale `stop` cannot fire.
 - 🔴 **The liveness registry (`internal/state/editors.go`) needs a live pid AND a fresh
   beat.** A pid alone believes a crashed editor once the OS recycles its pid. The beat rides
   the 10s tree tick (`beatEditor` in the `treeRefreshEvent` case). Reads never mutate the
