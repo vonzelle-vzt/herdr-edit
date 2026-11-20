@@ -8,7 +8,9 @@
 package app
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -216,6 +218,204 @@ func TestCodeActions_EmptyIsSilent(t *testing.T) {
 	if a.paletteOpen {
 		t.Fatal("an empty fix list opened the palette")
 	}
+}
+
+// editRange builds a single-line replacement for the code-action tests.
+func editRange(line, from, to int, text string) lsp.TextEdit {
+	return lsp.TextEdit{
+		Range:   lsp.Range{Start: lsp.Position{Line: line, Character: from}, End: lsp.Position{Line: line, Character: to}},
+		NewText: text,
+	}
+}
+
+// TestCodeActions_RunnableChangesTheBuffer drives a chosen action through the
+// palette and asserts on the BUFFER the user would see, not on the file alone:
+// the tab must be reloaded from the rewritten file.
+func TestCodeActions_RunnableChangesTheBuffer(t *testing.T) {
+	a := seedNavApp(t, "old := 1\n")
+	tab := a.activeTabPtr()
+	a.handleCodeActions(&codeActionsEvent{actions: []lsp.CodeAction{{
+		Title: "Rename old",
+		Kind:  "quickfix",
+		Edits: map[string][]lsp.TextEdit{tab.Path: {editRange(0, 0, 3, "neu")}},
+	}}, when: time.Now()})
+	a.paletteSelected = 0
+	a.runSelectedPaletteCommand()
+
+	if got := a.activeTabPtr().Buffer.String(); got != "neu := 1\n" {
+		t.Fatalf("buffer is %q after the fix, want %q", got, "neu := 1\n")
+	}
+}
+
+// TestCodeActions_UnavailableIsListedAndExplains pins the honesty rule: a
+// command-only action appears in the list, labelled, and choosing it flashes
+// WHY and changes nothing. Dropping it would read as "nothing to fix".
+func TestCodeActions_UnavailableIsListedAndExplains(t *testing.T) {
+	a := seedNavApp(t, "keep\n")
+	tab := a.activeTabPtr()
+	a.handleCodeActions(&codeActionsEvent{actions: []lsp.CodeAction{{
+		Title:       "Browse docs",
+		Command:     "gopls.doc",
+		Unavailable: "needs workspace/executeCommand (gopls.doc), which this editor does not implement",
+	}}, when: time.Now()})
+
+	if !a.paletteOpen || len(a.paletteResults) != 1 {
+		t.Fatalf("the unavailable action was not listed: open=%v results=%d", a.paletteOpen, len(a.paletteResults))
+	}
+	if !strings.Contains(a.paletteResults[0].cmd.label, "unavailable") {
+		t.Errorf("label %q does not say unavailable", a.paletteResults[0].cmd.label)
+	}
+	a.paletteSelected = 0
+	a.runSelectedPaletteCommand()
+	if !strings.Contains(a.statusMsg, "executeCommand") {
+		t.Errorf("flash = %q, want the reason", a.statusMsg)
+	}
+	if tab.Buffer.String() != "keep\n" {
+		t.Fatal("an unavailable action changed the buffer")
+	}
+}
+
+// TestCodeActions_InvalidEditChangesNothing pins all-or-nothing across files: an
+// action whose SECOND file has an out-of-range edit must leave the FIRST file
+// untouched, where the old applier wrote file one and skipped the bad edit.
+func TestCodeActions_InvalidEditChangesNothing(t *testing.T) {
+	a := seedNavApp(t, "old := 1\n")
+	tab := a.activeTabPtr()
+	other := filepath.Join(filepath.Dir(tab.Path), "z.txt")
+	if err := os.WriteFile(other, []byte("short\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a.handleCodeActions(&codeActionsEvent{actions: []lsp.CodeAction{{
+		Title: "Two files",
+		Kind:  "quickfix",
+		Edits: map[string][]lsp.TextEdit{
+			tab.Path: {editRange(0, 0, 3, "neu")},
+			other:    {editRange(0, 0, 99, "boom")}, // far past the end of "short"
+		},
+	}}, when: time.Now()})
+	a.paletteSelected = 0
+	a.runSelectedPaletteCommand()
+
+	if got, _ := os.ReadFile(tab.Path); string(got) != "old := 1\n" {
+		t.Fatalf("file one was rewritten to %q although file two's edit was invalid", got)
+	}
+	if got, _ := os.ReadFile(other); string(got) != "short\n" {
+		t.Fatalf("file two was rewritten to %q", got)
+	}
+	if !strings.Contains(a.statusMsg, "failed") {
+		t.Errorf("flash = %q, want a failure message", a.statusMsg)
+	}
+}
+
+// TestCodeActions_RefusesWhenATouchedTabIsDirty pins that the unsaved-work guard
+// covers every tab the edit touches, not only the active one.
+func TestCodeActions_RefusesWhenATouchedTabIsDirty(t *testing.T) {
+	a := seedNavApp(t, "a\n")
+	first := a.activeTabPtr()
+	second := filepath.Join(filepath.Dir(first.Path), "m.txt")
+	if err := os.WriteFile(second, []byte("b\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a.openFile(second)
+	a.activeTab = 0 // the dirty one is NOT the active tab
+	for i, tb := range a.tabs {
+		if tb.Path == second {
+			tb.Dirty = true
+		}
+		_ = i
+	}
+	a.runCodeAction(lsp.CodeAction{
+		Title: "Edit second",
+		Edits: map[string][]lsp.TextEdit{second: {editRange(0, 0, 1, "X")}},
+	})
+	if got, _ := os.ReadFile(second); string(got) != "b\n" {
+		t.Fatalf("a fix rewrote a file with unsaved changes: %q", got)
+	}
+}
+
+// TestCodeActionLive_BuffersChangeAgainstRealGopls is the end-to-end oracle: a
+// real gopls, a file with an unused import, the action chosen through the same
+// palette path a user takes, and an assertion on the BUFFER text afterwards.
+// HERDR_REQUIRE_LSP=1 turns a missing gopls into a failure.
+func TestCodeActionLive_BuffersChangeAgainstRealGopls(t *testing.T) {
+	if _, err := exec.LookPath("gopls"); err != nil {
+		if os.Getenv("HERDR_REQUIRE_LSP") == "1" {
+			t.Fatal("HERDR_REQUIRE_LSP=1 but gopls is not on PATH")
+		}
+		t.Skip("gopls not installed — skipping the live code-action test")
+	}
+	if testing.Short() && os.Getenv("HERDR_REQUIRE_LSP") != "1" {
+		t.Skip("live oracle skipped under -short")
+	}
+	root := t.TempDir()
+	src := "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n"
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module livecheck\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, "main.go")
+	if err := os.WriteFile(file, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// gopls reports paths as the OS resolves them (/private/var on macOS).
+	if resolved, err := filepath.EvalSymlinks(file); err == nil {
+		file = resolved
+	}
+
+	a := newTestApp(t, root)
+	a.openFile(file)
+	m := lsp.NewManager(root)
+	t.Cleanup(m.Stop)
+	diagCh := make(chan []lsp.Diagnostic, 8)
+	m.OnDiagnostics = func(uri string, diags []lsp.Diagnostic) {
+		if lsp.PathFromURI(uri) == file && len(diags) > 0 {
+			select {
+			case diagCh <- diags:
+			default:
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	m.DidOpen(ctx, file, src)
+
+	var target lsp.Diagnostic
+	select {
+	case diags := <-diagCh:
+		for _, d := range diags {
+			if strings.Contains(d.Message, "os") {
+				target = d
+			}
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("gopls published no diagnostic")
+	}
+	if target.Message == "" {
+		t.Fatal("no diagnostic about the os import")
+	}
+	acts, err := m.CodeAction(ctx, file, target.Range, []lsp.Diagnostic{target})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.handleCodeActions(&codeActionsEvent{actions: acts, when: time.Now()})
+	idx := -1
+	for i, act := range acts {
+		if act.Unavailable == "" && (strings.HasPrefix(act.Kind, "quickfix") || act.Kind == "source.organizeImports") {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("no runnable fix offered: %+v", acts)
+	}
+	a.paletteSelected = idx
+	a.runSelectedPaletteCommand()
+
+	got := a.activeTabPtr().Buffer.String()
+	if strings.Contains(got, `"os"`) || !strings.Contains(got, `"fmt"`) {
+		t.Fatalf("buffer after the fix:\n%s", got)
+	}
+	t.Logf("buffer after %q:\n%s", acts[idx].Title, got)
 }
 
 // TestSymbols_Reachable is the guard against this fork's signature failure: a

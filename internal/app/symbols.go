@@ -238,6 +238,10 @@ func (a *App) menuCodeActions() {
 
 // handleCodeActions offers the fixes through the palette and applies the chosen
 // one with the same disk-writing path a rename uses.
+//
+// Actions this editor cannot run (command-only, disabled, resource operations)
+// are listed anyway, labelled unavailable; choosing one flashes the reason. A
+// silent drop would read as "the server found nothing to fix".
 func (a *App) handleCodeActions(e *codeActionsEvent) {
 	if len(e.actions) == 0 {
 		a.flash("No fixes available here")
@@ -245,37 +249,60 @@ func (a *App) handleCodeActions(e *codeActionsEvent) {
 	}
 	cmds := make([]paletteCommand, 0, len(e.actions))
 	for _, act := range e.actions {
-		edits := act.Edits
-		title := act.Title
-		kind := act.Kind
+		act := act
+		label := act.Title
+		if act.Unavailable != "" {
+			label += " (unavailable)"
+		}
 		cmds = append(cmds, paletteCommand{
-			label:    title,
-			shortcut: kind,
+			label:    label,
+			shortcut: act.Kind,
 			enabled:  alwaysTrue,
-			action: func(app *App) {
-				if t := app.activeTabPtr(); t != nil && t.Dirty {
-					app.flash("Save first — a fix rewrites files on disk")
-					return
-				}
-				files, count, err := applyWorkspaceEdits(edits)
-				if err != nil {
-					app.flash("Fix failed: " + err.Error())
-					return
-				}
-				for _, t := range app.tabs {
-					if t.Path == "" || t.Synthetic {
-						continue
-					}
-					if _, touched := edits[t.Path]; touched {
-						_ = t.Reload()
-					}
-				}
-				app.refreshGitStatus()
-				app.flash(fmt.Sprintf("%s — %d edit(s) in %d file(s)", title, count, files))
-			},
+			action:   func(app *App) { app.runCodeAction(act) },
 		})
 	}
 	a.openPaletteWith(cmds, "Fix")
+}
+
+// runCodeAction carries out one chosen action: refuse it with a reason when it
+// is unavailable or would clobber unsaved work, otherwise apply its edit.
+//
+// "Unsaved work" means ANY open tab the edit touches, not just the active one:
+// a fix can edit another open file, which is then reloaded from disk.
+func (a *App) runCodeAction(act lsp.CodeAction) {
+	if act.Unavailable != "" {
+		a.flash(act.Title + " — " + act.Unavailable)
+		return
+	}
+	if t := a.activeTabPtr(); t != nil && t.Dirty {
+		a.flash("Save first — a fix rewrites files on disk")
+		return
+	}
+	for _, t := range a.tabs {
+		if _, touched := act.Edits[t.Path]; touched && t.Dirty {
+			a.flash("Save " + filepath.Base(t.Path) + " first — a fix rewrites files on disk")
+			return
+		}
+	}
+	files, count, err := applyWorkspaceEdits(act.Edits)
+	if err != nil {
+		a.flash("Fix failed: " + err.Error())
+		return
+	}
+	for _, t := range a.tabs {
+		if t.Path == "" || t.Synthetic {
+			continue
+		}
+		if _, touched := act.Edits[t.Path]; touched {
+			_ = t.Reload()
+		}
+	}
+	a.refreshGitStatus()
+	msg := fmt.Sprintf("%s — %d edit(s) in %d file(s)", act.Title, count, files)
+	if act.Command != "" {
+		msg += " (the server's follow-up command " + act.Command + " was not run)"
+	}
+	a.flash(msg)
 }
 
 // hasLSPFile gates the menu rows that need a language server.

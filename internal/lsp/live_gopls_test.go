@@ -323,6 +323,87 @@ func TestLive_CodeAction(t *testing.T) {
 	}
 }
 
+// TestLive_CodeAction_FixesUnusedImport is the oracle the decoder tests could not
+// be: a REAL gopls is shown a file with an unused import, offers its quick fix,
+// and applying the chosen action's edit to the file text must REMOVE the import
+// and leave the rest of the file intact and parseable.
+//
+// It fails if the client does not advertise codeActionLiteralSupport and gopls
+// answers with bare Commands, if the edit is decoded in only one wire shape, or
+// if a multi-line range (gopls deletes the import line) is mis-applied.
+func TestLive_CodeAction_FixesUnusedImport(t *testing.T) {
+	skipLiveUnderShort(t)
+	if _, err := exec.LookPath("gopls"); err != nil && os.Getenv("HERDR_REQUIRE_LSP") == "1" {
+		t.Fatal("HERDR_REQUIRE_LSP=1 but gopls is not on PATH")
+	}
+	root, file := goplsFixture(t)
+	src := "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n"
+	if err := os.WriteFile(file, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(root)
+	t.Cleanup(m.Stop)
+	diagCh := make(chan []Diagnostic, 8)
+	m.OnDiagnostics = func(uri string, diags []Diagnostic) {
+		if PathFromURI(uri) == file && len(diags) > 0 {
+			select {
+			case diagCh <- diags:
+			default:
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	m.DidOpen(ctx, file, src)
+
+	var diags []Diagnostic
+	select {
+	case diags = <-diagCh:
+	case <-time.After(45 * time.Second):
+		t.Fatal("gopls never published a diagnostic for the unused import")
+	}
+	var target Diagnostic
+	for _, d := range diags {
+		if strings.Contains(d.Message, "os") {
+			target = d
+		}
+	}
+	if target.Message == "" {
+		t.Fatalf("no diagnostic about the os import in %+v", diags)
+	}
+
+	acts, err := m.CodeAction(ctx, file, target.Range, []Diagnostic{target})
+	if err != nil {
+		t.Fatalf("codeAction: %v", err)
+	}
+	var chosen *CodeAction
+	for i := range acts {
+		if acts[i].Unavailable == "" && (strings.HasPrefix(acts[i].Kind, "quickfix") || acts[i].Kind == "source.organizeImports") && len(acts[i].Edits[file]) > 0 {
+			chosen = &acts[i]
+			break
+		}
+	}
+	if chosen == nil {
+		t.Fatalf("gopls offered no runnable quick fix; actions: %+v", acts)
+	}
+	t.Logf("chosen action: %q (%s)", chosen.Title, chosen.Kind)
+
+	got, err := ApplyTextEdits(src, chosen.Edits[file])
+	if err != nil {
+		t.Fatalf("applying gopls's own edit failed: %v", err)
+	}
+	if strings.Contains(got, `"os"`) {
+		t.Fatalf("the import is still there after the fix:\n%s", got)
+	}
+	if !strings.Contains(got, `"fmt"`) || !strings.Contains(got, `fmt.Println("hi")`) {
+		t.Fatalf("the fix damaged unrelated code:\n%s", got)
+	}
+	if got == src {
+		t.Fatal("buffer text did not change")
+	}
+}
+
 // contains is a tiny helper so the assertions read as prose.
 func contains(hay []string, needle string) bool {
 	for _, h := range hay {
