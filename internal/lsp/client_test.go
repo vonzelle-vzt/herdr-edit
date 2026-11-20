@@ -51,6 +51,7 @@ func TestHelperProcess(t *testing.T) {
 // runFakeServer speaks just enough LSP to exercise the client.
 func runFakeServer(mode string) {
 	wedgedAfterInit := false
+	literalActions := false
 	in := bufio.NewReaderSize(os.Stdin, 64*1024)
 	write := func(v interface{}) {
 		body, _ := json.Marshal(v)
@@ -81,11 +82,45 @@ func runFakeServer(mode string) {
 			if mode == "no-initialize" {
 				continue // deliberately never answer, to exercise the timeout
 			}
+			// Remember whether the client declared codeActionLiteralSupport: a
+			// real server answers codeAction with bare Commands when it did not.
+			var ip struct {
+				Capabilities struct {
+					TextDocument struct {
+						CodeAction struct {
+							Literal json.RawMessage `json:"codeActionLiteralSupport"`
+						} `json:"codeAction"`
+					} `json:"textDocument"`
+				} `json:"capabilities"`
+			}
+			_ = json.Unmarshal(req.Params, &ip)
+			literalActions = len(ip.Capabilities.TextDocument.CodeAction.Literal) > 0
 			write(map[string]interface{}{
 				"jsonrpc": "2.0", "id": req.ID,
 				"result": map[string]interface{}{"capabilities": map[string]interface{}{}},
 			})
 			wedgedAfterInit = true
+
+		case "textDocument/codeAction":
+			if literalActions {
+				write(map[string]interface{}{
+					"jsonrpc": "2.0", "id": req.ID,
+					"result": []map[string]interface{}{{
+						"title": "Literal fix", "kind": "quickfix",
+						"edit": map[string]interface{}{"changes": map[string]interface{}{
+							"file:///tmp/lit.go": []map[string]interface{}{{
+								"range":   map[string]interface{}{"start": map[string]int{"line": 0, "character": 0}, "end": map[string]int{"line": 0, "character": 1}},
+								"newText": "x",
+							}},
+						}},
+					}},
+				})
+			} else {
+				write(map[string]interface{}{
+					"jsonrpc": "2.0", "id": req.ID,
+					"result": []map[string]interface{}{{"title": "Bare command", "command": "do.thing"}},
+				})
+			}
 
 		case "textDocument/didOpen":
 			// Publish one error against whatever was opened, the way a real
@@ -269,6 +304,33 @@ func TestClient_WorkspaceSymbol(t *testing.T) {
 	}
 	if syms[0].Name != "FakeHandler" || syms[0].URI != "file:///proj/handler.ts" || syms[0].Line != 3 {
 		t.Errorf("symbol = %+v", syms[0])
+	}
+}
+
+// TestClient_CodeActionAdvertisesLiteralSupport is the end-to-end proof that the
+// initialize request declares codeActionLiteralSupport. The fake server answers
+// with an edit-bearing action only when it saw the declaration, and with a bare
+// Command otherwise, as real servers do: so without the declaration this lists a
+// single unavailable "Bare command" and the assertion on the literal fails.
+func TestClient_CodeActionAdvertisesLiteralSupport(t *testing.T) {
+	argv := withHelper(t, "ok")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := Start(ctx, "fake", argv, URI(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+
+	acts, err := c.CodeAction(ctx, "file:///tmp/lit.go", Range{}, nil)
+	if err != nil {
+		t.Fatalf("CodeAction: %v", err)
+	}
+	if len(acts) != 1 || acts[0].Title != "Literal fix" || acts[0].Unavailable != "" {
+		t.Fatalf("client did not advertise codeActionLiteralSupport; got %+v", acts)
+	}
+	if len(acts[0].Edits["/tmp/lit.go"]) != 1 {
+		t.Errorf("edit not decoded: %+v", acts[0].Edits)
 	}
 }
 

@@ -155,10 +155,28 @@ func (c *Client) initialize(ctx context.Context, rootURI string) error {
 				"references":     map[string]interface{}{},
 				"documentSymbol": map[string]interface{}{"hierarchicalDocumentSymbolSupport": true},
 				"signatureHelp":  map[string]interface{}{},
-				"codeAction":     map[string]interface{}{},
+				"codeAction": map[string]interface{}{
+					// Without codeActionLiteralSupport a server may only answer with
+					// bare Commands, which we cannot run. Declaring it is what makes
+					// servers send CodeAction literals carrying an `edit`.
+					"codeActionLiteralSupport": map[string]interface{}{
+						"codeActionKind": map[string]interface{}{
+							"valueSet": []string{
+								"", "quickfix", "refactor", "refactor.extract",
+								"refactor.inline", "refactor.rewrite", "source",
+								"source.organizeImports", "source.fixAll",
+							},
+						},
+					},
+					// An action the server cannot offer right now arrives with a
+					// reason instead of being withheld; we show it as unavailable.
+					"disabledSupport": true,
+				},
 				"rename": map[string]interface{}{
-					// We apply a plain WorkspaceEdit.changes map; we do not
-					// implement prepareRename or documentChanges/versioning.
+					// A WorkspaceEdit is decoded in both wire shapes (`changes` and
+					// `documentChanges`), but file create/rename/delete operations
+					// and versioned edits are not applied, and prepareRename is not
+					// implemented.
 					"prepareSupport": false,
 				},
 				"completion": map[string]interface{}{

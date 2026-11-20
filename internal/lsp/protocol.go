@@ -72,6 +72,11 @@ type Diagnostic struct {
 	Code     json.RawMessage `json:"code,omitempty"` // string OR number, per spec
 	Source   string          `json:"source,omitempty"`
 	Message  string          `json:"message"`
+
+	// Data is opaque to us and MUST be echoed back in codeAction's
+	// context.diagnostics: servers hang the quick fix for a diagnostic off it, so
+	// dropping it means the fix for that very diagnostic is never offered.
+	Data json.RawMessage `json:"data,omitempty"`
 }
 
 // CodeString renders Code for display. It is deliberately json.RawMessage
@@ -234,10 +239,23 @@ type Symbol struct {
 	LineUnknown bool
 }
 
-// CodeAction is one offered fix or refactor. Edits is nil when the server chose
-// to answer with a command instead, which this editor cannot execute.
+// CodeAction is one offered fix or refactor.
+//
+// Every action the server offered is kept, runnable or not. Unavailable is empty
+// for one this editor can carry out (Edits is then the whole job) and otherwise
+// holds the reason it cannot, so the UI can list it and say why when chosen
+// rather than hiding it, which reads as "the server offered nothing".
 type CodeAction struct {
 	Title string
 	Kind  string
 	Edits map[string][]TextEdit
+
+	// Command is the workspace/executeCommand name the action carries, if any.
+	// This editor does not implement executeCommand, so a command-only action is
+	// Unavailable; an action with edits AND a command applies the edits and the
+	// caller should say the command was not run.
+	Command string
+
+	// Unavailable is why the action cannot be run here; empty when it can.
+	Unavailable string
 }
