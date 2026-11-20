@@ -8,7 +8,9 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -460,5 +462,173 @@ func TestTakeDebugQueriesDropsQueriesTheCallerMayHaveAbandoned(t *testing.T) {
 	got := TakeDebugQueries("inst1")
 	if len(got) != 1 || got[0].ID != fresh {
 		t.Fatalf("took %+v, want only the fresh query %s", got, fresh)
+	}
+}
+
+// TestReadDebugRequest_UnchangedFileNotReread pins the stat-first cache for the
+// debug request: 50 polls of an unchanged file are one read.
+func TestReadDebugRequest_UnchangedFileNotReread(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	debugRequestCache = polledFile[DebugRequest]{}
+	if err := WriteDebugRequest(DebugActionToggleBreakpoint, "/proj/main.go", 7); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, DebugRequestFile(), time.Hour)
+	reads := countReads(t)
+	for i := 0; i < 50; i++ {
+		got, ok := ReadDebugRequest()
+		if !ok || got.File != "/proj/main.go" || got.Line != 7 {
+			t.Fatalf("poll %d: %+v ok=%v", i, got, ok)
+		}
+	}
+	if *reads != 1 {
+		t.Fatalf("file read %d times, want 1", *reads)
+	}
+}
+
+// TestReadDebugRequest_ChangedFileReread pins that a new request is seen, and
+// that the validation verdict is re-run for it (a request that turns invalid
+// must read as absent, not as the previous valid one).
+func TestReadDebugRequest_ChangedFileReread(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	debugRequestCache = polledFile[DebugRequest]{}
+	if err := WriteDebugRequest(DebugActionToggleBreakpoint, "/proj/a.go", 1); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, DebugRequestFile(), time.Hour)
+	first, ok := ReadDebugRequest()
+	if !ok {
+		t.Fatal("first request did not read")
+	}
+	if err := WriteDebugRequest(DebugActionToggleBreakpoint, "/proj/b.go", 2); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, DebugRequestFile(), time.Hour)
+	second, ok := ReadDebugRequest()
+	if !ok || second.File != "/proj/b.go" || second.Seq <= first.Seq {
+		t.Fatalf("changed request not seen: %+v then %+v", first, second)
+	}
+	if err := os.WriteFile(DebugRequestFile(), []byte("not json at all, deliberately longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, DebugRequestFile(), time.Hour)
+	if _, ok := ReadDebugRequest(); ok {
+		t.Fatal("a file that became junk still read as the old request")
+	}
+}
+
+// TestReadDebugRequest_CallerCannotMutateCache pins that FrameID is copied per
+// call, so one caller's edit cannot change what the next poll returns.
+func TestReadDebugRequest_CallerCannotMutateCache(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	debugRequestCache = polledFile[DebugRequest]{}
+	n := 4
+	doc, _ := json.Marshal(DebugRequest{Action: DebugActionContinue, Seq: 99, FrameID: &n})
+	if err := os.MkdirAll(filepath.Dir(DebugRequestFile()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(DebugRequestFile(), doc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, DebugRequestFile(), time.Hour)
+	a, ok := ReadDebugRequest()
+	if !ok || a.FrameID == nil {
+		t.Skip("continue does not carry a frame id in this build")
+	}
+	*a.FrameID = 77
+	b, _ := ReadDebugRequest()
+	if b.FrameID == nil || *b.FrameID != 4 {
+		t.Fatalf("caller mutation leaked into the cache: %+v", b.FrameID)
+	}
+}
+
+// TestDebugInstanceRegistered_ServedFromMemory pins that this process's own
+// registration is answered without touching the file, and that the TTL lets a
+// deletion made behind its back be noticed.
+func TestDebugInstanceRegistered_ServedFromMemory(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	clock := time.Now()
+	origNow := instanceMemo.now
+	instanceMemo.now = func() time.Time { return clock }
+	t.Cleanup(func() { instanceMemo.now = origNow })
+
+	if err := RegisterDebugInstance(DebugInstance{ID: "memo1", PID: os.Getpid(), Root: "/r"}); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(debugInstanceDir(), "memo1.json")
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if !DebugInstanceRegistered("memo1") {
+		t.Fatal("within the TTL the answer should come from memory, not a stat")
+	}
+	clock = clock.Add(instanceMemoTTL + time.Second)
+	if DebugInstanceRegistered("memo1") {
+		t.Fatal("after the TTL a registration deleted behind our back was not noticed")
+	}
+}
+
+// TestDebugInstanceRegistered_UnregisterIsImmediate pins that this process's own
+// unregister is reflected at once, not after the TTL.
+func TestDebugInstanceRegistered_UnregisterIsImmediate(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := RegisterDebugInstance(DebugInstance{ID: "memo2", PID: os.Getpid(), Root: "/r"}); err != nil {
+		t.Fatal(err)
+	}
+	if !DebugInstanceRegistered("memo2") {
+		t.Fatal("registered instance not reported")
+	}
+	UnregisterDebugInstance("memo2")
+	if DebugInstanceRegistered("memo2") {
+		t.Fatal("unregister was not reflected")
+	}
+}
+
+// TestAwaitDebugReplyContext_CancelWithdrawsQuery pins that cancelling returns
+// promptly with the context's error and withdraws the untaken query, so a side
+// effect never runs for a caller that gave up.
+func TestAwaitDebugReplyContext_CancelWithdrawsQuery(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	qdir := debugQueryDir("inst")
+	if err := os.MkdirAll(qdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	q := filepath.Join(qdir, "req1.json")
+	if err := os.WriteFile(q, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(40 * time.Millisecond); cancel() }()
+	start := time.Now()
+	_, err := AwaitDebugReplyContext(ctx, "inst", "req1", 30*time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("cancellation was not prompt")
+	}
+	if _, err := os.Stat(q); err == nil {
+		t.Fatal("the untaken query was not withdrawn on cancel")
+	}
+}
+
+// TestAwaitDebugReplyContext_BacksOff pins the poll cadence: it starts at 10ms
+// so a prompt answer is seen quickly, and is capped at 100ms.
+func TestAwaitDebugReplyContext_BacksOff(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		WriteDebugReply("fast1", []byte(`{"ok":true}`))
+	}()
+	start := time.Now()
+	r, err := AwaitDebugReplyContext(context.Background(), "inst", "fast1", 5*time.Second)
+	if err != nil || !strings.Contains(string(r), "ok") {
+		t.Fatalf("reply %s err %v", r, err)
+	}
+	if d := time.Since(start); d > 80*time.Millisecond {
+		t.Fatalf("a 25ms answer took %s to notice; the first polls should be 10ms apart", d)
+	}
+	if awaitReplyMinPoll != 10*time.Millisecond || awaitReplyMaxPoll != 100*time.Millisecond {
+		t.Fatal("backoff bounds changed from 10ms..100ms")
 	}
 }

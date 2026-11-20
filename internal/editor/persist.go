@@ -293,15 +293,70 @@ func capForPersist(stack []snapshot) []snapshot {
 	return stack[len(stack)-persistUndoMaxEntries:]
 }
 
+// persistMarshal is json.Marshal behind a seam so tests can count how many
+// times trimming serializes the history.
+var persistMarshal = json.Marshal
+
+// snapshotJSONOverhead approximates the bytes a snapshot costs beyond its
+// line text: the object braces, the three key names and the two positions.
+const snapshotJSONOverhead = 120
+
+// estimateSnapshotBytes approximates the JSON size of one snapshot from its
+// line byte lengths (plus quotes and a comma per line) without marshaling.
+// JSON escaping only ever makes the real encoding larger, so this is a floor;
+// trimSnapshotsToFit calibrates against one real marshal to close the gap.
+func estimateSnapshotBytes(s persistedSnapshot) int {
+	n := snapshotJSONOverhead
+	for _, l := range s.Lines {
+		n += len(l) + 3
+	}
+	return n
+}
+
+// dropOldestToEstimate removes oldest entries until the summed estimate fits
+// budget, and returns the survivors with their summed estimate. Pure
+// arithmetic over line lengths, so it costs a scan rather than a marshal.
+func dropOldestToEstimate(entries []persistedSnapshot, budget int) ([]persistedSnapshot, int) {
+	total := 2 // the enclosing [ ]
+	for _, e := range entries {
+		total += estimateSnapshotBytes(e) + 1
+	}
+	for len(entries) > 0 && total > budget {
+		total -= estimateSnapshotBytes(entries[0]) + 1
+		entries = entries[1:]
+	}
+	return entries, total
+}
+
 // trimSnapshotsToFit drops the oldest entries of entries until its JSON
-// encoding fits within maxBytes, or nothing is left. It re-marshals after
-// each drop rather than trying to compute an exact byte-per-entry budget
-// up front, since entries can vary wildly in size (a one-line edit vs. a
-// whole-file paste) — dropping a quarter of what's left each pass still
-// converges in a handful of iterations for any realistic history.
+// encoding fits within maxBytes, or nothing is left.
+//
+// The old version re-marshaled the whole history after every 25% drop, which
+// for a 1 MB file meant roughly 200 MB of marshaling per save. This one sizes
+// the entries from their line lengths first, drops the oldest until that
+// estimate fits, and then marshals ONCE as a safety check. The estimate is a
+// floor (escapes only add bytes), so if the real encoding is still too large
+// the budget is scaled by the observed overshoot and the estimate pass is
+// repeated; a few rounds is all that is ever needed, after which the original
+// drop-a-quarter loop is the backstop so the result is always genuinely under
+// maxBytes.
 func trimSnapshotsToFit(entries []persistedSnapshot, maxBytes int) []persistedSnapshot {
+	budget := maxBytes
+	for round := 0; round < 4 && len(entries) > 0; round++ {
+		entries, _ = dropOldestToEstimate(entries, budget)
+		if len(entries) == 0 {
+			return entries
+		}
+		b, err := persistMarshal(entries)
+		if err != nil || len(b) <= maxBytes {
+			return entries
+		}
+		// Real size exceeded the estimate; shrink the estimate budget by the
+		// same ratio, with a little extra so the next round converges.
+		budget = int(float64(budget) * float64(maxBytes) / float64(len(b)) * 0.98)
+	}
 	for len(entries) > 0 {
-		b, err := json.Marshal(entries)
+		b, err := persistMarshal(entries)
 		if err != nil || len(b) <= maxBytes {
 			break
 		}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestOpenRequest_RoundTrip covers the happy path across the file boundary.
@@ -99,5 +100,144 @@ func TestSplitLocation(t *testing.T) {
 		if p != c.wantPath || l != c.wantL || col != c.wantC {
 			t.Errorf("SplitLocation(%q) = %q,%d,%d — want %q,%d,%d", c.in, p, l, col, c.wantPath, c.wantL, c.wantC)
 		}
+	}
+}
+
+// countReads wraps the readFile seam with a counter for the test's duration.
+func countReads(t *testing.T) *int {
+	t.Helper()
+	n := 0
+	orig := readFile
+	readFile = func(p string) ([]byte, error) { n++; return orig(p) }
+	t.Cleanup(func() { readFile = orig })
+	return &n
+}
+
+// agePast sets path's mtime well outside racyWindow, so the stat cache is
+// allowed to trust it. A freshly written file is deliberately NOT trusted.
+func agePast(t *testing.T, path string, ago time.Duration) {
+	t.Helper()
+	ts := time.Now().Add(-ago)
+	if err := os.Chtimes(path, ts, ts); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReadOpenRequest_UnchangedFileNotReread pins the point of the cache: the
+// Run loop polls on every event, and a file that has not changed must cost a
+// stat, not a read and unmarshal.
+func TestReadOpenRequest_UnchangedFileNotReread(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	openRequestCache = polledFile[OpenRequest]{}
+	if err := WriteOpenRequest("/proj/a.go", 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, OpenRequestFile(), time.Hour)
+	reads := countReads(t)
+
+	first, ok := ReadOpenRequest()
+	if !ok {
+		t.Fatal("request did not read")
+	}
+	for i := 0; i < 50; i++ {
+		got, ok := ReadOpenRequest()
+		if !ok || got != first {
+			t.Fatalf("poll %d returned %+v ok=%v, want the cached %+v", i, got, ok, first)
+		}
+	}
+	if *reads != 1 {
+		t.Fatalf("file read %d times across 51 polls, want 1", *reads)
+	}
+}
+
+// TestReadOpenRequest_ChangedFileReread pins that the cache never hides a new
+// request: the seq guard in the editor only works if a fresh Seq is seen.
+func TestReadOpenRequest_ChangedFileReread(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	openRequestCache = polledFile[OpenRequest]{}
+	if err := WriteOpenRequest("/proj/a.go", 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, OpenRequestFile(), time.Hour)
+	first, _ := ReadOpenRequest()
+
+	if err := WriteOpenRequest("/proj/b.go", 9, 2); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, OpenRequestFile(), time.Hour)
+	second, ok := ReadOpenRequest()
+	if !ok || second.File != "/proj/b.go" || second.Seq <= first.Seq {
+		t.Fatalf("a rewritten request was not seen: first %+v second %+v", first, second)
+	}
+}
+
+// TestReadOpenRequest_SameSizeRewriteSeen pins the documented residual risk is
+// closed: a same-size in-place rewrite that keeps the mtime is exactly what a
+// bare (mtime, size) cache would miss, and a recent mtime must force a re-read.
+func TestReadOpenRequest_SameSizeRewriteSeen(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	openRequestCache = polledFile[OpenRequest]{}
+	path := OpenRequestFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"file":"/a/x.go","line":1,"col":1,"seq":111}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ReadOpenRequest(); got.Seq != 111 {
+		t.Fatalf("first read got %+v", got)
+	}
+	mt := time.Now()
+	if err := os.WriteFile(path, []byte(`{"file":"/a/y.go","line":1,"col":1,"seq":222}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ReadOpenRequest(); got.Seq != 222 {
+		t.Fatalf("same-size in-place rewrite was missed: %+v", got)
+	}
+}
+
+// TestReadOpenRequest_RemovedFileForgotten pins that deleting the file is seen
+// and that its reappearance is read, never served from a stale entry.
+func TestReadOpenRequest_RemovedFileForgotten(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	openRequestCache = polledFile[OpenRequest]{}
+	if err := WriteOpenRequest("/proj/a.go", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	agePast(t, OpenRequestFile(), time.Hour)
+	if _, ok := ReadOpenRequest(); !ok {
+		t.Fatal("request did not read")
+	}
+	if err := os.Remove(OpenRequestFile()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadOpenRequest(); ok {
+		t.Fatal("a removed request was still served from the cache")
+	}
+}
+
+// TestSigOf_CarriesMtimeNanosAndSize pins that the signature separates two
+// writes by nanoseconds and by size, which is what the "same mtime granularity"
+// requirement rests on.
+func TestSigOf_CarriesMtimeNanosAndSize(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(p, []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Unix(1_700_000_000, 0)
+	os.Chtimes(p, base, base)
+	fi, _ := os.Stat(p)
+	a := sigOf(fi)
+	os.Chtimes(p, base.Add(time.Nanosecond), base.Add(time.Nanosecond))
+	fi, _ = os.Stat(p)
+	b := sigOf(fi)
+	if a == b {
+		t.Skip("filesystem timestamps are coarser than 1ns; covered by the racy-window test")
+	}
+	if a.size != 3 {
+		t.Fatalf("size = %d, want 3", a.size)
 	}
 }
