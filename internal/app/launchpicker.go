@@ -185,7 +185,20 @@ func (a *App) hasLaunchConfigurations() bool {
 // rather than falling through.
 func (a *App) menuStartDebug() {
 	a.closeMenu()
+	a.startDebugRouted(false, "")
+}
 
+// startDebugRouted is menuStartDebug's body, with the one distinction the
+// interactive caller and a CLI caller genuinely differ on: whether a question
+// may be asked. remote is an explicit parameter, not state on the App.
+//
+// 🔴 A remote start must never open the picker — the CLI exits 0 and nothing
+// ever starts. So it either resolves a configuration (config NAME, the
+// remembered choice, or the only one) or flashes why it could not. A NAMED
+// configuration that cannot be used (unknown, a compound, malformed file) stops
+// outright: falling back to the file path would debug something the caller did
+// not ask for, which is the malformed-launch.json rule applied to a name.
+func (a *App) startDebugRouted(remote bool, config string) {
 	if a.debug != nil && (a.debug.starting || a.debug.running) {
 		a.flash("A debug session is already running — Stop debugging first")
 		return
@@ -194,6 +207,22 @@ func (a *App) menuStartDebug() {
 	file, err := a.launchFile()
 	if err != nil {
 		a.flash("launch.json: " + err.Error() + " — fix it, or F5 cannot know what you meant")
+		return
+	}
+
+	if remote && config != "" {
+		if cfg, ok := findLaunchConfig(file, config); ok {
+			a.startLaunchConfig(cfg)
+			return
+		}
+		for _, c := range file.Compounds {
+			if c.Name == config {
+				a.flash("Compound \"" + config + "\" runs " + itoa(len(c.Configurations)) +
+					" targets at once; this editor debugs one at a time — pass a single configuration")
+				return
+			}
+		}
+		a.flash("launch.json has no configuration named \"" + config + "\"")
 		return
 	}
 
@@ -213,6 +242,11 @@ func (a *App) menuStartDebug() {
 		return
 	}
 
+	if remote {
+		a.flash("remote start needs --config NAME (" +
+			itoa(len(file.Configurations)+len(file.Compounds)) + " configurations in launch.json)")
+		return
+	}
 	a.openLaunchPicker(file)
 }
 

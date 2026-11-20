@@ -3756,3 +3756,71 @@ func TestDebugVizRefusesWhileAStopEventIsPending(t *testing.T) {
 		t.Fatalf("evaluate ran against a stop whose continued event was still pending: %s", out)
 	}
 }
+
+// remoteStart writes a start request with the real sequence stamp and lets the
+// editor consume it, exactly as the poll in Run does.
+func remoteStart(t *testing.T, a *App, req state.DebugRequest) {
+	t.Helper()
+	panelStateDir(t, a)
+	a.lastDebugSeq = debugRequestFloor
+	req.Action = state.DebugActionStart
+	req.Seq = time.Now().UnixNano()
+	writeRawDebugRequest(t, req)
+	a.consumeDebugRequest()
+}
+
+// TestRemoteStartHonoursTheRequestedFile pins that a CLI "start" with a file
+// starts the session FOR THAT FILE. It used to drop req.File and debug whatever
+// tab was active (here main.go under delve) — callers worked around it by
+// sending an open request first.
+func TestRemoteStartHonoursTheRequestedFile(t *testing.T) {
+	a, _ := debugFixture(t)
+	t.Cleanup(a.stopDebugSession)
+	py := filepath.Join(a.rootDir, "script.py")
+	if err := os.WriteFile(py, []byte("print('hi')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteStart(t, a, state.DebugRequest{File: py})
+
+	if tab := a.activeTabPtr(); tab == nil || tab.Path != py {
+		t.Fatalf("active tab after remote start = %+v, want %s", tab, py)
+	}
+	if a.debug == nil || a.debug.adapter != "debugpy" {
+		t.Fatalf("session = %+v, want a debugpy session for the requested .py file", a.debug)
+	}
+}
+
+// TestWithinRootResolvesSymlinks pins that a request spelled through a symlink
+// to the project (or the project reached through one) is still "inside". The
+// root is filepath.Abs, not symlink-resolved, so a plain Rel check consumed such
+// a request and silently ignored it.
+func TestWithinRootResolvesSymlinks(t *testing.T) {
+	real, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(real, "main.go")
+	if err := os.WriteFile(file, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newTestApp(t, link) // root displayed as the symlink
+	if !a.withinRoot(file) {
+		t.Error("real path of a file in a symlinked root was judged outside the project")
+	}
+	if !a.withinRoot(filepath.Join(real, "not-yet.go")) {
+		t.Error("a not-yet-existing file under the root was judged outside")
+	}
+	b := newTestApp(t, real)
+	if !b.withinRoot(filepath.Join(link, "main.go")) {
+		t.Error("symlinked path to a file in the real root was judged outside the project")
+	}
+	if b.withinRoot(filepath.Join(t.TempDir(), "x.go")) || b.withinRoot(filepath.Join(real, "..", "x.go")) {
+		t.Error("a genuinely outside path was judged inside")
+	}
+}
