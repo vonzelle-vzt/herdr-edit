@@ -50,6 +50,7 @@ func TestHelperProcess(t *testing.T) {
 
 // runFakeServer speaks just enough LSP to exercise the client.
 func runFakeServer(mode string) {
+	wedgedAfterInit := false
 	in := bufio.NewReaderSize(os.Stdin, 64*1024)
 	write := func(v interface{}) {
 		body, _ := json.Marshal(v)
@@ -57,6 +58,11 @@ func runFakeServer(mode string) {
 	}
 
 	for {
+		if mode == "wedged" && wedgedAfterInit {
+			// Stop reading stdin entirely: the pipe fills and every writer blocks.
+			time.Sleep(time.Minute)
+			return
+		}
 		body, err := readMessage(in)
 		if err != nil {
 			return
@@ -79,6 +85,7 @@ func runFakeServer(mode string) {
 				"jsonrpc": "2.0", "id": req.ID,
 				"result": map[string]interface{}{"capabilities": map[string]interface{}{}},
 			})
+			wedgedAfterInit = true
 
 		case "textDocument/didOpen":
 			// Publish one error against whatever was opened, the way a real
@@ -326,4 +333,34 @@ func TestStopIsIdempotent(t *testing.T) {
 	}
 	c.Stop()
 	c.Stop() // must not panic or block
+}
+
+// TestStopReturnsBoundedWhenServerStopsReading pins the shutdown bound: a server
+// that stops draining stdin leaves a writer blocked inside write, which used to
+// hold the client mutex and make Stop (and so quitting the editor) hang forever.
+func TestStopReturnsBoundedWhenServerStopsReading(t *testing.T) {
+	argv := withHelper(t, "wedged")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := Start(ctx, "fake", argv, URI(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Overfill the pipe so a write blocks mid-frame.
+	big := strings.Repeat("x", 4<<20)
+	go func() { _ = c.DidOpen(URI("/p/a.ts"), "typescript", big) }()
+	time.Sleep(200 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() { c.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("Client.Stop did not return within 8s against a server that stopped reading")
+	}
+	select {
+	case <-c.readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop still running after Stop")
+	}
 }

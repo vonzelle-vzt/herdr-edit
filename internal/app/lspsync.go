@@ -65,7 +65,7 @@ func (a *App) scheduleLSPWake(d time.Duration) {
 	}
 	a.lspWakeArmed = true
 	scr := a.screen
-	time.AfterFunc(d, func() {
+	a.lspWakeTimer = time.AfterFunc(d, func() {
 		_ = scr.PostEvent(&lspWakeEvent{when: time.Now()})
 	})
 }

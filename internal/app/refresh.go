@@ -105,7 +105,9 @@ func (a *App) startGitRefresh() {
 		job.apply(a)
 		return
 	}
+	done := a.trackJob()
 	go func() {
+		defer done()
 		job.compute(wantIgnore, wantIndex)
 		job.when = time.Now()
 		if err := scr.PostEvent(job); err != nil {
