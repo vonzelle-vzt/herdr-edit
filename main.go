@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,21 @@ const (
 	actionHelp    cliAction = "help"
 	actionOpenAt  cliAction = "open-at"
 	actionDebug   cliAction = "debug"
+
+	actionCapabilities cliAction = "capabilities"
+)
+
+// exitNoEditor is the status a handoff command exits with when it wrote its
+// request but no running editor is registered to pick it up. Distinct from 1
+// (the request could not be written) so a script can tell "queued, nobody home"
+// from "failed".
+const exitNoEditor = 3
+
+// Wire-format versions advertised by --capabilities. They describe
+// debug-session.json and docs/viz-schema-v1.json; bump only with those.
+const (
+	debugSessionSchema = 1
+	vizSchema          = 1
 )
 
 // cliResult bundles everything resolveArgs hands back: which top-level
@@ -51,6 +67,9 @@ type cliResult struct {
 	// state.ValidDebugAction. Empty for every other action.
 	DebugAction string
 	DebugNode   string
+	// DebugConfig is `start --config NAME`: the launch.json configuration to
+	// run without opening the picker.
+	DebugConfig string
 	// DebugQuery is set for the two actions that ANSWER (evaluate, frames):
 	// the request is sent and the editor's JSON reply is printed.
 	DebugQuery *state.DebugRequest
@@ -78,6 +97,8 @@ func resolveArgs(args []string) cliResult {
 		return cliResult{Action: actionVersion}
 	case "--help", "-h", "help":
 		return cliResult{Action: actionHelp}
+	case "--capabilities":
+		return cliResult{Action: actionCapabilities}
 	case "--open-at":
 		// Ask an ALREADY-RUNNING editor to jump to a location, rather than
 		// starting a second one. This is the reverse of the active-file
@@ -110,6 +131,32 @@ func resolveArgs(args []string) cliResult {
 				return cliResult{Err: err}
 			}
 			res.DebugQuery = &q
+			return res
+		}
+		if args[1] == state.DebugActionStart {
+			// start [FILE[:LINE]] [--config NAME], flags in either order.
+			rest := args[2:]
+			for i := 0; i < len(rest); i++ {
+				switch {
+				case rest[i] == "--config":
+					if i+1 >= len(rest) || rest[i+1] == "" {
+						return cliResult{Err: errors.New("--config needs a launch.json configuration name")}
+					}
+					i++
+					res.DebugConfig = rest[i]
+				case strings.HasPrefix(rest[i], "--config="):
+					res.DebugConfig = strings.TrimPrefix(rest[i], "--config=")
+					if res.DebugConfig == "" {
+						return cliResult{Err: errors.New("--config needs a launch.json configuration name")}
+					}
+				case strings.HasPrefix(rest[i], "-"):
+					return cliResult{Err: fmt.Errorf("unknown option %q for --debug start", rest[i])}
+				case res.OpenFile == "":
+					res.OpenFile = rest[i]
+				default:
+					return cliResult{Err: errors.New("--debug start takes one FILE[:LINE]")}
+				}
+			}
 			return res
 		}
 		if len(args) > 2 {
@@ -163,17 +210,21 @@ func resolveArgs(args []string) cliResult {
 // the editor is itself the help — once running, the ≡ menu lists every
 // action.
 func printHelp() {
-	fmt.Println(`SpiceEdit — opinionated mouse-first terminal code editor.
+	fmt.Println(`herdr-edit — opinionated mouse-first terminal code editor.
 
 Usage:
-  spiceedit                     Open the current directory.
-  spiceedit <directory>         Open a project directory.
-  spiceedit <file>              Open a file (its parent becomes the project root).
-  spiceedit --open-at F:L[:C]   Ask a RUNNING editor to jump to that location.
-  spiceedit --debug ACTION      Drive a RUNNING editor's debugger. ACTION is one of
+  herdr-edit                     Open the current directory.
+  herdr-edit <directory>         Open a project directory.
+  herdr-edit <file>              Open a file (its parent becomes the project root).
+  herdr-edit --open-at F:L[:C]   Ask a RUNNING editor to jump to that location.
+  herdr-edit --debug ACTION      Drive a RUNNING editor's debugger. ACTION is one of
                                 start, continue, next, stepIn, stepOut, pause, stop,
                                 toggle-breakpoint FILE:LINE, or test FILE::NODE.
-  spiceedit --debug evaluate --expr E [--frame N] [--context hover|watch|repl]
+  herdr-edit --debug start [FILE[:LINE]] [--config NAME]
+                                Start debugging FILE (default: the file on screen).
+                                --config NAME runs that .vscode/launch.json
+                                configuration without opening the picker.
+  herdr-edit --debug evaluate --expr E [--frame N] [--context hover|watch|repl]
                      [--allow-side-effects] [--instance ID]
                                 Evaluate E in the RUNNING editor's paused session
                                 and print the visualization JSON
@@ -181,14 +232,67 @@ Usage:
                                 code, so they need --allow-side-effects. With
                                 several editors debugging, --instance picks one;
                                 without it the command lists them and refuses.
-  spiceedit --debug frames [--instance ID]
+  herdr-edit --debug frames [--instance ID]
                                 Print the paused frames as JSON.
-  spiceedit --version           Print the version and exit.
-  spiceedit --help              Print this help and exit.
+  herdr-edit --capabilities      Print what this build supports, as one JSON object.
+  herdr-edit --version           Print the version and exit.
+  herdr-edit --help              Print this help and exit.
+
+Exit codes:
+  0  done (for --open-at and --debug requests: a running editor is registered)
+  1  failed (bad arguments, or the request could not be written)
+  3  the request was written but NO running editor took it; it stays queued for
+     the next editor started on this machine
 
 Once running, click ≡ (top-left), right-click anywhere, or double-tap Esc
-for the action menu. See https://github.com/cloudmanic/spice-edit for
+for the action menu. See https://github.com/vonzelle-vzt/herdr-edit for
 hotkeys and the full feature list.`)
+}
+
+// capabilities is the --capabilities document. A struct, not a map, so the key
+// order is stable for anyone diffing the output.
+type capabilities struct {
+	Version            string   `json:"version"`
+	Verbs              []string `json:"verbs"`
+	OpenAt             bool     `json:"openAt"`
+	StartFile          bool     `json:"startFile"`
+	StartConfig        bool     `json:"startConfig"`
+	DebugSessionSchema int      `json:"debugSessionSchema"`
+	VizSchema          int      `json:"vizSchema"`
+	LiveEditors        int      `json:"liveEditors"`
+}
+
+// currentCapabilities reports what this binary supports. The verb list is
+// derived from state.DebugActions(), never restated, so it cannot drift from
+// what --debug actually accepts.
+func currentCapabilities() capabilities {
+	return capabilities{
+		Version:            version.Version,
+		Verbs:              state.DebugActions(),
+		OpenAt:             true,
+		StartFile:          true,
+		StartConfig:        true,
+		DebugSessionSchema: debugSessionSchema,
+		VizSchema:          vizSchema,
+		LiveEditors:        len(state.LiveEditors()),
+	}
+}
+
+// printCapabilities writes the capabilities JSON object, one line, to w.
+func printCapabilities(w io.Writer) error {
+	return json.NewEncoder(w).Encode(currentCapabilities())
+}
+
+// handoffStatus is the exit status for a request that has just been written:
+// 0 when some running editor is registered to pick it up, exitNoEditor (with an
+// explanation on errw) when none is. Truthful, because a bare 0 would tell a
+// caller the request landed when it is only sitting in a file.
+func handoffStatus(errw io.Writer) int {
+	if len(state.LiveEditors()) > 0 {
+		return 0
+	}
+	fmt.Fprintln(errw, "herdr-edit: no running editor took the request (it stays queued for the next editor started on this machine)")
+	return exitNoEditor
 }
 
 // runDebugQuery sends an evaluate or frames request to the running editor,
@@ -234,7 +338,7 @@ func runDebugQuery(q state.DebugRequest) int {
 func main() {
 	res := resolveArgs(os.Args[1:])
 	if res.Err != nil {
-		fmt.Fprintln(os.Stderr, "spiceedit:", res.Err)
+		fmt.Fprintln(os.Stderr, "herdr-edit:", res.Err)
 		os.Exit(1)
 	}
 
@@ -244,6 +348,12 @@ func main() {
 		return
 	case actionHelp:
 		printHelp()
+		return
+	case actionCapabilities:
+		if err := printCapabilities(os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+			os.Exit(1)
+		}
 		return
 	case actionOpenAt:
 		path, line, col := state.SplitLocation(res.OpenFile)
@@ -256,7 +366,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
 			os.Exit(1)
 		}
-		return
+		os.Exit(handoffStatus(os.Stderr))
 	case actionDebug:
 		if res.DebugQuery != nil {
 			os.Exit(runDebugQuery(*res.DebugQuery))
@@ -285,11 +395,17 @@ func main() {
 				abs, line = p, l
 			}
 		}
-		if err := state.WriteDebugRequest(res.DebugAction, abs, line, res.DebugNode); err != nil {
-			fmt.Fprintln(os.Stderr, "herdr-edit:", err)
+		var werr error
+		if res.DebugAction == state.DebugActionStart {
+			werr = state.WriteDebugStart(abs, line, res.DebugConfig)
+		} else {
+			werr = state.WriteDebugRequest(res.DebugAction, abs, line, res.DebugNode)
+		}
+		if werr != nil {
+			fmt.Fprintln(os.Stderr, "herdr-edit:", werr)
 			os.Exit(1)
 		}
-		return
+		os.Exit(handoffStatus(os.Stderr))
 	}
 
 	// Single-file mode: when the user invoked `spiceedit somefile.md`,
@@ -314,7 +430,7 @@ func main() {
 	defer a.Close()
 
 	if err := a.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "spiceedit:", err)
+		fmt.Fprintln(os.Stderr, "herdr-edit:", err)
 		os.Exit(1)
 	}
 }

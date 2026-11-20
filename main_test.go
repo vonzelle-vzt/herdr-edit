@@ -8,6 +8,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cloudmanic/spice-edit/internal/state"
+	"github.com/cloudmanic/spice-edit/internal/version"
 )
 
 // TestResolveArgs_NoArgsRootsCurrentDir keeps the no-arg path simple:
@@ -243,5 +245,147 @@ func TestHelpNamesEveryDebugAction(t *testing.T) {
 		if !strings.Contains(help, action) {
 			t.Errorf("--help does not mention the %q action", action)
 		}
+	}
+}
+
+// TestHelpNamesTheRealBinary pins that usage text says herdr-edit, not the
+// upstream binary name, and documents the new surface: --capabilities, start
+// FILE / --config, and exit code 3.
+func TestHelpNamesTheRealBinary(t *testing.T) {
+	help := captureStdout(t, printHelp)
+	if strings.Contains(help, "spiceedit") || strings.Contains(help, "SpiceEdit") {
+		t.Errorf("--help still names the upstream binary:\n%s", help)
+	}
+	for _, want := range []string{"herdr-edit --capabilities", "--config NAME", "start [FILE[:LINE]]", "Exit codes", "3  the request was written"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("--help does not mention %q", want)
+		}
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected and returns what it printed.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	fn()
+	os.Stdout = saved
+	w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// TestResolveArgs_DebugStart pins start's optional location and --config, in
+// either order, and its refusals.
+func TestResolveArgs_DebugStart(t *testing.T) {
+	got := resolveArgs([]string{"--debug", "start", "src/a.go:12", "--config", "Launch API"})
+	if got.Err != nil || got.OpenFile != "src/a.go:12" || got.DebugConfig != "Launch API" {
+		t.Fatalf("got %+v", got)
+	}
+	got = resolveArgs([]string{"--debug", "start", "--config=Web", "a.go"})
+	if got.Err != nil || got.OpenFile != "a.go" || got.DebugConfig != "Web" {
+		t.Fatalf("got %+v", got)
+	}
+	got = resolveArgs([]string{"--debug", "start", "--config", "Only"})
+	if got.Err != nil || got.OpenFile != "" || got.DebugConfig != "Only" {
+		t.Fatalf("config with no file: %+v", got)
+	}
+	if got := resolveArgs([]string{"--debug", "start"}); got.Err != nil || got.DebugConfig != "" {
+		t.Errorf("bare start changed: %+v", got)
+	}
+	for _, bad := range [][]string{
+		{"--debug", "start", "--config"},
+		{"--debug", "start", "--config="},
+		{"--debug", "start", "--bogus"},
+		{"--debug", "start", "a.go", "b.go"},
+	} {
+		if got := resolveArgs(bad); got.Err == nil {
+			t.Errorf("%v accepted", bad)
+		}
+	}
+}
+
+// TestResolveArgs_Capabilities pins the flag.
+func TestResolveArgs_Capabilities(t *testing.T) {
+	if got := resolveArgs([]string{"--capabilities"}); got.Action != actionCapabilities {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestCapabilitiesDocument pins the JSON contract: verbs are DERIVED from
+// state.DebugActions, the booleans and schema versions are present, and
+// liveEditors counts the registry.
+func TestCapabilitiesDocument(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var buf strings.Builder
+	if err := printCapabilities(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(buf.String()), &doc); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, buf.String())
+	}
+	if doc["version"] != version.Version {
+		t.Errorf("version = %v", doc["version"])
+	}
+	verbs, _ := doc["verbs"].([]any)
+	want := state.DebugActions()
+	if len(verbs) != len(want) {
+		t.Fatalf("verbs = %v, want %v", verbs, want)
+	}
+	for i := range want {
+		if verbs[i] != want[i] {
+			t.Errorf("verb %d = %v, want %s", i, verbs[i], want[i])
+		}
+	}
+	for _, k := range []string{"openAt", "startFile", "startConfig"} {
+		if doc[k] != true {
+			t.Errorf("%s = %v, want true", k, doc[k])
+		}
+	}
+	if doc["debugSessionSchema"] != float64(1) || doc["vizSchema"] != float64(1) {
+		t.Errorf("schemas = %v / %v", doc["debugSessionSchema"], doc["vizSchema"])
+	}
+	if doc["liveEditors"] != float64(0) {
+		t.Errorf("liveEditors = %v, want 0", doc["liveEditors"])
+	}
+	unreg, err := state.RegisterEditor("/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unreg()
+	if got := currentCapabilities().LiveEditors; got != 1 {
+		t.Errorf("liveEditors = %d after registering, want 1", got)
+	}
+}
+
+// TestHandoffStatusIsTruthful pins the exit-3 contract: no registered editor
+// means exit 3 with the stderr explanation, a registered one means 0 and
+// silence.
+func TestHandoffStatusIsTruthful(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var errw strings.Builder
+	if got := handoffStatus(&errw); got != exitNoEditor || exitNoEditor != 3 {
+		t.Fatalf("no editor: status %d, want 3", got)
+	}
+	if !strings.Contains(errw.String(), "no running editor took the request") ||
+		!strings.Contains(errw.String(), "stays queued for the next editor started on this machine") {
+		t.Errorf("stderr = %q", errw.String())
+	}
+	unreg, err := state.RegisterEditor("/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unreg()
+	errw.Reset()
+	if got := handoffStatus(&errw); got != 0 || errw.Len() != 0 {
+		t.Errorf("with an editor: status %d, stderr %q", got, errw.String())
 	}
 }
