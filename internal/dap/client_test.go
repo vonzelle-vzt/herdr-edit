@@ -1714,3 +1714,38 @@ func TestShortWriteWithoutErrorClosesTheConnection(t *testing.T) {
 		t.Fatalf("err = %v closed = %v, want io.ErrShortWrite and a closed connection", err, sc.closed)
 	}
 }
+
+// TestStopIsBoundedAndReleasesGoroutinesWhenAdapterIgnoresDisconnect pins the
+// quit contract: stopDebugSession runs synchronously on the way out of Run, so a
+// Stop that waits on an adapter which never answers (or never reads) is the
+// editor refusing to quit. It must return within a bound and leave no goroutine
+// of its own behind.
+func TestStopIsBoundedAndReleasesGoroutinesWhenAdapterIgnoresDisconnect(t *testing.T) {
+	base := runtime.NumGoroutine()
+	clientEnd, adapterEnd := net.Pipe()
+	defer adapterEnd.Close()
+	c := StartConn("fake", clientEnd, Handlers{})
+
+	// The adapter end is never read: net.Pipe is unbuffered, so the polite
+	// disconnect write blocks and no answer can ever arrive.
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { c.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3*disconnectTimeout + time.Second):
+		t.Fatal("Stop did not return against an adapter that ignores disconnect")
+	}
+	if d := time.Since(start); d > 3*disconnectTimeout {
+		t.Fatalf("Stop took %v, want a bounded wait", d)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for runtime.NumGoroutine() > base+1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > base+1 {
+		buf := make([]byte, 1<<16)
+		t.Fatalf("goroutines after Stop = %d, baseline %d\n%s", n, base, buf[:runtime.Stack(buf, true)])
+	}
+}

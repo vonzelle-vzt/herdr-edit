@@ -192,7 +192,10 @@ func (a *App) afterTypedRune(tab *editor.Tab, r rune, hadSelection bool) {
 	}
 	a.cancelCompletionRequest()
 	gen := a.completionGen
-	time.AfterFunc(completionDebounce, func() {
+	if a.completionTimer != nil {
+		a.completionTimer.Stop() // older gens are dropped anyway; do not leave them armed
+	}
+	a.completionTimer = time.AfterFunc(completionDebounce, func() {
 		a.post(&completionTimerEvent{gen: gen, when: time.Now()})
 	})
 }

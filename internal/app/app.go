@@ -420,6 +420,7 @@ type App struct {
 	diagnostics map[string][]lsp.Diagnostic
 	lspSentVersion map[string]uint64 // Buffer.Version each document was last synced at, to skip no-op syncs
 	lspWakeArmed   bool              // a trailing-edge sync wake is scheduled (lspsync.go)
+	lspWakeTimer   *time.Timer       // the armed wake, kept so shutdown can stop it (lifecycle.go)
 	lspSyncedAt time.Time
 
 	// startRows maps start-page rows back to files so a click can open them. Rebuilt each draw.
@@ -617,6 +618,10 @@ type App struct {
 	// carrying an older value is dropped.
 	completionGen    uint64
 	completionCancel context.CancelFunc
+	// completionTimer is the armed debounce, kept so shutdown can stop it (lifecycle.go).
+	completionTimer *time.Timer
+	// life is shutdown bookkeeping: liveness registration and tracked subprocess jobs (lifecycle.go).
+	life lifecycle
 	// completionAutoOff is config.json's completion.auto=false, inverted so the
 	// zero value (and every test App) keeps the default ON.
 	completionAutoOff bool
@@ -1012,8 +1017,10 @@ func (a *App) stopTreeRefresh() {
 
 // Close releases the terminal back to the user. Always call this before exit.
 func (a *App) Close() {
-	a.stopTreeRefresh()
-	a.stopAutoScroll()
+	a.shutdownBackground()
+	if a.lsp != nil {
+		a.lsp.Stop() // idempotent; covers a Run that never reached its own exit path
+	}
 	if a.screen != nil {
 		a.screen.Fini()
 	}
@@ -1023,6 +1030,7 @@ func (a *App) Close() {
 // each event, redraws, and exits when a.quit is set.
 func (a *App) Run() error {
 	a.width, a.height = a.screen.Size()
+	a.beginLifecycle()
 	a.startLSP()
 	if tab := a.activeTabPtr(); tab != nil {
 		a.lspDidOpen(tab.Path, tab.Buffer.String())
@@ -1062,6 +1070,7 @@ func (a *App) Run() error {
 	// adapter does not advertise a terminate request, so this is what actually
 	// kills it. See debug.go / dap.Client.Disconnect.
 	a.stopDebugSession()
+	a.shutdownBackground() // withdraw from the liveness registry before the slower LSP stop
 	if a.lsp != nil {
 		a.lsp.Stop()
 	}

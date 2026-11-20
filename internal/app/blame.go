@@ -214,7 +214,9 @@ func (a *App) startBlame(key blameKey) {
 	if post == nil {
 		post = a.post
 	}
+	done := a.trackJob()
 	go func() {
+		defer done()
 		text := run(key.path, key.line)
 		post(&blameEvent{key: key, text: text, when: time.Now()})
 	}()
