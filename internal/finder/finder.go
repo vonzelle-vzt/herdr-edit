@@ -110,6 +110,19 @@ func (f *Finder) Rebuild(onDone func()) {
 	}()
 }
 
+// SetIndex installs an index the caller already computed (the app's background refresh runs
+// `git ls-files` once and shares the bytes) and marks the finder ready, so no second exec is
+// needed. paths must be what ParseGitLsFiles returns. A build already in flight is left to finish;
+// its result simply replaces this one, which is no staler than what it would have produced anyway.
+func (f *Finder) SetIndex(paths []string, viaGit bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paths = paths
+	f.viaGit = viaGit
+	f.lastErr = nil
+	f.state = StateReady
+}
+
 // Invalidate marks the cached index stale. Caller must follow
 // with Rebuild() to actually refresh — splitting the two lets
 // the app debounce many invalidations into a single rebuild
@@ -186,7 +199,13 @@ func (f *Finder) Search(query string, limit int) []Result {
 	paths := f.paths
 	state := f.state
 	f.mu.RUnlock()
-	if state == StateIdle || state == StateBuilding {
+	if state == StateErrored {
+		return nil
+	}
+	// Idle/Building with no paths yet is the genuine first build: nothing to show. With paths in
+	// hand it is a REBUILD (the 10s refresh invalidates every tick), and serving the previous
+	// index keeps an open finder from blanking to "Indexing…" and flickering back every tick.
+	if (state == StateIdle || state == StateBuilding) && paths == nil {
 		return nil
 	}
 	if query == "" {

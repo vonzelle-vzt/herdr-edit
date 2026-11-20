@@ -572,6 +572,8 @@ type App struct {
 
 	// treeRefreshStop signals the background tree-refresh goroutine to exit.
 	treeRefreshStop chan struct{}
+	// refresh is the bookkeeping for the background git half of the 10s refresh (refresh.go).
+	refresh refreshState
 
 	// gitBranch is the current branch name for the project root (or a
 	// short commit SHA when HEAD is detached). Empty when the root isn't
@@ -906,10 +908,20 @@ func (a *App) refreshGitStatus() {
 	a.refreshGitLineChanges()
 }
 
-// refreshGitLineChanges refreshes git state for every open text tab.
+// refreshGitLineChanges refreshes git state for every open text tab. The
+// repo-wide unmerged set is identical for every tab, so it is computed once
+// here and handed to each, not re-run per tab.
 func (a *App) refreshGitLineChanges() {
+	var unmerged map[string]bool
+	computed := false
 	for _, tab := range a.tabs {
-		a.refreshTabGitState(tab)
+		if !tabHasGitState(tab) {
+			continue
+		}
+		if !computed {
+			unmerged, computed = gitUnmergedPaths(a.rootDir), true
+		}
+		a.refreshTabGitStateWith(tab, unmerged)
 	}
 }
 
@@ -925,16 +937,42 @@ func (a *App) refreshGitLineChanges() {
 //
 // Deliberately not called for image or synthetic tabs — neither has a path git
 // has an opinion about.
+//
+// The unmerged set is repo-wide, so loops over many tabs (and the background
+// refresh) compute it once and call refreshTabGitStateWith / installTabGitState
+// instead of paying for it per tab. installTabGitState is still the ONE place
+// that assigns the two facts.
 func (a *App) refreshTabGitState(t *editor.Tab) {
-	if t == nil || t.Path == "" || t.IsImage() || t.Synthetic {
+	if !tabHasGitState(t) {
 		return
 	}
-	t.GitLines = loadGitLineChanges(a.rootDir, t.Path)
+	a.refreshTabGitStateWith(t, gitUnmergedPaths(a.rootDir))
+}
+
+// refreshTabGitStateWith is refreshTabGitState for a caller that already holds
+// the repo's unmerged set: it loads this tab's line changes and installs both.
+func (a *App) refreshTabGitStateWith(t *editor.Tab, unmerged map[string]bool) {
+	if !tabHasGitState(t) {
+		return
+	}
+	a.installTabGitState(t, loadGitLineChanges(a.rootDir, t.Path), unmerged)
+}
+
+// tabHasGitState reports whether git has an opinion about this tab at all.
+func tabHasGitState(t *editor.Tab) bool {
+	return t != nil && t.Path != "" && !t.IsImage() && !t.Synthetic
+}
+
+// installTabGitState is the single assignment site for a tab's git facts: the
+// line change bars and the unmerged flag, kept in step, then the conflict rescan.
+// Both the synchronous callers and the background refresh's apply end here.
+func (a *App) installTabGitState(t *editor.Tab, lines map[int]editor.GitLineChange, unmerged map[string]bool) {
+	t.GitLines = lines
 	// 🔴 git is the authority on WHETHER; the scanner only says WHERE. Without
 	// this line any file containing a well-formed marker sequence — a test
 	// fixture, a merge-tool README, this editor's own conflict_test.go — would
 	// light up as conflicted in a perfectly clean checkout.
-	t.GitUnmerged = gitUnmergedPaths(a.rootDir)[t.Path]
+	t.GitUnmerged = unmerged[t.Path]
 	t.RescanConflicts()
 }
 
@@ -1171,16 +1209,20 @@ type selfApplyingEvent interface {
 
 // refreshTreeNow re-runs the same refresh pipeline the 10s timer
 // fires: rescan the file tree (preserving expansion state), reconcile
-// any open tabs with disk, refresh git status, and invalidate the
-// finder index so a freshly-pulled file shows up everywhere at once.
-// Called from the periodic event and from runCustomAction's success
-// path so a Copy-from-remote action's output is visible immediately
-// instead of after the next tick.
+// any open tabs with disk, then refresh git status, per-tab git state
+// and the finder index. Called from the periodic event and from
+// runCustomAction's success path so a Copy-from-remote action's output
+// is visible immediately instead of after the next tick.
+//
+// Only the cheap local half (directory reload, mtime stats) runs here on
+// the UI goroutine. Everything that forks git runs in the background and
+// lands as one event (see refresh.go), so a slow repo cannot freeze input.
 func (a *App) refreshTreeNow() {
-	a.refreshTree()
+	if a.tree != nil {
+		a.tree.ReloadDirs()
+	}
 	a.reconcileOpenTabsWithDisk()
-	a.refreshGitStatus()
-	a.invalidateFinder()
+	a.startGitRefresh()
 }
 
 // handleCustomActionDone surfaces the result of an async custom-action

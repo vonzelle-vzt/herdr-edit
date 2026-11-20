@@ -107,6 +107,14 @@ func buildIndexGit(rootDir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseGitLsFiles(out), nil
+}
+
+// ParseGitLsFiles turns the raw output of `git ls-files --cached --others --exclude-standard -z`
+// (run with the project root as working directory) into the sorted, de-duplicated, capped path
+// list the index holds. Exported so the app's background refresh can run that command once and
+// feed the same bytes to the file tree's ignore filter and to Finder.SetIndex.
+func ParseGitLsFiles(out []byte) []string {
 	// Split on \0; trim the trailing empty entry git always writes.
 	parts := bytes.Split(out, []byte{0})
 	paths := make([]string, 0, len(parts))
@@ -140,7 +148,7 @@ func buildIndexGit(rootDir string) ([]string, error) {
 		}
 	}
 	sort.Strings(paths)
-	return paths, nil
+	return paths
 }
 
 // buildIndexWalk is the non-git fallback: filepath.WalkDir from

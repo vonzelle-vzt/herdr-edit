@@ -191,3 +191,15 @@ func TestGitIndexDeduplicatesUnmergedPaths(t *testing.T) {
 			"every search over it would report %dx the real hit count", n, n)
 	}
 }
+
+// TestParseGitLsFiles pins the shared parser the app's refresh feeds with a single ls-files run:
+// NUL-separated input comes back sorted and de-duplicated (an unmerged path appears once per stage).
+func TestParseGitLsFiles(t *testing.T) {
+	got := ParseGitLsFiles([]byte("b.go\x00a.go\x00b.go\x00b.go\x00"))
+	if !sliceEqual(got, []string{"a.go", "b.go"}) {
+		t.Fatalf("got %v, want [a.go b.go]", got)
+	}
+	if got := ParseGitLsFiles(nil); len(got) != 0 {
+		t.Fatalf("empty input: got %v", got)
+	}
+}
