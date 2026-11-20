@@ -145,6 +145,7 @@ func TestJsTsEmbeddedFixtureIsConsistent(t *testing.T) {
 // `typescript` one: the oracle must be runnable BEFORE the registry claims the
 // language, or the claim could never be gated on it.
 func TestLiveJsTsBreakpointBindsThroughSourceMap(t *testing.T) {
+	skipLiveUnderShort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), jsDebugTimeout)
 	defer cancel()
 

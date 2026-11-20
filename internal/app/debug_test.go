@@ -795,11 +795,21 @@ func TestDebugGutterPaintsOnWrappedTabs(t *testing.T) {
 // the row by reading the screen rather than by recomputing wrap geometry.
 func fmtLineNo(n int) string { return strconv.Itoa(n) }
 
+// skipLiveAppUnderShort skips the app-level live debugger oracles under -short
+// (they start a real delve or debugpy), unless HERDR_REQUIRE_DAP=1 demands them.
+func skipLiveAppUnderShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() && os.Getenv("HERDR_REQUIRE_DAP") != "1" {
+		t.Skip("SKIPPED live oracle under -short (real debugger, slow); run without -short or set HERDR_REQUIRE_DAP=1 to run it")
+	}
+}
+
 // requireDlvForApp is the anti-skip gate for the app-level live oracle, matching
 // internal/dap/live_dlv_test.go: skip when delve is absent so a fresh clone
 // stays green, fail when HERDR_REQUIRE_DAP=1 says it must be there.
 func requireDlvForApp(t *testing.T) {
 	t.Helper()
+	skipLiveAppUnderShort(t)
 	if _, err := exec.LookPath("dlv"); err != nil {
 		msg := "dlv is not installed — `go install github.com/go-delve/delve/cmd/dlv@latest`"
 		if os.Getenv("HERDR_REQUIRE_DAP") == "1" {
@@ -1552,6 +1562,7 @@ func TestRemovingTheLastBreakpointClearsTheFileOnTheAdapter(t *testing.T) {
 // requireDlvForApp uses, because a skipped end-to-end oracle reads as a pass.
 func requireDebugpyForApp(t *testing.T, root string) {
 	t.Helper()
+	skipLiveAppUnderShort(t)
 	if cmd := dap.LocateDebugpy(root); cmd != nil {
 		t.Logf("debugpy resolved from %s: %v", cmd.Origin, cmd.Argv)
 		return

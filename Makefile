@@ -34,7 +34,7 @@ build:
 	mkdir -p bin
 	go build -o bin/$(BINARY) .
 
-# install copies the binary into /usr/local/bin so you can launch it as `spiceedit`.
+# install copies the binary into /usr/local/bin so you can launch it as `herdr-edit`.
 install: build
 	install -m 0755 bin/$(BINARY) /usr/local/bin/$(BINARY)
 
@@ -51,10 +51,12 @@ build-linux:
 test:
 	go test -race ./...
 
-# test-short is the quick local iteration loop: skip anything tagged
-# slow with -short, no race detector. Use this while writing tests.
+# test-short is the quick local iteration loop: -short skips the live oracles
+# (real gopls/dlv/debugpy/js-debug/Chrome) with a loud SKIPPED message, no race
+# detector. HERDR_REQUIRE_DAP=1 / HERDR_REQUIRE_LSP=1 force them to run anyway.
+# Use this while writing tests; `make test` (and CI) runs everything.
 test-short:
-	go test -short ./...
+	go test -short -count=1 ./...
 
 # coverage produces a coverage profile across every package and a
 # rendered HTML report you can open in a browser.

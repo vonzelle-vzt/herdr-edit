@@ -256,6 +256,7 @@ func unmarshalBody(body []byte, v interface{}) error {
 // — because every one of the traps in this package lives somewhere in that
 // sequence, and any of them fails as a hang rather than as an error.
 func TestLiveDelveStopsAtBreakpoint(t *testing.T) {
+	skipLiveUnderShort(t)
 	dlv := requireDlv(t)
 	t.Logf("using %s", dlv)
 
@@ -417,6 +418,7 @@ func TestLiveDelveStopsAtBreakpoint(t *testing.T) {
 // stopped, continuing must actually resume the program and run it to the end.
 // A session that stops but cannot resume is a debugger the user has to kill.
 func TestLiveDelveContinueRunsToCompletion(t *testing.T) {
+	skipLiveUnderShort(t)
 	requireDlv(t)
 
 	root, file, lines := dlvFixture(t)
@@ -491,6 +493,7 @@ func TestLiveDelveContinueRunsToCompletion(t *testing.T) {
 // written to our terminal. If it reached our real stdout instead, it would
 // scribble over the tcell screen with nothing to repair it.
 func TestLiveDelveOutputEventCarriesProgramStdout(t *testing.T) {
+	skipLiveUnderShort(t)
 	requireDlv(t)
 
 	root, _, _ := dlvFixture(t)
@@ -747,6 +750,7 @@ func (s *liveSession) assertStoppedOn(t *testing.T, ctx context.Context, ev Stop
 // the conversion at either end, and "line+1" is satisfied by a step that never
 // happened next to an off-by-one. See assertStoppedOn.
 func TestLiveDelveStepOverAdvancesOneLine(t *testing.T) {
+	skipLiveUnderShort(t)
 	dlv := requireDlv(t)
 	t.Logf("using %s", dlv)
 
@@ -794,6 +798,7 @@ func TestLiveDelveStepOverAdvancesOneLine(t *testing.T) {
 // assignment to have RUN) can tell the difference, which is why the breakpoint
 // for this oracle is on the line after the assignment rather than on it.
 func TestLiveDelveVariablesReadsALocal(t *testing.T) {
+	skipLiveUnderShort(t)
 	requireDlv(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
@@ -882,6 +887,7 @@ func (s *liveSession) countStopped() int {
 // RED against a client that does not put `condition` on the wire: the run then
 // stops ten times and the first stop reports i == 0.
 func TestLiveDelveConditionalBreakpointFiresOnce(t *testing.T) {
+	skipLiveUnderShort(t)
 	dlv := requireDlv(t)
 	t.Logf("using %s", dlv)
 
@@ -960,6 +966,7 @@ func TestLiveDelveConditionalBreakpointFiresOnce(t *testing.T) {
 // contract — and a logMessage that the adapter treated as an ordinary breakpoint
 // would stop ten times, which is the failure this pins.
 func TestLiveDelveLogPointDoesNotStop(t *testing.T) {
+	skipLiveUnderShort(t)
 	requireDlv(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
