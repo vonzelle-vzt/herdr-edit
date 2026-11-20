@@ -9,6 +9,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -398,5 +399,124 @@ func TestLSPCallsAreNilSafe(t *testing.T) {
 	a.maybeSyncLSP()
 	if got := a.diagnosticStatus(); got != "" {
 		t.Errorf("no server should mean no status, got %q", got)
+	}
+}
+
+// hugeDiagnosticApp is an app on a many-line file whose single diagnostic spans
+// lines 0..spanEnd, scrolled to the middle so the viewport sits well inside it.
+func hugeDiagnosticApp(tb *testing.T, lines, spanEnd int) *App {
+	tb.Helper()
+	var sb strings.Builder
+	for i := 0; i < lines; i++ {
+		fmt.Fprintf(&sb, "\tx := %d // %s\n", i, strings.Repeat("abcdefghij", 10))
+	}
+	root := tb.TempDir()
+	path := filepath.Join(root, "big.go")
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		tb.Fatal(err)
+	}
+	a := newTestApp(tb, root)
+	a.openFile(path)
+	a.diagnostics = map[string][]lsp.Diagnostic{path: {{
+		Severity: lsp.SeverityError,
+		Message:  "spans most of the file",
+		Range: lsp.Range{
+			Start: lsp.Position{Line: 0, Character: 0},
+			End:   lsp.Position{Line: spanEnd, Character: 3},
+		},
+	}}}
+	a.activeTabPtr().ScrollY = lines / 2
+	return a
+}
+
+// TestDrawDiagnosticsHugeSpanBenchmark measures the underline pass for one
+// diagnostic spanning 5000 lines, via testing.Benchmark so the app can be built
+// with the *testing.T helpers. Before the viewport clip it walked every column
+// of every one of those lines, calling ScreenPos (two []rune conversions and two
+// LineVisualCol scans) per cell; now it touches only visible rows. Opt-in
+// (HERDR_BENCH=1) because it is a measurement, not an assertion:
+//
+//	HERDR_BENCH=1 go test ./internal/app -run HugeSpanBenchmark -v
+func TestDrawDiagnosticsHugeSpanBenchmark(t *testing.T) {
+	if os.Getenv("HERDR_BENCH") == "" {
+		t.Skip("set HERDR_BENCH=1 to measure")
+	}
+	a := hugeDiagnosticApp(t, 6000, 5000)
+	a.draw()
+	res := testing.Benchmark(func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			a.drawDiagnostics()
+		}
+	})
+	t.Logf("drawDiagnostics, 5000-line span: %d ns/op (%d iterations)", res.NsPerOp(), res.N)
+}
+
+// TestDrawDiagnosticsClipsToViewport pins the behaviour the clip must keep: with
+// a multi-line diagnostic spanning far past the viewport, exactly the visible
+// rows are underlined (read off the rendered screen, not recomputed).
+func TestDrawDiagnosticsClipsToViewport(t *testing.T) {
+	a := hugeDiagnosticApp(t, 400, 390)
+	a.draw()
+	a.screen.Show()
+	scr := a.screen.(tcell.SimulationScreen)
+	cells, w, _ := scr.GetContents()
+	ex, ey, ew, eh := a.editorRect()
+	tab := a.activeTabPtr()
+	gut := tab.GutterWidth() + 1
+
+	underlinedRows := 0
+	for dy := 0; dy < eh; dy++ {
+		// Column 0 of each row is the leading tab: visual col 0..3 of the line.
+		_, _, attr := cells[(ey+dy)*w+ex+gut].Style.Decompose()
+		if attr&tcell.AttrUnderline != 0 {
+			underlinedRows++
+		}
+	}
+	if underlinedRows != eh {
+		t.Errorf("underlined %d of %d visible rows; the span covers all of them", underlinedRows, eh)
+	}
+	// Nothing painted past the editor's right edge (the splitter/gutter side
+	// belongs to other panes).
+	for dy := 0; dy < eh; dy++ {
+		x := ex + ew
+		if x >= w {
+			break
+		}
+		if _, _, attr := cells[(ey+dy)*w+x].Style.Decompose(); attr&tcell.AttrUnderline != 0 {
+			t.Fatalf("underline leaked past the editor's right edge on row %d", dy)
+		}
+	}
+}
+
+// TestDrawDiagnosticsAgreesWithScreenPos cross-checks the per-line column walk
+// against Tab.ScreenPos on a line with hard tabs and multi-byte runes: every cell
+// ScreenPos says a column occupies must be underlined, and no other cell on
+// the row may be. ScreenPos is the independent oracle here, so the optimised
+// walk cannot drift from the geometry the cursor uses.
+func TestDrawDiagnosticsAgreesWithScreenPos(t *testing.T) {
+	a, path := appWithFile(t, "\t\tfoo\téü bar baz\n")
+	a.diagnostics = map[string][]lsp.Diagnostic{path: {
+		diag(0, 2, 12, lsp.SeverityError, "mixed"),
+	}}
+	a.activeTabPtr().ScrollX = 1
+	a.draw()
+	a.screen.Show()
+	scr := a.screen.(tcell.SimulationScreen)
+	cells, w, _ := scr.GetContents()
+	ex, ey, ew, eh := a.editorRect()
+	tab := a.activeTabPtr()
+
+	want := map[int]bool{}
+	for col := 2; col < 12; col++ {
+		if dx, dy, ok := tab.ScreenPos(0, col, ew, eh); ok && dy == 0 {
+			want[ex+dx] = true
+		}
+	}
+	for x := ex; x < ex+ew; x++ {
+		_, _, attr := cells[ey*w+x].Style.Decompose()
+		got := attr&tcell.AttrUnderline != 0
+		if got != want[x] {
+			t.Errorf("x=%d underlined=%v, ScreenPos says %v", x, got, want[x])
+		}
 	}
 }

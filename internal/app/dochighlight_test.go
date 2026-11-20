@@ -194,6 +194,38 @@ func TestDrawDocumentHighlightsSuppressedCases(t *testing.T) {
 	})
 }
 
+// TestDocumentHighlightRefreshesAfterSameLineCountEdit is the RED test for the
+// stale memo: the cache key used to be (path, symbol, scroll, height, line
+// count), so typing the symbol onto another line left every key field
+// unchanged and the new occurrence was never tinted until something scrolled.
+func TestDocumentHighlightRefreshesAfterSameLineCountEdit(t *testing.T) {
+	a, _ := appWithFile(t, "foo here\nplain line\n")
+	tab := a.activeTabPtr()
+	tab.Cursor = editor.Position{Line: 0, Col: 1}
+	tab.Anchor = tab.Cursor
+
+	scr := a.screen.(tcell.SimulationScreen)
+	scr.SetSize(80, 20)
+	a.width, a.height = 80, 20
+	a.draw() // primes the memo with one occurrence on line 0
+
+	// Same line count, same symbol, same scroll: only the text differs.
+	tab.Buffer.InsertString(editor.Position{Line: 1, Col: 0}, "foo ")
+	a.draw()
+	scr.Show()
+
+	_, ey, _, _ := a.editorRect()
+	cells, w, _ := scr.GetContents()
+	y := ey + 1
+	idx := runeIndexOf(screenText(cells, w, y), "foo")
+	if idx < 0 {
+		t.Fatalf("edited line not rendered: %q", screenText(cells, w, y))
+	}
+	if !cellHasHighlightBG(a, cells, w, idx, y) {
+		t.Error("new occurrence on an edited line was not tinted (stale memo)")
+	}
+}
+
 // cellHasHighlightBG reports whether the cell at (x, y) carries the
 // document-highlight background colour.
 func cellHasHighlightBG(a *App, cells []tcell.SimCell, w, x, y int) bool {

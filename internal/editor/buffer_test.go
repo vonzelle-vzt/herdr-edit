@@ -327,3 +327,46 @@ func TestPosLess_AndOrdered(t *testing.T) {
 		t.Fatalf("PosOrdered should be stable for already-ordered: %+v %+v", x, y)
 	}
 }
+
+// TestBufferVersionMovesOnEveryPrimitiveMutation pins that each mutation
+// primitive (single-line insert, multi-line insert, delete) and Touch change
+// Version, while no-ops and reads leave it alone. Callers compare it instead
+// of the whole text, so a primitive that forgets to bump it is a silent desync.
+func TestBufferVersionMovesOnEveryPrimitiveMutation(t *testing.T) {
+	b := NewBuffer("hello\nworld")
+	v := b.Version()
+
+	steps := []struct {
+		name string
+		do   func()
+	}{
+		{"single-line insert", func() { b.InsertString(Position{0, 1}, "X") }},
+		{"multi-line insert", func() { b.InsertString(Position{0, 0}, "a\nb") }},
+		{"delete", func() { b.DeleteRange(Position{0, 0}, Position{1, 0}) }},
+		{"touch", func() { b.Touch() }},
+	}
+	for _, s := range steps {
+		s.do()
+		if b.Version() == v {
+			t.Errorf("%s did not change Version", s.name)
+		}
+		v = b.Version()
+	}
+
+	b.InsertString(Position{0, 0}, "")
+	b.DeleteRange(Position{0, 0}, Position{0, 0})
+	_ = b.String()
+	if b.Version() != v {
+		t.Error("no-op edits and reads must not change Version")
+	}
+}
+
+// TestBufferVersionIsNeverSharedBetweenBuffers pins that two fresh buffers
+// never report the same stamp, so a tab reloaded from disk (a new Buffer)
+// cannot look unchanged to a caller comparing stamps across the swap.
+func TestBufferVersionIsNeverSharedBetweenBuffers(t *testing.T) {
+	a, b := NewBuffer("x"), NewBuffer("x")
+	if a.Version() == b.Version() {
+		t.Fatalf("two NewBuffer calls share Version %d", a.Version())
+	}
+}

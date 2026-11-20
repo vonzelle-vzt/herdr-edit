@@ -64,6 +64,16 @@ func (a *App) visibleOccurrences(tab *editor.Tab, sym string, top, height int) [
 	return matches
 }
 
+// docHighlightTextKey is the memo key's text component: the buffer's edit
+// version mixed with its line count. The version catches every same-line-count
+// edit the old key missed; the line count stays in as a backstop for writers
+// that edit Buffer.Lines without calling Touch (undo restore), which change the
+// count more often than not. It is stored in App.docHighlightLineCount, whose
+// name predates the version — an int compared for equality only.
+func docHighlightTextKey(b *editor.Buffer) int {
+	return int(b.Version()<<20) ^ len(b.Lines)
+}
+
 // drawDocumentHighlights repaints the background of every visible occurrence
 // of the identifier under the cursor, leaving the syntax foreground colour
 // untouched — same discipline drawDiagnostics uses for its underline.
@@ -88,22 +98,25 @@ func (a *App) drawDocumentHighlights() {
 	}
 
 	ex, ey, ew, eh := a.editorRect()
-	lineCount := len(tab.Buffer.Lines)
+	// The memo's text component: Buffer.Version moves on every edit, which
+	// line count alone does not (typing the symbol onto another line leaves it
+	// unchanged). See docHighlightTextKey.
+	textKey := docHighlightTextKey(tab.Buffer)
 
-	// 🔴 Memoized on (path, sym, ScrollY, height, lineCount). draw() clears
+	// 🔴 Memoized on (path, sym, ScrollY, height, text). draw() clears
 	// and repaints the WHOLE screen on every event this app handles,
 	// including bare mouse motion — an uncached full editor.Matches scan on
 	// every one of those is a stall the user reads as the editor hanging,
 	// not as a feature working correctly.
 	if a.docHighlightPath != tab.Path || a.docHighlightSym != sym ||
 		a.docHighlightScrollY != tab.ScrollY || a.docHighlightHeight != eh ||
-		a.docHighlightLineCount != lineCount {
+		a.docHighlightLineCount != textKey {
 		a.docHighlightMatches = a.visibleOccurrences(tab, sym, tab.ScrollY, eh)
 		a.docHighlightPath = tab.Path
 		a.docHighlightSym = sym
 		a.docHighlightScrollY = tab.ScrollY
 		a.docHighlightHeight = eh
-		a.docHighlightLineCount = lineCount
+		a.docHighlightLineCount = textKey
 	}
 
 	for _, m := range a.docHighlightMatches {
