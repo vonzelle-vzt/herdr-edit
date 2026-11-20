@@ -273,3 +273,36 @@ func TestOllamaDialRechecksResolution(t *testing.T) {
 		t.Fatal("a request reached the server after the name rebound")
 	}
 }
+
+// TestOllamaHoldsNoIdleConnection pins that a finished request leaves no
+// pooled connection behind. The transport has no idle timeout, so a kept-alive
+// loopback socket — and the two client goroutines that service it — would
+// outlive the request, outlive switching suggestions off, and outlive the
+// editor's shutdownBackground. A loopback dial per debounced request costs
+// microseconds next to the model's inference.
+func TestOllamaHoldsNoIdleConnection(t *testing.T) {
+	closed := make(chan struct{}, 4)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(ollamaResponse{Response: "x"})
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateClosed {
+			closed <- struct{}{}
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	o, err := newOllama(OllamaConfig{Endpoint: srv.URL, Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.Complete(context.Background(), Request{Prefix: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the connection was still open after the request finished: it was pooled for reuse")
+	}
+}

@@ -19,6 +19,17 @@
 //	{"icons": "on"}      // force-on, even if detection would say no
 //	{"icons": "off"}     // force-off, even if a Nerd Font is installed
 //	{"completion": {"auto": false}}   // only Esc SPACE opens completions
+//	{"inline": {"enabled": true, "model": "qwen2.5-coder:1.5b"}}
+//	                                  // AI ghost-text suggestions; OFF by default
+//
+// The full inline block (fork) is
+//
+//	{"inline": {"enabled": false, "provider": "ollama", "model": "",
+//	            "url": "", "allowRemote": false}}
+//
+// and every key is optional. internal/app (inlinewire.go) turns it into an
+// inline.Config; this package only parses it, so the provider names and the
+// endpoint rules live in exactly one place, internal/inline.
 //
 // The loader is best-effort the same way customactions is: missing
 // file → defaults, malformed file → error returned for the app to
@@ -63,6 +74,31 @@ type Config struct {
 	// editor.quickSuggestions. Same pointer-in-fileFormat promotion as
 	// RespectGitignore, so only an explicit false turns it off.
 	CompletionAuto bool
+
+	// Inline is the AI inline-suggestion (ghost text) block. Its zero value is
+	// OFF, and that is also the default: nothing is constructed and nothing
+	// leaves the editor unless the file says "enabled": true.
+	Inline Inline
+}
+
+// Inline is config.json's "inline" block, trimmed but otherwise as written.
+// It deliberately has no API-key field: a key in a dotfile ends up in dotfile
+// repositories and screenshots, so remote keys come from the environment.
+type Inline struct {
+	// Enabled starts suggestions at launch. The ≡ menu can still switch them
+	// on for the session, which is the same explicit consent as editing this.
+	Enabled bool
+	// Provider is lowercased; "" selects the local default (ollama). Unknown
+	// names are reported by internal/inline when suggestions are switched on,
+	// not here, so the list of names exists once.
+	Provider string
+	// Model is the model name sent to the provider, e.g. "qwen2.5-coder:1.5b".
+	Model string
+	// URL is the provider's endpoint; "" means the provider's own default.
+	URL string
+	// AllowRemote is consent to send buffer text to a provider that is not on
+	// this machine. Without it a remote provider is refused outright.
+	AllowRemote bool
 }
 
 // Defaults returns a Config populated with the values used when no
@@ -76,9 +112,21 @@ func Defaults() Config {
 // then promote into Config so the public type doesn't have to carry
 // JSON tags or pointer fields just for "field was absent" detection.
 type fileFormat struct {
-	Icons      string      `json:"icons,omitempty"`
-	Tree       *tree       `json:"tree,omitempty"`
-	Completion *completion `json:"completion,omitempty"`
+	Icons      string       `json:"icons,omitempty"`
+	Tree       *tree        `json:"tree,omitempty"`
+	Completion *completion  `json:"completion,omitempty"`
+	Inline     *inlineBlock `json:"inline,omitempty"`
+}
+
+// inlineBlock is the on-disk "inline" block. Plain fields, not pointers: every
+// default is the zero value (off, local provider, no consent to remote), so an
+// absent key and an explicit false mean the same thing.
+type inlineBlock struct {
+	Enabled     bool   `json:"enabled"`
+	Provider    string `json:"provider"`
+	Model       string `json:"model"`
+	URL         string `json:"url"`
+	AllowRemote bool   `json:"allowRemote"`
 }
 
 // tree groups file-explorer settings. Nested rather than flat so future tree options have an
@@ -163,6 +211,15 @@ func Load(path string) (Config, error) {
 	}
 	if ff.Completion != nil && ff.Completion.Auto != nil {
 		cfg.CompletionAuto = *ff.Completion.Auto
+	}
+	if ff.Inline != nil {
+		cfg.Inline = Inline{
+			Enabled:     ff.Inline.Enabled,
+			Provider:    strings.ToLower(strings.TrimSpace(ff.Inline.Provider)),
+			Model:       strings.TrimSpace(ff.Inline.Model),
+			URL:         strings.TrimSpace(ff.Inline.URL),
+			AllowRemote: ff.Inline.AllowRemote,
+		}
 	}
 	return cfg, nil
 }
