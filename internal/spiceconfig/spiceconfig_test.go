@@ -203,3 +203,69 @@ func TestCompletionAuto(t *testing.T) {
 		}
 	}
 }
+
+// writeInlineConfig writes body as a config.json in a fresh temp dir and loads it.
+func writeInlineConfig(t *testing.T, body string) (Config, error) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	return Load(p)
+}
+
+// TestInlineIsOffUnlessEnabled pins the privacy default: no block, an empty
+// block, or a block naming a provider and model without "enabled": true all
+// leave inline suggestions OFF — configuring a model is not consent to use it.
+func TestInlineIsOffUnlessEnabled(t *testing.T) {
+	if Defaults().Inline != (Inline{}) {
+		t.Fatalf("Defaults().Inline = %+v, want the zero value (off)", Defaults().Inline)
+	}
+	for _, body := range []string{
+		`{}`,
+		`{"inline":{}}`,
+		`{"inline":{"provider":"ollama","model":"qwen2.5-coder:1.5b","url":"http://127.0.0.1:11434"}}`,
+		`{"inline":{"enabled":false,"allowRemote":true}}`,
+	} {
+		cfg, err := writeInlineConfig(t, body)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", body, err)
+		}
+		if cfg.Inline.Enabled {
+			t.Errorf("Load(%s).Inline.Enabled = true, want false", body)
+		}
+	}
+}
+
+// TestInlineBlockIsParsed pins the on-disk spelling of every key — camelCase
+// allowRemote included — and the normalisation: the provider is lowercased so
+// "Ollama" works, and stray whitespace never reaches a URL or a model name.
+func TestInlineBlockIsParsed(t *testing.T) {
+	cfg, err := writeInlineConfig(t, `{"inline":{"enabled":true,"provider":" Ollama ",
+		"model":" qwen2.5-coder:1.5b ","url":" http://127.0.0.1:11434 ","allowRemote":true}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Inline{Enabled: true, Provider: "ollama", Model: "qwen2.5-coder:1.5b",
+		URL: "http://127.0.0.1:11434", AllowRemote: true}
+	if cfg.Inline != want {
+		t.Fatalf("Inline = %+v, want %+v", cfg.Inline, want)
+	}
+	if !cfg.CompletionAuto || cfg.Icons != IconsAuto {
+		t.Fatal("an inline block disturbed the other settings' defaults")
+	}
+}
+
+// TestInlineMalformedBlockStaysOff pins the failure direction: a block the
+// decoder rejects ("enabled": "yes") is reported AND leaves suggestions off.
+// Falling back to "on" for a value the user plainly meant as on would be
+// friendlier and is exactly the wrong way for a privacy switch to fail.
+func TestInlineMalformedBlockStaysOff(t *testing.T) {
+	cfg, err := writeInlineConfig(t, `{"inline":{"enabled":"yes","model":"m"}}`)
+	if err == nil {
+		t.Fatal("a wrongly typed enabled key was accepted silently")
+	}
+	if cfg.Inline.Enabled {
+		t.Fatal("a malformed inline block switched suggestions on")
+	}
+}

@@ -49,6 +49,11 @@ type ghostText struct {
 	text   string
 	at     ghostAnchor
 	active bool
+	// drawn is whether the LAST frame actually painted the suggestion. Tab
+	// accepts only then: a valid suggestion can still be off screen (the view
+	// was wheel-scrolled away, the cursor unmoved), and inserting text the
+	// user never saw would be an auto-apply in disguise.
+	drawn bool
 }
 
 // revisionOf is tab's buffer revision: Buffer.Version, the editor's own change
@@ -152,6 +157,7 @@ func (g *ghostText) offer(tab *editor.Tab, rev uint64, at editor.Position, text 
 	g.text = clean
 	g.at = g.anchorFor(tab)
 	g.active = true
+	g.drawn = false // not acceptable until a frame has shown it
 	return true
 }
 
@@ -160,6 +166,7 @@ func (g *ghostText) dismiss() {
 	g.text = ""
 	g.at = ghostAnchor{}
 	g.active = false
+	g.drawn = false
 }
 
 // valid reports whether a suggestion is showing and still describes tab
@@ -199,13 +206,20 @@ func (g *ghostText) accept(tab *editor.Tab) bool {
 	return true
 }
 
-// handleKey is the seam into App.handleKey. Returns true when it consumed the
-// key; on false the caller handles the key exactly as if no ghost existed.
+// handleKey is the seam into App.handleKey (via inlineKey). Returns true when
+// it consumed the key; on false the caller handles the key exactly as if no
+// ghost existed.
 //
 // 🔴 Same rule as handleCompletionKey: swallowing a keystroke is the worst
-// thing an editor can do. Only Tab and Esc are consumed, and only while a
-// suggestion is visible. Every other key dismisses the ghost and passes
-// through, so typing never interacts with a suggestion except to remove it.
+// thing an editor can do. Only Tab is consumed, and only while a suggestion is
+// visible. Every other key dismisses the ghost and passes through, so typing
+// never interacts with a suggestion except to remove it.
+//
+// 🔴 Esc is NOT consumed, though it dismisses. Esc is the editor's leader: it
+// used to be swallowed here, which turned `Esc s` with a suggestion on screen
+// into a dismissal followed by a typed 's' — the save silently became an edit.
+// Passing it through dismisses AND arms the leader, so every Esc chord works
+// the same with or without a suggestion. TestInlineEscLeaderStillWorks.
 func (g *ghostText) handleKey(ev *tcell.EventKey, tab *editor.Tab, popupOpen bool) bool {
 	if !g.valid(tab) {
 		return false
@@ -216,16 +230,11 @@ func (g *ghostText) handleKey(ev *tcell.EventKey, tab *editor.Tab, popupOpen boo
 		g.dismiss()
 		return false
 	}
-	// Tab and Esc arrive as KeyTab/KeyEsc only when unmodified; Shift+Tab is
-	// KeyBacktab, and Alt-chorded keys are left to the leader logic.
-	if ev.Modifiers()&(tcell.ModAlt|tcell.ModCtrl) == 0 {
-		switch ev.Key() {
-		case tcell.KeyTab:
-			return g.accept(tab)
-		case tcell.KeyEsc:
-			g.dismiss()
-			return true
-		}
+	// Tab arrives as KeyTab only when unmodified; Shift+Tab is KeyBacktab, and
+	// Alt-chorded keys are left to the leader logic. An undrawn suggestion is
+	// not accepted: the Tab is then an ordinary Tab.
+	if ev.Key() == tcell.KeyTab && ev.Modifiers()&(tcell.ModAlt|tcell.ModCtrl) == 0 && g.drawn {
+		return g.accept(tab)
 	}
 	g.dismiss()
 	return false
@@ -239,7 +248,11 @@ func (g *ghostText) handleKey(ev *tcell.EventKey, tab *editor.Tab, popupOpen boo
 // Reads the cells tab.Render already drew to the right of the cursor and
 // repaints them shifted, so it must run after Render and before anything that
 // paints over the editor (the popup).
+//
+// Records in g.drawn whether any of the suggestion reached the screen, which
+// is what lets Tab accept it; every early return below leaves it false.
 func (g *ghostText) draw(scr tcell.Screen, th theme.Theme, tab *editor.Tab, popupOpen bool, ex, ey, ew, eh int) {
+	g.drawn = false
 	if !g.visible(tab, popupOpen) {
 		return
 	}
@@ -278,6 +291,7 @@ func (g *ghostText) draw(scr tcell.Screen, th theme.Theme, tab *editor.Tab, popu
 			return
 		}
 		scr.SetContent(x, y, r, nil, ghostStyle)
+		g.drawn = true
 		x++
 	}
 	for _, c := range tail {

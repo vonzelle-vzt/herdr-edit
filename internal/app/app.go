@@ -283,6 +283,9 @@ func builtinMenuGroups() [][]menuItemDef {
 		// View toggle
 		{
 			{shortcut: "Esc t", action: (*App).menuToggleSidebar, enabled: alwaysTrue, labelFor: (*App).sidebarToggleLabel, visible: (*App).hasTree},
+			// No leader key: the free lowercase runes are reserved (c, x, v)
+			// or taken, and this is a set-once switch, not a reflex.
+			{label: "Toggle inline suggestions", action: (*App).menuToggleInlineSuggestions, enabled: alwaysTrue, labelFor: (*App).inlineSuggestionsLabel},
 		},
 		// Merge conflicts (fork). Every row is `visible`-gated on the active
 		// tab actually being unmerged according to git, so this whole group —
@@ -628,6 +631,10 @@ type App struct {
 	// completionSource stubs the language server in tests; nil means
 	// a.lsp.Completion (completionFetcher).
 	completionSource completionFunc
+	// inline is AI inline suggestions (ghost text), end to end: settings, the
+	// debouncer while ON, the request in flight and the suggestion on screen.
+	// The zero value is OFF and constructs nothing. See inlinewire.go.
+	inline inlineState
 
 	// Inline git blame — Esc b. Cursor line only, cached per (path, line),
 	// computed off the event loop and delivered as a posted event.
@@ -1573,6 +1580,12 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 	// Every key invalidates any pending automatic completion: a debounce timer
 	// or server answer from before this key describes text that has changed.
 	a.completionGen++
+	// A visible inline suggestion sees every key first. Tab accepts it; any
+	// other key — Esc, the leader, included — dismisses it and carries on
+	// below as if it had never been there (inlinewire.go).
+	if a.inlineKey(ev) {
+		return
+	}
 
 	// Secondary modals own the keyboard while they're up. Each handler
 	// understands Esc (cancel), Enter (submit / activate), and the keys
@@ -1766,6 +1779,7 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 		hadSelection := tab.HasSelection()
 		tab.InsertRune(ev.Rune())
 		a.afterTypedRune(tab, ev.Rune(), hadSelection)
+		a.inlineAfterInsert(tab)
 	}
 }
 
@@ -3063,6 +3077,11 @@ func (a *App) draw() {
 	} else {
 		a.drawStartPage()
 	}
+	// Inline suggestion ghost text: after Tab.Render and every other editor
+	// overlay, because it shifts the cells already painted right of the cursor
+	// and must carry their styling with them. Outside the branch above so the
+	// request in flight is still settled when the last tab has just closed.
+	a.drawInline()
 
 	if a.findOpen {
 		a.drawFindBar()

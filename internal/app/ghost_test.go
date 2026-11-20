@@ -61,9 +61,10 @@ func ghostRow(t *testing.T, a *App, g *ghostText) (string, []tcell.SimCell, int)
 	return b.String(), row, ex
 }
 
-// TestGhostTabAccepts is the happy path: Tab inserts the suggestion at the
-// cursor, the key is consumed (so no indent is ALSO inserted), the cursor ends
-// after the inserted text, and a single undo removes the whole suggestion.
+// TestGhostTabAccepts is the happy path: once a frame has shown it, Tab
+// inserts the suggestion at the cursor, the key is consumed (so no indent is
+// ALSO inserted), the cursor ends after the inserted text, and a single undo
+// removes the whole suggestion.
 func TestGhostTabAccepts(t *testing.T) {
 	a := ghostApp(t, "fmt.\n", 0, 4)
 	tab := a.activeTabPtr()
@@ -71,6 +72,7 @@ func TestGhostTabAccepts(t *testing.T) {
 	if !g.offer(tab, g.revision(tab), tab.Cursor, "Println()") {
 		t.Fatal("offer at the cursor was refused")
 	}
+	ghostRow(t, a, &g) // the frame that shows it; Tab accepts only what was drawn
 
 	ghostRoute(a, &g, keyEv(tcell.KeyTab, 0))
 
@@ -89,16 +91,18 @@ func TestGhostTabAccepts(t *testing.T) {
 	}
 }
 
-// TestGhostEscDismisses pins Esc: consumed, buffer untouched, suggestion gone —
-// and afterwards Tab is an ordinary Tab again, not a delayed accept.
+// TestGhostEscDismisses pins Esc: NOT consumed — it is the leader and must
+// still reach handleKey (TestInlineEscLeaderStillWorks has the `Esc s` case) —
+// but the buffer is untouched and the suggestion gone, and afterwards Tab is an
+// ordinary Tab again, not a delayed accept.
 func TestGhostEscDismisses(t *testing.T) {
 	a := ghostApp(t, "fmt.\n", 0, 4)
 	tab := a.activeTabPtr()
 	var g ghostText
 	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
 
-	if !g.handleKey(keyEv(tcell.KeyEsc, 0), tab, false) {
-		t.Fatal("Esc with a visible suggestion must be consumed — it would otherwise start the leader")
+	if g.handleKey(keyEv(tcell.KeyEsc, 0), tab, false) {
+		t.Fatal("Esc with a visible suggestion was consumed — the leader would never see it")
 	}
 	if got := tab.Buffer.Lines[0]; got != "fmt." {
 		t.Fatalf("Esc changed the buffer: %q", got)
@@ -111,6 +115,33 @@ func TestGhostEscDismisses(t *testing.T) {
 	}
 	if strings.Contains(tab.Buffer.Lines[0], "Println") {
 		t.Fatal("a dismissed suggestion was applied")
+	}
+}
+
+// TestGhostUndrawnIsNotAccepted pins the unit half of "Tab accepts what you
+// saw": an offered suggestion that no frame has painted — or whose last frame
+// had it scrolled off screen — is dismissed by Tab, which is then not consumed.
+func TestGhostUndrawnIsNotAccepted(t *testing.T) {
+	a := ghostApp(t, "fmt.\n", 0, 4)
+	tab := a.activeTabPtr()
+	var g ghostText
+	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
+	if g.handleKey(keyEv(tcell.KeyTab, 0), tab, false) || g.active {
+		t.Fatal("Tab accepted, or left behind, a suggestion no frame had drawn")
+	}
+
+	g.offer(tab, g.revision(tab), tab.Cursor, "Println()")
+	ghostRow(t, a, &g)
+	if !g.drawn {
+		t.Fatal("a painted suggestion was not recorded as drawn")
+	}
+	ex, ey, ew, _ := a.editorRect()
+	g.draw(a.screen, a.theme, tab, false, ex, ey, ew, 0) // a frame with no room for the cursor line
+	if g.drawn || g.handleKey(keyEv(tcell.KeyTab, 0), tab, false) {
+		t.Fatal("Tab accepted a suggestion the last frame did not show")
+	}
+	if tab.Buffer.Lines[0] != "fmt." {
+		t.Fatalf("an undrawn suggestion reached the buffer: %q", tab.Buffer.Lines[0])
 	}
 }
 
