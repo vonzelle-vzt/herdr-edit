@@ -35,6 +35,21 @@
 //
 // StaleAfter travels IN the payload rather than being a number each reader
 // hardcodes, so the editor and the panels cannot drift apart about it.
+//
+// # The other half of staleness: a quiet live session must not look dead
+//
+// A session paused at a breakpoint changes nothing, so a publisher that only
+// writes on content change leaves a perfectly healthy "stopped" snapshot to age
+// past StaleAfter. The publisher therefore HEARTBEATS: while the published state
+// is live it re-writes the same content with a fresh ts every StaleAfter/3.
+//
+// # Ownership: only the editor that is debugging owns the file
+//
+// debug-session.json is one file for the whole machine but every editor
+// publishes to it, and each writes "idle" on its first event and on quit. An
+// idle write therefore must not clobber another editor's live session: it is
+// skipped when the file names a different, still-running pid (see writeAllowed).
+// A live write always wins — the editor that is actually debugging owns the file.
 package state
 
 import (
@@ -133,6 +148,11 @@ type DebugSession struct {
 	Root       string `json:"root"`       // project root, as active.json publishes it
 	StaleAfter int    `json:"staleAfter"` // seconds; see the header
 	TS         int64  `json:"ts"`         // unix milliseconds
+
+	// PID is the editor process that wrote this snapshot. Additive and
+	// optional: old readers ignore it, and old files without it parse as 0.
+	// It is what lets an idle writer tell whose session it would be erasing.
+	PID int `json:"pid,omitempty"`
 }
 
 // DebugPublisher coalesces session updates and writes at most one file per
@@ -142,11 +162,23 @@ type DebugSession struct {
 type DebugPublisher struct {
 	path string
 
+	// hbInterval and now are fields rather than constants so tests can run a
+	// heartbeat in milliseconds and stamp a controlled time.
+	hbInterval time.Duration
+	now        func() time.Time
+
 	mu      sync.Mutex
 	latest  DebugSession
 	pending bool
 	timer   *time.Timer
+	hb      *time.Timer // heartbeat; non-nil only while a live state is published
+	closed  bool
 }
+
+// heartbeatEvery is how often a live session is re-stamped: a third of
+// StaleAfter, so two consecutive missed beats still leave a reader inside the
+// window.
+const heartbeatEvery = DebugStaleAfter / 3
 
 // DebugSessionFile is the path the editor writes and panels read.
 func DebugSessionFile() string {
@@ -161,7 +193,7 @@ func NewDebugPublisher() *DebugPublisher {
 	if dir == "" {
 		return nil
 	}
-	return &DebugPublisher{path: DebugSessionFile()}
+	return &DebugPublisher{path: DebugSessionFile(), hbInterval: heartbeatEvery, now: time.Now}
 }
 
 // Set records the current session. Cheap and safe to call on every event —
@@ -180,6 +212,12 @@ func (p *DebugPublisher) Set(s DebugSession) {
 
 	// Compare ignoring TS — toWire leaves it zero on both sides — or every call
 	// would look like a change and defeat the debounce entirely.
+	if p.closed {
+		return
+	}
+	// Armed/disarmed on EVERY call, not only on change: an unchanged live
+	// session is exactly the one that needs the heartbeat.
+	defer p.syncHeartbeatLocked()
 	if next.sameAs(p.latest) {
 		return
 	}
@@ -191,10 +229,58 @@ func (p *DebugPublisher) Set(s DebugSession) {
 	p.timer = time.AfterFunc(debounce, p.flush)
 }
 
-// Flush writes any pending snapshot immediately. Called on shutdown, right
-// after the editor sets the session idle, so the clean-exit half of the
-// staleness contract does not sit inside the debounce window while the process
-// exits underneath it.
+// live reports whether a state is one a reader ages out. terminated and idle
+// are settled facts and need no heartbeat.
+func (s DebugSession) live() bool {
+	return s.State == DebugStateStarting || s.State == DebugStateRunning ||
+		s.State == DebugStateStopped
+}
+
+// syncHeartbeatLocked starts the heartbeat when a live state is published and
+// stops it otherwise. Caller holds p.mu.
+func (p *DebugPublisher) syncHeartbeatLocked() {
+	if p.closed || !p.latest.live() {
+		p.stopHeartbeatLocked()
+		return
+	}
+	if p.hb == nil {
+		p.hb = time.AfterFunc(p.hbInterval, p.beat)
+	}
+}
+
+// stopHeartbeatLocked cancels the heartbeat timer. Caller holds p.mu.
+func (p *DebugPublisher) stopHeartbeatLocked() {
+	if p.hb != nil {
+		p.hb.Stop()
+		p.hb = nil
+	}
+}
+
+// beat is the heartbeat tick: re-write the unchanged snapshot with a fresh ts
+// and re-arm, unless the session has since gone idle or the publisher closed.
+func (p *DebugPublisher) beat() {
+	p.mu.Lock()
+	if p.closed || !p.latest.live() || p.hb == nil {
+		p.hb = nil
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	p.flush()
+	p.mu.Lock()
+	if !p.closed && p.latest.live() && p.hb != nil {
+		p.hb = time.AfterFunc(p.hbInterval, p.beat)
+	} else {
+		p.hb = nil
+	}
+	p.mu.Unlock()
+}
+
+// Flush writes any pending snapshot immediately and stops the heartbeat.
+// Called on shutdown, right after the editor sets the session idle, so the
+// clean-exit half of the staleness contract does not sit inside the debounce
+// window while the process exits underneath it. A later Set re-arms the
+// heartbeat if the session is still live.
 func (p *DebugPublisher) Flush() {
 	if p == nil {
 		return
@@ -203,8 +289,51 @@ func (p *DebugPublisher) Flush() {
 	if p.timer != nil {
 		p.timer.Stop()
 	}
+	p.stopHeartbeatLocked()
 	p.mu.Unlock()
 	p.flush()
+}
+
+// Close stops every timer so no goroutine outlives the editor, and makes later
+// Set calls no-ops. It does not write: pair it with Flush when a final snapshot
+// is wanted.
+func (p *DebugPublisher) Close() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.closed = true
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	p.stopHeartbeatLocked()
+	p.mu.Unlock()
+}
+
+// writeAllowed decides whether this publisher may write snap over what is on
+// disk. Live (and terminated) writes always win. An idle write is skipped only
+// when the file holds a non-idle session owned by a different, still-running
+// pid; an absent, unparseable, idle, own, pid-less or dead-owner file is fair
+// game.
+func (p *DebugPublisher) writeAllowed(snap DebugSession) bool {
+	if snap.State != DebugStateIdle {
+		return true
+	}
+	raw, err := os.ReadFile(p.path)
+	if err != nil {
+		return true
+	}
+	var cur struct {
+		State string `json:"state"`
+		PID   int    `json:"pid"`
+	}
+	if json.Unmarshal(raw, &cur) != nil || cur.State == DebugStateIdle {
+		return true
+	}
+	if cur.PID <= 0 || cur.PID == os.Getpid() {
+		return true
+	}
+	return !pidAlive(cur.PID)
 }
 
 // flush writes the latest snapshot, swallowing every failure. A full disk or a
@@ -216,7 +345,11 @@ func (p *DebugPublisher) flush() {
 	p.pending = false
 	p.mu.Unlock()
 
-	snap.TS = time.Now().UnixMilli()
+	if !p.writeAllowed(snap) {
+		return
+	}
+	snap.TS = p.now().UnixMilli()
+	snap.PID = os.Getpid()
 	blob, err := json.Marshal(snap)
 	if err != nil {
 		return
