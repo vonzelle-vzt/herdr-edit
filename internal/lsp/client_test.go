@@ -122,6 +122,23 @@ func runFakeServer(mode string) {
 				})
 			}
 
+		case "textDocument/rename":
+			// A package rename the way gopls answers one: a text edit plus a
+			// file RENAME in documentChanges.
+			write(map[string]interface{}{
+				"jsonrpc": "2.0", "id": req.ID,
+				"result": map[string]interface{}{"documentChanges": []map[string]interface{}{
+					{
+						"textDocument": map[string]interface{}{"uri": "file:///tmp/pkg/a.go", "version": 1},
+						"edits": []map[string]interface{}{{
+							"range":   map[string]interface{}{"start": map[string]int{"line": 0, "character": 8}, "end": map[string]int{"line": 0, "character": 11}},
+							"newText": "neu",
+						}},
+					},
+					{"kind": "rename", "oldUri": "file:///tmp/pkg", "newUri": "file:///tmp/neu"},
+				}},
+			})
+
 		case "textDocument/didOpen":
 			// Publish one error against whatever was opened, the way a real
 			// server does once it has parsed the document.
@@ -331,6 +348,32 @@ func TestClient_CodeActionAdvertisesLiteralSupport(t *testing.T) {
 	}
 	if len(acts[0].Edits["/tmp/lit.go"]) != 1 {
 		t.Errorf("edit not decoded: %+v", acts[0].Edits)
+	}
+}
+
+// TestClient_RenameRefusesAFileOperation pins all-or-nothing for rename. A
+// package rename arrives as text edits PLUS a file rename. Applying only the
+// text left the project half-renamed and failing to build, with no message,
+// because the decoder's unsupported-operation report was thrown away.
+func TestClient_RenameRefusesAFileOperation(t *testing.T) {
+	argv := withHelper(t, "ok")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := Start(ctx, "fake", argv, URI(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+
+	edits, err := c.Rename(ctx, "file:///tmp/pkg/a.go", Position{Line: 0, Character: 9}, "neu")
+	if err == nil {
+		t.Fatalf("a rename carrying a file move was accepted: %+v", edits)
+	}
+	if len(edits) != 0 {
+		t.Errorf("edits returned alongside the refusal: %+v", edits)
+	}
+	if !strings.Contains(err.Error(), "nothing was changed") {
+		t.Errorf("error does not say nothing changed: %v", err)
 	}
 }
 

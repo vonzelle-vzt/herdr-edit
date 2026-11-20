@@ -398,7 +398,14 @@ func (c *Client) Rename(ctx context.Context, uri string, pos Position, newName s
 	if err != nil {
 		return nil, err
 	}
-	return workspaceEdits(raw), nil
+	// All or nothing, like code actions. A rename that also moves a file (a Go
+	// package rename, a TS module rename) applied without the move leaves the
+	// project half-renamed and failing to build, so refuse the whole edit.
+	edits, unsupported := decodeWorkspaceEdit(raw)
+	if unsupported != "" {
+		return nil, fmt.Errorf("the server's rename includes an operation this editor cannot apply (%s); nothing was changed", unsupported)
+	}
+	return edits, nil
 }
 
 // DocumentSymbol lists the symbols declared in a file.

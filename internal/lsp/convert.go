@@ -385,16 +385,6 @@ func CompletionKindName(kind int) string {
 	}
 }
 
-// workspaceEdits unwraps a WorkspaceEdit into path -> edits, for rename.
-//
-// It discards the unsupported-operation report decodeWorkspaceEdit makes; code
-// actions use decodeWorkspaceEdit directly because they must say why they
-// cannot run.
-func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
-	edits, _ := decodeWorkspaceEdit(raw)
-	return edits
-}
-
 // decodeWorkspaceEdit unwraps a WorkspaceEdit into path -> edits, plus the name
 // of any operation it carries that this editor cannot perform.
 //

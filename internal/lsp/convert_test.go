@@ -522,3 +522,12 @@ func TestSymbolKindName(t *testing.T) {
 		t.Errorf("unknown kind should be blank, got %q", SymbolKindName(999))
 	}
 }
+
+// workspaceEdits is decodeWorkspaceEdit without the unsupported-operation report,
+// for tests that only look at the edits. Production code never drops that
+// report: rename refuses an edit carrying a file operation, and code actions
+// mark it unavailable.
+func workspaceEdits(raw json.RawMessage) map[string][]TextEdit {
+	edits, _ := decodeWorkspaceEdit(raw)
+	return edits
+}
