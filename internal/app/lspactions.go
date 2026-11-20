@@ -70,6 +70,27 @@ func (a *App) lspCursorPos() (path string, pos lsp.Position, ok bool) {
 	}, true
 }
 
+// hasLSPServerFile reports whether hover and go-to-definition can possibly be
+// answered: a real file tab, a language manager attached, and a language the
+// registry knows (plaintext never has a server). It is the `enabled` predicate
+// for their menu rows, so the palette greys them out instead of letting the
+// user fire a request that can only flash "No language server".
+func (a *App) hasLSPServerFile() bool {
+	if !a.hasLSPFile() || a.lsp == nil {
+		return false
+	}
+	return lsp.LanguageID(a.activeTabPtr().Path) != "plaintext"
+}
+
+// wrapToggleLabel names the Toggle word wrap row for the active tab's current
+// state, so the menu says what clicking will do rather than a bare "Toggle".
+func (a *App) wrapToggleLabel() string {
+	if t := a.activeTabPtr(); t != nil && t.Wrap {
+		return "Disable word wrap"
+	}
+	return "Enable word wrap"
+}
+
 // menuHover asks the language server what is under the cursor. Bound to Esc h.
 func (a *App) menuHover() {
 	a.closeMenu()
