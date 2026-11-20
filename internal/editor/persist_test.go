@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -502,5 +503,80 @@ func TestPersistUndo_ReplaceAllHistorySurvivesRoundTrip(t *testing.T) {
 	}
 	if reopened.Buffer.String() != "foo bar foo" {
 		t.Fatalf("got %q, want the pre-ReplaceAll content restored", reopened.Buffer.String())
+	}
+}
+
+// bigSnapshots builds n snapshots of roughly bytesEach bytes of line text, with
+// content made of the given unit so escape-heavy input can be tested.
+func bigSnapshots(n, bytesEach int, unit string) []persistedSnapshot {
+	line := strings.Repeat(unit, 100/len(unit))
+	out := make([]persistedSnapshot, n)
+	for i := range out {
+		lines := make([]string, bytesEach/len(line))
+		for j := range lines {
+			lines[j] = line
+		}
+		out[i] = persistedSnapshot{Lines: lines}
+	}
+	return out
+}
+
+// countTrimMarshals runs trimSnapshotsToFit with the marshal seam counting.
+func countTrimMarshals(entries []persistedSnapshot, max int) ([]persistedSnapshot, int) {
+	calls := 0
+	orig := persistMarshal
+	persistMarshal = func(v any) ([]byte, error) { calls++; return orig(v) }
+	defer func() { persistMarshal = orig }()
+	return trimSnapshotsToFit(entries, max), calls
+}
+
+// TestTrimSnapshotsToFit_LargeFileMarshalsOnce is the regression for the
+// re-marshal-per-pass cost: thirty 1 MB snapshots against the real 4 MiB cap
+// must come back under the cap after a couple of marshals, where the old
+// drop-a-quarter loop serialized the whole history on every pass.
+func TestTrimSnapshotsToFit_LargeFileMarshalsOnce(t *testing.T) {
+	entries := bigSnapshots(30, 1<<20, "x")
+	got, calls := countTrimMarshals(entries, persistUndoMaxFileBytes)
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) > persistUndoMaxFileBytes {
+		t.Fatalf("result is %d bytes, cap %d", len(b), persistUndoMaxFileBytes)
+	}
+	if len(got) == 0 {
+		t.Fatal("the newest entries should survive a 4 MiB budget")
+	}
+	if calls > 2 {
+		t.Fatalf("trimming marshaled %d times, want at most 2", calls)
+	}
+}
+
+// TestTrimSnapshotsToFit_EscapeHeavyStillFits covers the case the line-length
+// estimate undershoots: control characters escape to six bytes in JSON. The
+// calibration rounds must still land under the cap with a bounded number of
+// marshals.
+func TestTrimSnapshotsToFit_EscapeHeavyStillFits(t *testing.T) {
+	entries := bigSnapshots(30, 256<<10, "\x01")
+	got, calls := countTrimMarshals(entries, persistUndoMaxFileBytes)
+	b, _ := json.Marshal(got)
+	if len(b) > persistUndoMaxFileBytes {
+		t.Fatalf("escape-heavy result is %d bytes, cap %d", len(b), persistUndoMaxFileBytes)
+	}
+	if len(got) == 0 {
+		t.Fatal("some entries should survive")
+	}
+	if calls > 5 {
+		t.Fatalf("calibration took %d marshals, want a handful", calls)
+	}
+}
+
+// TestTrimSnapshotsToFit_AlreadyFitsIsUntouched pins that a history under the
+// cap is returned whole.
+func TestTrimSnapshotsToFit_AlreadyFitsIsUntouched(t *testing.T) {
+	entries := bigSnapshots(3, 1000, "x")
+	got, _ := countTrimMarshals(entries, persistUndoMaxFileBytes)
+	if len(got) != 3 {
+		t.Fatalf("dropped entries from a history that fit: %d left", len(got))
 	}
 }
