@@ -1031,6 +1031,7 @@ func (a *App) Close() {
 func (a *App) Run() error {
 	a.width, a.height = a.screen.Size()
 	a.beginLifecycle()
+	a.startRequestWatch()
 	a.startLSP()
 	if tab := a.activeTabPtr(); tab != nil {
 		a.lspDidOpen(tab.Path, tab.Buffer.String())

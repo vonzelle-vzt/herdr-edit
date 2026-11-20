@@ -44,6 +44,8 @@ const jobDrainWait = 750 * time.Millisecond
 type lifecycle struct {
 	// unregister withdraws the liveness-registry entry; nil until Run registers.
 	unregister func()
+	// requestWatchStop ends the request-file watcher (requestwake.go).
+	requestWatchStop chan struct{}
 	// jobs counts the goroutines that wrap a subprocess, so shutdown can wait
 	// for them with a bound instead of abandoning them mid-flight.
 	jobs sync.WaitGroup
@@ -89,6 +91,7 @@ func (a *App) waitJobs(d time.Duration) bool {
 // it must run on the UI goroutine, like every other App mutation.
 func (a *App) shutdownBackground() {
 	a.stopTreeRefresh()
+	a.stopRequestWatch()
 	a.stopAutoScroll()
 	a.cancelCompletionRequest()
 	if a.lspWakeTimer != nil {
