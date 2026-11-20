@@ -164,6 +164,15 @@ func WriteDebugRequest(action, file string, line int, node ...string) error {
 	return writeStateJSON(req, "debug-request-*.tmp", DebugRequestFile())
 }
 
+// WriteDebugStart asks the editor to start a debug session, optionally at a
+// location and naming a launch.json configuration. It is WriteDebugRequest's
+// "start" with the one field that function's signature cannot carry, so the CLI
+// never makes the editor open its interactive picker.
+func WriteDebugStart(file string, line int, config string) error {
+	req := DebugRequest{Action: DebugActionStart, File: file, Line: line, Config: config, Seq: time.Now().UnixNano()}
+	return writeStateJSON(req, "debug-request-*.tmp", DebugRequestFile())
+}
+
 // writeStateJSON writes v to path, temp-file plus rename so a reader never
 // sees half a payload. The temp file sits beside path, so the rename never
 // crosses a filesystem. The ONE writer for every debug request and reply.

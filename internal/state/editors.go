@@ -90,12 +90,3 @@ func LiveEditors() []EditorInfo {
 	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
 	return out
 }
-
-// WriteDebugStart asks the editor to start a debug session, optionally at a
-// location and naming a launch.json configuration. It is WriteDebugRequest's
-// "start" with the one field that function's signature cannot carry, so the CLI
-// never makes the editor open its interactive picker.
-func WriteDebugStart(file string, line int, config string) error {
-	req := DebugRequest{Action: DebugActionStart, File: file, Line: line, Config: config, Seq: time.Now().UnixNano()}
-	return writeStateJSON(req, "debug-request-*.tmp", DebugRequestFile())
-}
