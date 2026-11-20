@@ -416,12 +416,12 @@ type App struct {
 
 	// lsp owns the language servers for this project; diagnostics is the latest published set
 	// per absolute path. Both nil when no server is available, which every call site tolerates.
-	lsp         *lsp.Manager
-	diagnostics map[string][]lsp.Diagnostic
+	lsp            *lsp.Manager
+	diagnostics    map[string][]lsp.Diagnostic
 	lspSentVersion map[string]uint64 // Buffer.Version each document was last synced at, to skip no-op syncs
 	lspWakeArmed   bool              // a trailing-edge sync wake is scheduled (lspsync.go)
 	lspWakeTimer   *time.Timer       // the armed wake, kept so shutdown can stop it (lifecycle.go)
-	lspSyncedAt time.Time
+	lspSyncedAt    time.Time
 
 	// startRows maps start-page rows back to files so a click can open them. Rebuilt each draw.
 	startRows []startRow
@@ -641,14 +641,14 @@ type App struct {
 	// every event including bare mouse motion, and an uncached scan on each
 	// of those would be a stall the user reads as the editor hanging. See
 	// dochighlight.go.
-	docHighlightPath      string
-	docHighlightSym       string
-	docHighlightScrollY   int
-	docHighlightHeight    int
-	docHighlightVersion   uint64
+	docHighlightPath    string
+	docHighlightSym     string
+	docHighlightScrollY int
+	docHighlightHeight  int
+	docHighlightVersion uint64
 
-	blame *blameScheduler // inline-blame debounce + single-flight; see blame.go
-	docHighlightMatches   []editor.Match
+	blame               *blameScheduler // inline-blame debounce + single-flight; see blame.go
+	docHighlightMatches []editor.Match
 
 	// Highest open-request sequence already honoured. See consumeOpenRequest.
 	lastOpenSeq int64
