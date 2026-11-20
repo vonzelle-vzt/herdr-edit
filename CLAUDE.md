@@ -176,6 +176,8 @@ is the one people actually reach for.
 
 ```
 internal/app/lspstatus.go     Which language servers are running, in the status bar
+internal/app/inlinewire.go    Inline suggestions: config -> provider -> debounce -> event -> ghost (off by default)
+internal/app/refactor.go      applyWorkspaceEdits: the ONE WorkspaceEdit applier (rename + code actions)
 ```
 
 ⚠️ **Known platform limitation, measured on CI: on linux, debugpy does not deliver
@@ -582,6 +584,28 @@ work now runs in `refresh.go` and lands as one posted event. New background resu
 `Buffer.Version()` is the change stamp: any code that writes `Buffer.Lines` directly must call
 `Touch()`, or the LSP sync and the highlight memo miss the edit. Undo and the comment toggle
 both missed it once.
+
+### Inline suggestions, code actions and the gutter (fork, 0.21.0)
+
+- 🔴 **Inline suggestions OFF means nothing is constructed.** `startInline` (`inlinewire.go`) returns
+  before `inline.NewProvider` when `inline.enabled` is false, and a test proves no connection reaches
+  a real listener. Do not build the provider eagerly "for later": that is a network client in an
+  editor whose user said no.
+- 🔴 **Esc is the leader, so the ghost never consumes it.** Any non-Tab key dismisses the ghost AND
+  passes through. `TestInlineEscLeaderStillWorks` was RED when the ghost ate Esc: `Esc s` typed an
+  `s` instead of saving. Tab accepts only a suggestion the last frame actually DREW.
+- Staleness is `Buffer.Version()` plus the request anchor, never a buffer hash (a 10k-line file cost
+  75µs per check). Results are matched on the whole request, not on the revision alone: typing over
+  an auto-closed `)` keeps the revision and moves the cursor.
+- 🔴 **WorkspaceEdits are all or nothing.** `applyWorkspaceEdits` (`refactor.go`) is the ONE
+  applier, shared by rename and code actions. It validates every edit in every file before writing,
+  and restores earlier files if a later write fails. A `documentChanges` file operation
+  (create/rename/delete) is reported by `decodeWorkspaceEdit`. Code actions mark it unavailable,
+  and rename refuses the whole edit. Applying only the text half of a package rename leaves the
+  project failing to build, with no message.
+- `documentChanges` WINS over `changes`. The spec says so, and merging both applied every edit twice.
+- Gutter precedence lives in ONE function, `Tab.gutterMarker` (`marks.go`): breakpoint > conflict >
+  bookmark > git. Both `Render` and `renderWrapped` call it, so the wrapped path cannot disagree.
 
 ### Polled call sites, not scattered hooks (fork)
 `publishActive()` and `maybeSyncLSP()` are each called from ONE place in

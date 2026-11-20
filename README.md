@@ -443,11 +443,26 @@ resolved path is the `.ts` file at the marked line — a stop on the compiled ou
 {
   "icons": "auto",                       // "auto" | "on" | "off"
   "tree": { "respectGitignore": true },  // default true; false restores upstream behaviour
-  "completion": { "auto": true }         // default true; false = the popup only opens on Esc SPACE
+  "completion": { "auto": true },        // default true; false = the popup only opens on Esc SPACE
+  "inline": {                            // ghost-text suggestions; OFF by default
+    "enabled": false,
+    "provider": "ollama",                // the only provider implemented today
+    "model": "qwen2.5-coder:1.5b",       // required when enabled; no default
+    "url": "",                           // default http://127.0.0.1:11434; must be localhost
+    "allowRemote": false                 // opt-in for a remote endpoint (not implemented yet)
+  }
 }
 ```
 
 Unknown keys are ignored, so the file is safe to grow.
+
+**Inline suggestions** are off unless `inline.enabled` is true. While they are off, no provider is
+constructed and no connection is made. When they are on, a suggestion is requested after you pause
+typing, shown dimmed after the cursor, and accepted with `Tab`. Any other key dismisses it and still
+does what it normally does (so `Esc` stays the leader). Files on the secrets deny-list (`.env`, keys)
+are never sent. The ≡ menu's *Toggle inline suggestions* flips it for the session. A hostname in `url`
+is resolved once when suggestions turn on, which can stall the editor for a few seconds if DNS is slow;
+the default IP-literal URL needs no lookup.
 
 See [`UPSTREAM-README.md`](UPSTREAM-README.md) for custom actions (`actions.json`) and format-on-save
 (`.spiceedit/format.json`) — both inherited unchanged.
