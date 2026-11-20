@@ -7,6 +7,12 @@
 
 BINARY := herdr-edit
 
+# GOBUILD_FLAGS is the ONE place build flags live, matching .goreleaser.yml:
+# goreleaser passes -trimpath by default and `ldflags: -s -w` explicitly, so a
+# local build is the same binary shape as a release. build and build-linux both
+# read it, which is what stops the two drifting apart (build used to omit them).
+GOBUILD_FLAGS := -trimpath -ldflags='-s -w'
+
 .PHONY: run build install build-linux test test-short coverage tidy clean help
 
 # help is the default target so `make` with no args prints what's available.
@@ -32,7 +38,7 @@ run:
 # build produces a single binary at ./bin/$(BINARY).
 build:
 	mkdir -p bin
-	go build -o bin/$(BINARY) .
+	go build $(GOBUILD_FLAGS) -o bin/$(BINARY) .
 
 # install copies the binary into /usr/local/bin so you can launch it as `herdr-edit`.
 install: build
@@ -43,7 +49,7 @@ install: build
 # tmux/zellij — no runtime, no libc, just one file.
 build-linux:
 	mkdir -p bin
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags='-s -w' -o bin/$(BINARY)-linux-amd64 .
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(GOBUILD_FLAGS) -o bin/$(BINARY)-linux-amd64 .
 
 # test runs the full suite with the race detector. The same command
 # CI runs (.github/workflows/test.yml) — keep them in lockstep so a
