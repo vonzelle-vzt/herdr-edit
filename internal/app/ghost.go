@@ -6,8 +6,9 @@
 // =============================================================================
 
 // ghost.go is inline-completion GHOST TEXT: a suggestion drawn dimmed after the
-// cursor that is not part of the buffer until Tab accepts it. Esc dismisses it,
-// any edit invalidates it, and the completion popup wins over it.
+// cursor that is not part of the buffer until Tab accepts it. Any other key
+// dismisses it and is still delivered, any edit invalidates it, and the
+// completion popup wins over it. inlinewire.go is what feeds it.
 //
 // 🔴 It never auto-applies: offer only stores text, and accept — reachable only
 // from a Tab keypress — is the one place the buffer changes.
@@ -15,7 +16,6 @@
 package app
 
 import (
-	"hash/maphash"
 	"strconv"
 	"strings"
 	"unicode"
@@ -37,21 +37,11 @@ type ghostAnchor struct {
 	path   string
 	cursor editor.Position
 	anchor editor.Position
-	// rev is the buffer's revision (see ghostText.revision): it changes on
-	// an edit to ANY line, and never returns to an earlier value, so an edit
-	// that is later reverted still leaves the revision moved on.
+	// rev is the buffer's revision (see revisionOf): it changes on an edit to
+	// ANY line, and never returns to an earlier value, so an edit that is later
+	// reverted still leaves the revision moved on.
 	rev uint64
 }
-
-// bufRev is the last content hash seen for a buffer and the revision it got.
-type bufRev struct {
-	hash uint64
-	rev  uint64
-}
-
-// maxTrackedBuffers bounds the revision table. Dropping it is safe: a buffer
-// seen again gets a FRESH revision, so the worst case is a refused answer.
-const maxTrackedBuffers = 256
 
 // ghostText is the ghost-text component. The zero value is ready to use and
 // shows nothing.
@@ -59,103 +49,33 @@ type ghostText struct {
 	text   string
 	at     ghostAnchor
 	active bool
-
-	// revs is the per-buffer revision table and lastRev the counter it draws
-	// from. lastRev only ever increments, so revision 0 means "never seen" and
-	// no revision is ever handed out twice.
-	revs    map[*editor.Buffer]bufRev
-	lastRev uint64
-
-	// watch is the buffer a request is in flight for. Revisions are only
-	// tracked while one is watched or a suggestion shows: otherwise nothing
-	// can go stale, and hashing the buffer on every key and draw would cost
-	// time proportional to the file for no reason.
-	watch *editor.Buffer
-	// hashes counts full-buffer hashes, so a test can pin the idle path at zero.
-	hashes int
 }
 
-// ghostSeed keys the content hash; any fixed seed works within one process.
-var ghostSeed = maphash.MakeSeed()
-
-// bufferHash hashes every line with a separator, so moving a newline changes it.
-func bufferHash(b *editor.Buffer) uint64 {
-	var h maphash.Hash
-	h.SetSeed(ghostSeed)
-	for _, l := range b.Lines {
-		h.WriteString(l)
-		h.WriteByte('\n')
-	}
-	return h.Sum64()
-}
-
-// revision returns tab's buffer revision for a request built now, and watches
-// the buffer until the answer is offered or endRequest is called. Returns 0 for
-// a tab with no buffer, which no request can carry.
-func (g *ghostText) revision(tab *editor.Tab) uint64 {
-	rev := g.observe(tab)
-	if rev != 0 {
-		g.watch = tab.Buffer
-	}
-	return rev
-}
-
-// endRequest stops watching: the host calls it when it cancels a request
-// without an answer to offer.
-func (g *ghostText) endRequest() {
-	g.watch = nil
-}
-
-// tracked reports whether b's revision can matter: a request is in flight for
-// it or the showing suggestion belongs to it.
-func (g *ghostText) tracked(b *editor.Buffer) bool {
-	return b != nil && (b == g.watch || (g.active && b == g.at.buffer))
-}
-
-func (g *ghostText) hash(b *editor.Buffer) uint64 {
-	g.hashes++
-	return bufferHash(b)
-}
-
-// observe returns tab's buffer revision: a monotonic counter bumped whenever
-// the buffer's content differs from the last time it was observed. The editor
-// keeps no revision of its own and Buffer.Lines is mutated directly in places,
-// so observing the content is the backstop; noteEdit is the direct signal.
-func (g *ghostText) observe(tab *editor.Tab) uint64 {
+// revisionOf is tab's buffer revision: Buffer.Version, the editor's own change
+// stamp. It moves on every mutation made through the Buffer primitives or an
+// explicit Touch, is process-wide unique so a reloaded buffer never repeats an
+// old stamp, and never goes backwards — so edit-then-revert still counts as a
+// change. Reading it is O(1): staleness costs the same in a 10k-line file as
+// in a 10-line one, which a content hash of the buffer could not.
+//
+// 🔴 This leans on CLAUDE.md's rule that every direct Buffer.Lines writer calls
+// Touch(). One that does not would leave a suggestion valid against text it
+// was not computed for — the same miss the LSP sync and highlight memo suffer.
+//
+// Returns 0 for a tab with no buffer; 0 is never a valid revision, so a
+// request carrying it can never be offered.
+func revisionOf(tab *editor.Tab) uint64 {
 	if tab == nil || tab.Buffer == nil {
 		return 0
 	}
-	h := g.hash(tab.Buffer)
-	if r, ok := g.revs[tab.Buffer]; ok && r.hash == h {
-		return r.rev
-	}
-	return g.bump(tab.Buffer, h)
+	return tab.Buffer.Version()
 }
 
-// noteEdit records that tab's buffer was just edited. The host calls it from
-// every edit path: it is what makes an edit followed by a revert, with no draw
-// between them, still invalidate. An untracked buffer only forgets its entry,
-// without hashing: its next request then gets a fresh revision, which keeps
-// revisions monotonic.
-func (g *ghostText) noteEdit(tab *editor.Tab) {
-	if tab == nil || tab.Buffer == nil {
-		return
-	}
-	if !g.tracked(tab.Buffer) {
-		delete(g.revs, tab.Buffer)
-		return
-	}
-	g.bump(tab.Buffer, g.hash(tab.Buffer))
-}
-
-// bump gives b a new revision for content hash h.
-func (g *ghostText) bump(b *editor.Buffer, h uint64) uint64 {
-	if _, ok := g.revs[b]; !ok && (g.revs == nil || len(g.revs) >= maxTrackedBuffers) {
-		g.revs = make(map[*editor.Buffer]bufRev)
-	}
-	g.lastRev++
-	g.revs[b] = bufRev{hash: h, rev: g.lastRev}
-	return g.lastRev
+// revision returns tab's buffer revision for a request built now; a request
+// carries it as inline.Request.Revision and offer refuses the answer unless
+// the buffer is still at it.
+func (g *ghostText) revision(tab *editor.Tab) uint64 {
+	return revisionOf(tab)
 }
 
 // anchorFor snapshots the state of tab that a suggestion is bound to.
@@ -166,7 +86,7 @@ func (g *ghostText) anchorFor(tab *editor.Tab) ghostAnchor {
 		path:   tab.Path,
 		cursor: tab.Cursor,
 		anchor: tab.Anchor,
-		rev:    g.observe(tab),
+		rev:    revisionOf(tab),
 	}
 }
 
@@ -222,8 +142,7 @@ func ghostSanitize(s string) (string, bool) {
 // to any line never fits the text it would land in. Returns whether the
 // suggestion is now showing. It NEVER touches the buffer.
 func (g *ghostText) offer(tab *editor.Tab, rev uint64, at editor.Position, text string) bool {
-	defer g.endRequest()
-	if !ghostEligible(tab) || tab.Cursor != at || rev == 0 || g.observe(tab) != rev {
+	if !ghostEligible(tab) || tab.Cursor != at || rev == 0 || revisionOf(tab) != rev {
 		return false
 	}
 	clean, ok := ghostSanitize(text)
@@ -247,15 +166,11 @@ func (g *ghostText) dismiss() {
 // exactly as it was offered. Called on every key and every draw, so an edit
 // that did not come through the keyboard still invalidates it before it can be
 // drawn or accepted. A stale suggestion is dismissed, not merely hidden: an
-// undo or a cursor returning to the old spot must not resurrect it. It observes
-// the buffer's revision while a request for it is in flight, so an edit is
-// counted before the older answer arrives; with nothing showing or in flight
-// it returns without touching the buffer.
+// undo or a cursor returning to the old spot must not resurrect it. Every
+// comparison is O(1) — the revision is a stamp, not a walk over the buffer —
+// so calling it per key and per frame costs nothing proportional to the file.
 func (g *ghostText) valid(tab *editor.Tab) bool {
 	if !g.active {
-		if tab != nil && tab.Buffer != nil && tab.Buffer == g.watch {
-			g.observe(tab)
-		}
 		return false
 	}
 	if !ghostEligible(tab) || g.anchorFor(tab) != g.at {
